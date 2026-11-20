@@ -113,6 +113,19 @@ test('show_options uses the calling thread and returns a review ID without waiti
   assert.equal(h.runner.get(thread.id).pendingReviews,1);
 });
 
+test('show_options tells the agent which shots are too tall for the app to draw in full', async () => {
+  const {h,thread,input}=fixture();
+  const tall=path.join(h.home,'phone.png');
+  fs.writeFileSync(tall,makePng(2,17000));
+  const tool=buildThreadbearTools(h.runner,thread.id).find(t=>t.name==='show_options')!;
+  const fine=JSON.stringify(await tool.handler(input as any,{} as any));
+  assert.doesNotMatch(fine,/shrunk/);
+  const withTall={...input,options:input.options.map(o=>o.id==='B'?{...o,shots:[{path:tall}]}:o)};
+  const warned=JSON.stringify(await tool.handler(withTall as any,{} as any));
+  assert.match(warned,/B shot 2 \(2 x 17000\)/);
+  assert.match(warned,/split each into shots no more than 16384 px/);
+});
+
 test('failed atomic save keeps a review pending, and an accepted outbox repairs a missing card after restart', async () => {
   const {h,thread,input}=fixture();
   const {review}=h.runner.createReview(thread.id,input);

@@ -118,8 +118,9 @@ fn picture(path: &str) -> Option<Vec<u8>> {
 fn shrunk(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(16_384);
-    limits.max_image_height = Some(16_384);
+    // Any shape, a full-page phone shot too: max_alloc is what holds it.
+    limits.max_image_width = Some(65_536);
+    limits.max_image_height = Some(65_536);
     limits.max_alloc = Some(512 * 1024 * 1024);
     reader.limits(limits);
     let small = reader.decode().ok()?.resize_to_fill(PIXELS.0, PIXELS.1, image::imageops::FilterType::Triangle);

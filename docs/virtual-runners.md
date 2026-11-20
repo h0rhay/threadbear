@@ -17,8 +17,10 @@ Status: the spike passed (Order, 1), and the backend is built in two
 slices (18 Nov, "What's built", below): the tables, the box's state
 machine, box keys, cloud tokens and the boot exchange; then the Fly
 adapter, the service's actions, starting a thread, waking, reachable
-boxes and the crons. No runner runs in box mode yet, and there's no box
-image, so nothing has made a real box through the app. A first draft of the plan
+boxes and the crons; then the runner's box mode (19 Nov, slice 3) and the
+box image it boots (slice 4); then starting one from the Mac app, with
+its cloud token made just in time in the thread (19 Nov, slice 5). Nothing
+has made a real box through the app yet. A first draft of the plan
 went to a review panel (Fable, Opus and Grok, 16 Nov), each reading the
 code; their changes are folded in, and "What the review changed" at the
 end says what moved and why.
@@ -677,15 +679,301 @@ its delete succeeds or a listing asked for after the mark lacks it): its exchang
 refused, as is any exchange that doesn't name its machine while one of its
 attempt is condemned, and a heartbeat naming it gives it nothing.
 
+The third slice (19 Nov 2026), the runner's **box mode**
+(`runner/src/box-mode.ts`, `box-save.ts`, `clock-jump.ts`; docs/protocol.md
+"Box mode"), with tests in `runner/test/unit/box-mode.test.ts` (the real
+runner entry point among them), `box-save.test.ts` and
+`clock-jump.test.ts`:
+
+- **Starting.** `THREADBEAR_BOX_BOOT` set means box mode. The boot token
+  is read and taken out of the environment first, then traded at
+  `THREADBEAR_SYNC_URL` with the machine's id (the variable the service now
+  names in `THREADBEAR_MACHINE_ID_ENV`, from the provider's
+  `machineIdEnv`; `FLY_MACHINE_ID` if it names none). The exchange now
+  also gives the box its `login`. What it got goes in the data dir's
+  secrets (`box.json`, `convex-key`) and the token in claude-main's
+  `threadbear-token.json`, each 0600; a runner that restarts on the same
+  machine uses them rather than the spent token.
+- **The folder**: the repo cloned into `~/work` on its base branch, and the
+  `create` makes the thread under its own id in the subfolder, with a
+  worktree as any new thread in that repo gets (the clone trusted as the
+  runner's own checkout); or, with a save, the save restored on the clone
+  and the same session resumed.
+- **Limits** (decision 1): no self-update, CLI updates, keep-awake,
+  `followOrigin`, reinstaller, Sentry, schedules, librarian or spare-week
+  threads; no presence, logins, projects, pools or machine figures sent;
+  one thread (`Runner.boxThread`); the login's email given; `IS_SANDBOX=1`.
+- **Superseded**: a call refused as a bad key ends the box: no more calls,
+  its CLI stopped, the process exits (no `bye`).
+- **The `save` command**: the thread's folder, transcript and git work
+  (move-pack.ts and move-git.ts, as decision 7 planned), sealed under the
+  thread key, uploaded on the box key and named in `boxSaved`. Over one
+  upload (10 MB) it fails, saying so.
+- **Clock jumps**, for every runner: a wall-clock jump of over 15 s between
+  2-second ticks (a box resumed, a Mac waking) makes the sync's Convex
+  client again at once and heartbeats, at most every 30 s. The spike
+  measured 60 s to 3.3 s on Fly.
+
+Codex's review of the third slice (19 Nov 2026) found five holes and two
+follow-ups, fixed with a test each (`box-mode.test.ts`, `box-save.test.ts`,
+`boxes-backend.test.ts`):
+
+- A save left the thread working, so work after the copy was lost once
+  `SAVED` let the box go. Every save now stops the thread first (turn
+  interrupted, CLI and background jobs stopped) and keeps its turns held
+  until the box is woken (`Runner.quiesceForSave`, `releaseTurns`).
+- An established box whose folder had gone deleted what was left and
+  restored the exchange's (older) save over it. Now only the start that
+  traded the token makes the folder, into an empty place, deleting nothing.
+- An untracked `node_modules` made an acknowledged save unrestorable: it's
+  left out of the save now (`packGit`'s `leaveOut`).
+- The save wasn't held to the restore's limits: it is now (100,000 files,
+  128 MB unpacked since the second look, the restore's allowance lowered from a move's 1 GB to
+  that), and it's read back before it's uploaded.
+- A box loaded every thread record on its disk: only its own now
+  (`Runner.start`, `adopt`).
+- A restored thread's turns could start before its worktree's setup had
+  run: they're held until it has (`boxSetupPending`, `setUpRestored`).
+- A lost exchange answer couldn't be asked for again: the box makes its
+  own key and sends its hash, and the backend replays the answer to the
+  same token, machine and hash (`boxes.exchanged`, `peekReplay`).
+
+A second look at those found six more and a follow-up, fixed the same way.
+The rule three of them share: **once a stopping save has started, the box
+runs nothing until the backend says it may** (a command other than a save
+taken after the save's outcome is known, or a heartbeat sent after that
+finding the box `awake`); nothing local lets it go (`SaveHold`).
+
+- A lost `boxSaved` answer let the thread go while the backend might be
+  deleting the box: it's sent again with the same file (the backend takes
+  a repeat as the same save), and an outcome never known keeps it held.
+- A clock jump let a save's hold go: it no longer does.
+- `leaveOut` dropped changes to tracked files under `node_modules`: only
+  untracked ones are left out now; a tracked change fails the save.
+- A restored worktree's setup could write during a save: the save waits for it.
+- A box whose folder had gone exited, and on Fly its disk went with it: an
+  established box now stays up degraded (heartbeating, running nothing,
+  saying why on the thread) for the guard to pause and a person to see to.
+- A save could be bigger than a small replacement box could read: boxes are
+  1024 MB at least (`MIN_BOX_MB`), and a save 128 MB unpacked at most. The
+  restore still gunzips into one buffer (its files are views of it, not
+  copies); streaming it would need a format that names its files before
+  their bytes, which waits for chunked saves.
+- A restored setup that hadn't finished was forgotten on a restart: it's
+  kept apart from `prepared` (`setUp`), and run again, turns held, until it has.
+
+A third look found five more and a follow-up. A save now stops the box
+**categorically**: once the CLI is closed, every other process in the box
+is killed (`box-procs.ts`: all but the runner, its ancestors, PID 1 and
+what the provider was running when the box booted), the runner's own work
+is waited for, and it looks again before anything is copied; an archive's
+cleanup meanwhile is owed instead. That covers a restored setup's
+background children and a teardown starting after the CLI closed. And:
+
+- The save hold is kept in `box.json` (`saveHold`) before the thread is
+  touched, so a restart mid-save, or with its outcome unknown, starts held.
+- A save's size is checked from the disk before anything is read.
+- A file staged under `node_modules` was dropped: the save starts from the
+  checkout's own index now, and only files that index doesn't have are
+  left out; a staged or tracked change there fails the save.
+- Heartbeats and the save's finish while held marked the box as working
+  again: they send `held`, which `runnerAuth` takes as housekeeping.
+
+A fourth look found three more ways to lose work, and a follow-up:
+
+- The provider's processes were taken afresh at every start, so an agent's
+  process that outlived a runner restart was spared: the baseline is taken
+  once, by the first start after the exchange, and kept in `box.json`.
+- A zombie thread-group leader with live threads was skipped: a process
+  is alive while any of its tasks is, and its group is killed.
+- The save's copy of the index kept assume-unchanged and skip-worktree,
+  hiding real changes (the fifth look replaced the copy altogether, below).
+- The mirror's flush before `boxSaved` wasn't sure: `flushAll` waits for one
+  going, runs its own to the end, and fails the save if anything's left.
+
+A fifth look found two more and a follow-up:
+
+- The copied index's stat data let git keep an edit that kept a file's
+  size and mtime (with `core.checkStat` minimal and `core.trustctime`
+  off). The save's index is now built from HEAD, which has no stat data,
+  every file hashed afresh with those settings overridden, plus the
+  checkout's staged paths force-added; `untrustedGit` no longer needs
+  `update-index`.
+- Every fresh box's first flush called `sync:prune`, which a box key can't,
+  so its mirror never finished and no save could: a box skips it (and
+  projects' pictures). The box tests' fake backend now refuses anything
+  not in `BOX_CALLS`, so a call like that can't hide in a fake again.
+- `flushAll` now drains the sidebar index's writer too.
+
+A sixth look found two more and two follow-ups:
+
+- An agent's `schedule_message` started the box's scheduler, arming timers
+  and checks that could write after a save's copy: a box's scheduler now
+  refuses every way in (`Scheduler`'s `refuse`), saying the Mac schedules it.
+- A symlink staged with `-f` whose target was missing was dropped (an
+  `existsSync` that followed it): `lstat` now.
+- Commands' finishes still to send could mark a saved box as working: the
+  save's barrier sends those from before it, and any other command's
+  finish waits while the save goes.
+- A box key counted as the owner's, so `create_thread` on another runner
+  tried to start it directly: a box files the request, as any runner key.
+
+A seventh look found one more and a follow-up:
+
+- A patch's live poll ran its functions, and the commands they run, while
+  a save held the box. Now one gate stops every process start in the
+  runner while a save holds it (`spawn-gate.ts`, on `node:child_process`
+  itself, with a test that it covers every way the module starts one and
+  that nothing in `runner/src` goes round it), the save's own git let by;
+  the live poll doesn't read the thread's patches while it's held, and the
+  save waits for a read already going.
+- The save's barrier could race a heartbeat's retry of the same finish,
+  and the backend marked a repeated finish as work: finishes now go one
+  at a time per command, and a finish that changes nothing is housekeeping.
+
+An eighth look found one more and a follow-up:
+
+- A patch's code runs inside the runner, so a timer or worker it started
+  could write behind a save's copy with no process to stop. In box mode no
+  patch code runs in the runner's process at all: each file is read in a
+  child process that prints what's static in it and exits
+  (`patch-child.ts`), and functions (`when`, `badge`, `items` and the rest)
+  aren't run, so what has one isn't shown on a box's thread.
+- The gate's `exec` and `execFile` lost `util.promisify`'s contract: their
+  replacements carry it now, through the gate.
+
+A ninth look found two more in that loader: a process the patch left
+holding the loader's stdout kept the read (and the thread's first turn)
+waiting for ever, and anything the patch printed spoiled its reply. The
+loader now runs in a process group of its own, the read ends on the reply,
+the loader's exit or a timeout, and the group is killed; the reply comes on
+fd 3, and the patch's stdout and stderr are thrown away.
+
+Where it differs from the plan: the Claude token is on the box's disk, in
+`threadbear-token.json`, rather than only in the runner's memory as
+decision 10 says, so the runner's existing year-long token path carries it
+to the CLI and a restarted runner still has it; the box's disk is the
+box's alone, and goes with it. And the save doesn't yet push the thread's
+branch and `refs/threadbear/save` to `origin` (that waits for GitHub
+tokens, decision 11).
+
+The fourth slice (19 Nov 2026), the **box image** (`runner/box/Dockerfile`,
+`entrypoint.sh`, `smoke.sh`, `runner/.dockerignore`), built and published by
+`.github/workflows/box-image.yml` (Faster starts, 1):
+
+- **What's in it.** For linux/amd64, Fly's default: Node 24 on Debian 13
+  (`node:24-trixie-slim`, pinned by digest) with git, procps and ca-certificates; Claude Code's native
+  linux-x64 build at a pinned version, checked against its SHA-256
+  (`CLAUDE_CODE_VERSION`, `CLAUDE_CODE_SHA256`), where its installer puts
+  it (`~/.local/bin/claude`, a link into `~/.local/share/claude/versions`),
+  with `DISABLE_AUTOUPDATER` set; and the runner from the commit being
+  built, as a release holds it (`src`, `bin`, the package files, `npm ci
+  --omit=dev`), with a `release.json` naming the commit, so it reports
+  `0.1.0+<built>-<commit>`. The agent SDK's own copy of Claude Code (some
+  250 MB) is left out, as the runner always names the CLI. No secrets.
+  About 1.3 GB unpacked (Claude Code 373 MB, the runner's packages 218
+  MB) and 330 MB to pull; the first build, on the Hetzner box, took about
+  4 minutes.
+- **Its entrypoint** runs the runner in box mode, as the service passes no
+  command; with no `THREADBEAR_BOX_BOOT` or `THREADBEAR_SYNC_URL` it stops
+  at once (64), saying why, rather than start an ordinary runner. As root
+  (Claude Code with `IS_SANDBOX=1`), in `/work` (`THREADBEAR_BOX_WORK`),
+  with the runner's log on stderr too, so the provider's logs show a box's
+  start (Faster starts, 2). Nothing restarts the runner: when it exits the
+  machine stops, as the Fly adapter's `restart: no` intends.
+- **Which runner it is.** Built from the repo at a commit rather than from
+  a signed release, so it's the runner Mike's backend is deployed from: a
+  push to main that changes what the image holds pushes
+  `registry.fly.io/<FLY_APP>:<commit>` and `:latest`, and
+  `setRunnerService` makes a virtual runner with `:latest` when it names
+  no image (`defaultBoxImage`). A new box is a few minutes behind main
+  while the image builds; the runner and backend stay compatible both ways,
+  as for any runner. A release tag publishes `:release-<date>` too, for a
+  virtual runner pinned to a release. A fork's push builds its own, into its
+  own Fly app (docs/forking.md).
+- **Private, in the boxes' own Fly app** (Mike, 19 Nov). The image holds
+  Claude Code, which isn't open source, so publishing it would
+  redistribute Anthropic's program. It goes to the private registry of
+  the Fly app the boxes live in (Mike's is `tb-boxes-mikecann`), which
+  Fly pulls from for that app's machines with no credentials. GitHub
+  pushes with `FLY_BOX_IMAGE_TOKEN`, a token that reaches that app only
+  (Mike's org token narrowed with `fly tokens attenuate`, so it ends when
+  that token does, 16 Dec 2026). The passed-over choices were a public
+  image without Claude Code, installed at each box's start (about 20 s
+  slower), and a public image with it.
+- **Checked before it's pushed** (`smoke.sh`, no secrets): with no boot
+  token it exits 64 and says why; Claude Code runs at the version its link
+  names, with git, ps and the runner's version; and in box mode the whole
+  runner loads and trades its boot token at `THREADBEAR_SYNC_URL` with a
+  stand-in for Convex in the same container, which refuses it (`auth`),
+  and the runner stops at once, saying so.
+- **Moving Claude Code on** is by hand: both values from its release
+  manifest (the Dockerfile says how), in a commit that rebuilds the image.
+  Until then a box runs that version, while Mike's other runners follow
+  Claude Code's latest.
+
+The fifth slice (19 Nov 2026), **starting from the Mac and the token
+card** (docs/protocol.md, Virtual runners: "Waiting for a cloud token",
+"Cloud tokens' lifecycle", "Cloud tokens on the Mac", "Starting from the
+Mac"; Box mode, "A refused token"), behind the `virtualRunners` experiment
+(decision 14), with tests in `box-service.test.ts`, `boxes-backend.test.ts`,
+`virtual-runners.test.ts`, `thread-index.test.ts`, `thread-keys.test.ts`,
+`box-mode.test.ts`, desktop/core's unit tests and
+`features/virtual-runners.feature`:
+
+- **Runs on.** After the machines, one entry per virtual runner
+  (`RemoteThreads.services`, from `boxes:runnerServices`), with a cloud
+  icon and no online word; it's in Default too. A box's own runner is never
+  listed as a machine (Runs on, Move to, Settings, schedules). With one
+  picked, the folder and login are this Mac's: `threads.create` with
+  `serviceId` reads the repo here (`runner/src/virtual-runners.ts`: origin
+  without credentials, subfolder, the upstream or origin's default branch)
+  and the login's email, and calls `boxes:startThread`, which now writes
+  the thread's sidebar row at once, so it's listed while it waits.
+- **Rows.** "Starting a machine" and "Waking" with the small spinner,
+  "Asleep" as quietly as a hibernating thread, and "Needs a cloud token"
+  with the needs-you mark (`desktop/core`, the row rule).
+- **The token card** (Mike's option C, 17 Nov), on the thread's message box
+  where the limit box goes, while its box's login has no cloud token or a
+  refused one (`RemoteRunner.box.token`): Make one (the runner runs `claude
+  setup-token` headless in a pseudo-terminal as that login,
+  `runner/src/cloud-token-helper.py`, and sends the token to
+  `setCloudToken`), Paste a token, and Use this Mac's token when that login
+  has a year-long token here. A click shows a spinner with the buttons off
+  until the runner answers.
+- **Waiting for a token** (backend API 94). A login's cloud token is a
+  state machine (`cloudTokenMachine.ts`: valid, dead), and a box whose
+  login has none, or a dead one, starts in `needsToken`: nothing is asked
+  of the provider until a token is set, which puts it in its virtual
+  runner's queue for room (`waitingForRoom`), started oldest first under
+  `maxBoxes` whatever released it; one whose token was refused meanwhile
+  goes back to waiting for a token (Codex's second look). Archiving one that
+  never started ends it there and then, its archive done and its sidebar
+  row archived (Codex's review of slice 5, with the first sidebar row's
+  secrets scrubbed).
+- **A refused token.** A box's turn refused with a 401 sends
+  `boxes:tokenRefused` (only the token it was given dies), holds the thread
+  and asks `boxes:boxCloudToken` every 30 s; a newer token is written in,
+  the CLI closed, and the thread carries on by itself
+  (`runner/src/box-token.ts`). The card comes back meanwhile.
+
+Not built in this slice: Settings' list of cloud tokens with their expiry,
+a picture with a virtual runner thread's first message, and the first
+message showing in the thread before the box has written it (the row's
+preview has it).
+
 Not built yet, in about the order they're needed:
 
-- TODO the runner's box mode and its image: the exchange, the `create`
-  for its named thread, the `save` command (and a save bigger than one
-  upload, 10 MB, in chunks, as a move's are), `IS_SANDBOX` in the image.
+- TODO a real box started from the Mac end to end, on Fly with the box
+  image.
+- TODO a save bigger than one upload, 10 MB, in chunks, as a move's are;
+  and the save's push of the branch and `refs/threadbear/save` (decision
+  7), with GitHub tokens (decision 11).
 - TODO a lost box's taken command put back to pending once (decision 12).
 - TODO starting and waking from the phone (`startThread` takes the owner
   key only), and archiving a sleeping box's thread without waking it.
-- TODO the GPUI app and the phone (Order, 4), and the experiment (14).
+- TODO the phone (Order, 4), Settings' section per virtual runner and its
+  cloud tokens, and the experiment made standard (14).
 
 ## Order
 
@@ -741,7 +1029,8 @@ He chose to stay on Fly (it's about a seventh of E2B's price for the same
 box). Where the time went, and what takes each part away, cheapest first:
 
 1. **Bake the image** (71 s: installing Claude Code and the runner's
-   packages). The box image carries both. No running cost.
+   packages). The box image carries both. No running cost. Built 19 Nov
+   (slice 4, "What's built"); its first real start will say what's left.
 2. **Find the 30 s** between a new thread and its first text that the
    setup and the turn don't explain. Read the runner's log in box mode.
 3. **A pool of suspended spare boxes.** The service keeps a few boxes

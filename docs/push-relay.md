@@ -51,6 +51,47 @@ each person's own Mac and their own Convex deployment.
 A backend with its own Apple key (`APNS_*` env: Mike's) sends directly and
 skips the relay. `PUSH_VIA=relay` sends through the relay anyway, for testing.
 
+### UnifiedPush: the F-Droid build, with no relay
+
+The Android app's F-Droid build (`android-native/`, flavour `fdroid`) has no
+Firebase, so it doesn't use the relay at all (API 93, 19 Nov 2026):
+
+1. The phone asks its own backend for the deployment's VAPID public key
+   (`phone:webPushKey`, made once and kept in the `webPushVapid` table), then
+   registers with the UnifiedPush distributor app on the phone (ntfy and the
+   like), which gives it an https endpoint on the distributor's server and
+   Web Push keys. It registers those with `phone:registerDevice`,
+   `platform: "webpush"`, the endpoint as `apnsToken` and the keys as
+   `webPush`, plus its 32-byte push key as before.
+2. `convex/push.ts` (`sendWebPush`) posts each notification to that endpoint
+   itself: `{ threadId, e }` (the same sealed title and text as Firebase's),
+   encrypted for the phone with RFC 8291 (at most 3993 bytes, so the whole
+   body fits in 4096, which the phone's connector requires) and signed with the VAPID key (RFC
+   8292), both in `convex/webPush.ts` with node:crypto, checked against the
+   RFC's own example in `runner/test/unit/web-push.test.ts`. The
+   distributor's server sees the endpoint and an opaque blob; it can't read
+   the thread id either. `PUSH_RELAY=off` doesn't stop these, as no relay is
+   involved.
+3. The endpoint is chosen by whoever holds the phone's pairing token, so the
+   backend only takes a public https one (`convex/webPushEndpoint.ts`: for
+   IPv6 only global unicast, less 6to4, Teredo and documentation). Each post
+   goes over node:https with a `lookup` (`pinnedLookup` in `webPush.ts`) that
+   refuses a name if any address it resolves to is private, in the same
+   lookup the socket connects with, so a name can't answer differently
+   between a check and the connection. It never follows a redirect, reads at
+   most 256 bytes of an error, and gives up after 10 seconds, lookup
+   included. Web pushes go out side by side with each other and with
+   Apple's and Firebase's, so a slow server holds up nobody. A 404 or 410
+   means the distributor dropped the phone, and keys that aren't a P-256
+   point can never work, so either way the row goes. Names are looked up
+   through c-ares (`Resolver`), not the system's getaddrinfo, so stalled DNS
+   can't tie up the worker threads Apple's and the relay's lookups need.
+4. Known gap: `pushOff` (`pushHealth.ts`) and the health line's `via` still
+   only know Apple and the relay. A backend with `PUSH_RELAY=off` and no
+   Apple key says push is off even though UnifiedPush works, and a failing
+   web push shows as the relay's. The F-Droid app ignores `pushOff` for that
+   reason; Mike's own setup always has the relay.
+
 ### An Android phone
 
 The same, through Firebase Cloud Messaging (API 66):

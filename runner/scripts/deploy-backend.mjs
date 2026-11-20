@@ -22,7 +22,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { ConvexAdminError, convexEnv, prodArgs, readConvexAdmin } from '../src/convex-admin.ts';
 import { Fail, stepRetryingNetwork } from './deploy-steps.mjs';
-import { backfillsAt, lastJson, STEPPING_FILE, withStepping } from './backend-stones.mjs';
+import { backfillsAt, lastJson, rearmCursor, STEPPING_FILE, withStepping } from './backend-stones.mjs';
 
 const HELP = `deploy-backend.mjs: deploy convex/ and web/ at a commit to the runner's Convex deployment, if they changed.
 
@@ -84,6 +84,13 @@ function readAdmin(home) {
     if (e instanceof ConvexAdminError) throw new Fail(e.message);
     throw e;
   }
+}
+
+// What a failed `convex run` said: its "Uncaught ..." line, which names the
+// error, rather than the stack's last frame (19 Nov 2026).
+function convexError(r) {
+  const lines = String(r.stderr || r.stdout).trim().split('\n');
+  return (lines.find((l) => l.startsWith('Uncaught ')) ?? lines.at(-1)).trim();
 }
 
 function hasRunnerKey(home) {
@@ -359,15 +366,24 @@ function main(argv) {
     }
     writeJson(stateFile, { ...readJson(stateFile), functions: { tree: want.functions, commit, at: new Date().toISOString() }, failed: undefined, stepping: undefined });
     // A timer due while a machine was off failed its job: deliver it again,
-    // a batch a run until none is left. Recorded until it has gone through,
-    // so an interrupted or failed run does it next time.
+    // a page of the week's scheduled jobs a run until the last. Recorded
+    // until it has gone through, so an interrupted or failed run does it
+    // next time.
     if (readJson(stateFile).rearmDue) {
-      for (let i = 0; ; i++) {
-        const r = run('machines:rearmFailed', {});
+      for (let i = 0, cursor = null; ; i++) {
+        const r = run('machines:rearmFailed', { cursor });
         if (r.status !== 0) {
-          failed('timers', new Fail(`Couldn't deliver again the timers that failed while a machine was off: ${String(r.stderr || r.stdout).trim().split('\n').at(-1)}`));
+          failed('timers', new Fail(`Couldn't deliver again the timers that failed while a machine was off: ${convexError(r)}`));
         }
-        if (!(Number(lastJson(r.stdout)) > 0) || i > 100) break;
+        let next;
+        try {
+          next = rearmCursor(r.stdout);
+        } catch (e) {
+          failed('timers', new Fail(`Delivering again the timers that failed: ${e.message}`));
+        }
+        if (next === null) break;
+        if (i > 2000) failed('timers', new Fail('Delivering again the timers that failed was still going after 2,000 pages.'));
+        cursor = next;
       }
       writeJson(stateFile, { ...readJson(stateFile), rearmDue: undefined });
     }

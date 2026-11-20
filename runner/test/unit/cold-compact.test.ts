@@ -1,19 +1,15 @@
-// Compact when cold (experiment coldCompact, runner/cold-compact.ts): a long
+// Compact when cold (runner/cold-compact.ts): a long
 // Claude thread woken after its cache expired compacts first, in the same
 // turn, and a warm or short one never does.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import { makeHarness, tick, tmpDir } from '../helpers/fakes.ts';
 import { CACHE_LIFETIME_MS, COLD_COMPACT_MIN_TOKENS, COLD_MARGIN_MS, coldWake } from '../../src/runner/cold-compact.ts';
 
 const HOUR = 60 * 60_000;
 
-function setup(on = true) {
-  const home = tmpDir();
-  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { coldCompact: on } }));
-  const h = makeHarness(home);
+function setup() {
+  const h = makeHarness(tmpDir());
   const { thread } = h.runner.create({ text: 'Build it', accountId: 'claude-main' });
   const s = h.adapter.sessions.at(-1)!;
   s.init();
@@ -71,14 +67,14 @@ test('a warm thread is never compacted', async () => {
   assert.ok(!last(h).sent.some((m) => m.text.startsWith('/compact')));
 });
 
-test('a short thread, the experiment off, or a slash command: no compaction', async () => {
-  for (const [on, tokens, text] of [[true, COLD_COMPACT_MIN_TOKENS - 1, 'Next'], [false, 500_000, 'Next'], [true, 500_000, '/cost']] as const) {
-    const { h, id, s } = setup(on);
+test('a short thread or a slash command: no compaction', async () => {
+  for (const [tokens, text] of [[COLD_COMPACT_MIN_TOKENS - 1, 'Next'], [500_000, '/cost']] as const) {
+    const { h, id, s } = setup();
     finish(s, tokens);
     h.clock.advance(5 * HOUR);
     h.runner.send(id, text);
     await tick(8);
-    assert.ok(!last(h).sent.some((m) => m.text.startsWith('/compact')), `${on} ${tokens} ${text}`);
+    assert.ok(!last(h).sent.some((m) => m.text.startsWith('/compact')), `${tokens} ${text}`);
   }
 });
 

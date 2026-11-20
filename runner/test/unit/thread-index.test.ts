@@ -479,3 +479,109 @@ test('another runner’s row whose id isn’t a thread id’s shape is left out'
   assert.deepEqual(index.list().threads.map((t) => t.threadId), ['0cf430ac-f429-4b2e-9c1d-2f6a8b7c9d0e']);
   index.stop();
 });
+
+test("a box's virtual runner, and its login when it has no usable cloud token, reach the app; nothing else of a bad shape does", async () => {
+  const { index, heard, remote, h } = setup();
+  index.start();
+  const lastSeenAt = h.clock.now() - 60 * 60_000;
+  remote({
+    runners: [
+      { runnerId: 'b-wait', name: 'Cloud (Fly)', lastSeenAt: 0, box: { state: 'needsToken', service: 'runnerServices:1', token: 'none', login: 'me@example.com' } },
+      { runnerId: 'b-dead', name: 'Cloud (Fly)', lastSeenAt, box: { state: 'awake', unreachable: true, service: 'runnerServices:1', token: 'dead', login: 'me@example.com' } },
+      { runnerId: 'b-odd', name: 'Cloud (Fly)', lastSeenAt, box: { state: 'asleep', service: 7, token: 'maybe', login: 'me@example.com' } },
+    ],
+    threads: [],
+  });
+  const boxes = Object.fromEntries(heard.at(-1)!.runners.map((r) => [r.id, r.box]));
+  assert.deepEqual(boxes['b-wait'], { state: 'needsToken', service: 'runnerServices:1', token: 'none', login: 'me@example.com' });
+  assert.deepEqual(boxes['b-dead'], { state: 'awake', unreachable: true, service: 'runnerServices:1', token: 'dead', login: 'me@example.com' });
+  assert.deepEqual(boxes['b-odd'], { state: 'asleep' });
+  assert.equal(heard.at(-1)!.runners.find((r) => r.id === 'b-wait')!.online, true, 'waiting for a token is reachable');
+  index.stop();
+});
+
+test('the virtual runners (API 94, the experiment) come with the other runners for Runs on; not otherwise', async () => {
+  for (const takes of [true, false]) {
+    const h = makeHarness();
+    const asked: string[] = [];
+    let servicesAnswer: ((v: unknown) => void) | undefined;
+    const heard: RemoteThreads[] = [];
+    const index = new ThreadIndex({
+      post: async () => null,
+      subscribe: (fn, args, onUpdate) => {
+        asked.push(fn);
+        if (fn === 'boxes:runnerServices') {
+          assert.deepEqual(args, { key: 'k' });
+          servicesAnswer = onUpdate;
+        }
+        return () => undefined;
+      },
+      key: 'k',
+      runnerId: 'r-laptop',
+      home: h.home,
+      host: h.runner,
+      publish: (n: Notification) => n.method === 'remoteThreads.updated' && heard.push(n.params),
+      clock: h.clock,
+      log: nullLogger,
+      takesSince: () => true,
+      takesServices: () => takes,
+    });
+    index.start();
+    index.list();
+    assert.equal(asked.includes('boxes:runnerServices'), takes);
+    if (takes) {
+      servicesAnswer!([{ serviceId: 'runnerServices:1', name: 'Cloud (Fly)', provider: 'fly', image: 'x', running: 2, asleep: 1 }, { serviceId: 3 }]);
+      assert.deepEqual(heard.at(-1)!.services, [{ id: 'runnerServices:1', name: 'Cloud (Fly)', provider: 'fly' }]);
+      assert.deepEqual(index.list().services, [{ id: 'runnerServices:1', name: 'Cloud (Fly)', provider: 'fly' }]);
+    } else assert.equal(index.list().services, undefined);
+    index.stop();
+  }
+});
+
+// Codex's review of slice 5 (7): switching the experiment on (or the backend
+// reaching API 94) while the app watches starts the virtual runners' watch at
+// the next refresh, and switching it off stops it and drops them.
+test('the virtual runners watch starts and stops with a refresh, as the experiment or the backend changes', async () => {
+  const h = makeHarness();
+  let takes = false;
+  const asked: string[] = [];
+  let stopped = 0;
+  let servicesAnswer: ((v: unknown) => void) | undefined;
+  const heard: RemoteThreads[] = [];
+  const index = new ThreadIndex({
+    post: async () => null,
+    subscribe: (fn, _args, onUpdate) => {
+      asked.push(fn);
+      if (fn === 'boxes:runnerServices') {
+        servicesAnswer = onUpdate;
+        return () => void stopped++;
+      }
+      return () => undefined;
+    },
+    key: 'k',
+    runnerId: 'r-laptop',
+    home: h.home,
+    host: h.runner,
+    publish: (n: Notification) => n.method === 'remoteThreads.updated' && heard.push(n.params),
+    clock: h.clock,
+    log: nullLogger,
+    takesSince: () => true,
+    takesServices: () => takes,
+  });
+  index.start();
+  index.list();
+  assert.ok(!asked.includes('boxes:runnerServices'));
+  takes = true;
+  index.refresh();
+  assert.equal(asked.filter((f) => f === 'boxes:runnerServices').length, 1, 'watched once it can be');
+  servicesAnswer!([{ serviceId: 'runnerServices:1', name: 'Cloud (Fly)', provider: 'fly' }]);
+  assert.deepEqual(heard.at(-1)!.services, [{ id: 'runnerServices:1', name: 'Cloud (Fly)', provider: 'fly' }]);
+  index.refresh();
+  assert.equal(asked.filter((f) => f === 'boxes:runnerServices').length, 1, 'not twice');
+  takes = false;
+  index.refresh();
+  assert.equal(stopped, 1);
+  assert.equal(index.list().services, undefined);
+  assert.equal(heard.at(-1)!.services, undefined, 'the app hears they went');
+  index.stop();
+});

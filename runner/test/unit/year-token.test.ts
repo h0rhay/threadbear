@@ -70,8 +70,10 @@ test('a token made for a login is news straight away, not at the next rescan', a
   fs.mkdirSync(one);
   const main = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-year-main-'));
   const registry = new AccountRegistry({ claudeMainDir: main, claudeMainJson: path.join(main, 'none.json'), tokenStatsAccountsDir: root, userHome: os.tmpdir(), pathEnv: '' } as never);
+  let probe: fs.FSWatcher | undefined;
   try {
     assert.equal(registry.list().find((a) => a.id === 'claude-1')?.yearToken, undefined);
+    probe = await watchIsLive(one);
     const heard = new Promise<Account[]>((resolve) => registry.onChange(resolve));
     // As the helper writes it: a temp file, then a rename onto the name.
     const tmp = path.join(one, `${TOKEN_FILE}.123`);
@@ -80,9 +82,33 @@ test('a token made for a login is news straight away, not at the next rescan', a
     const list = await Promise.race([heard, new Promise<never>((_, reject) => setTimeout(() => reject(new Error('not heard within 3 s')), 3000))]);
     assert.deepEqual(list.find((a) => a.id === 'claude-1')?.yearToken, { madeAt: MADE });
   } finally {
+    probe?.close();
     registry.close();
   }
 });
+
+// On macOS a folder's fs.watch is libuv's one FSEvents stream, which starts
+// on another thread and only reports what happens after it has, so a file
+// written straight after fs.watch() returns can come too soon to be told:
+// this test missed it 7 times in 48 on a loaded Tinker Desk (19 Nov). Each
+// new watch restarts that shared stream with every watched folder in it, so
+// once a watch made after the registry's hears a file of its own, the
+// registry's is live too. That watch stays open until the test is done, as
+// closing it restarts the stream again. (Linux's inotify is live at once.)
+async function watchIsLive(dir: string): Promise<fs.FSWatcher> {
+  const name = 'watch-probe';
+  let seen = false;
+  const w = fs.watch(dir, { persistent: false }, (_event, file) => {
+    if (String(file) === name) seen = true;
+  });
+  const deadline = Date.now() + 10_000;
+  for (let i = 0; !seen; i++) {
+    if (Date.now() > deadline) throw new Error('the watch never heard its own probe file');
+    fs.writeFileSync(path.join(dir, name), String(i));
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return w;
+}
 
 test("a token login isn't asked the CLI; its end is a year from when it was made, and a new token takes a refusal back", async () => {
   const made = Date.parse(MADE);

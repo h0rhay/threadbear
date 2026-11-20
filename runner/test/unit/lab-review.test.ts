@@ -790,8 +790,10 @@ test("labReview: the thread's own provider is never taken for another lab, where
 
 test('labReview: Settings shows the default order, saves a new one, and refuses what is not a reviewer', () => {
   const home = tmpDir();
-  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ labReviewers: [{ provider: 'codex' }, { provider: 'nope' }, 7, { provider: 'codex', model: 'x' }, { provider: 'claude', effort: 'high' }] }));
-  assert.deepEqual(loadConfig({ THREADBEAR_HOME: home }).labReviewers, [{ provider: 'codex' }, { provider: 'claude', effort: 'high' }], 'hand-edited: the bad and repeated left out');
+  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ labReviewers: [{ provider: 'codex' }, { provider: 'nope' }, 7, { provider: 'codex', effort: 'low' }, { provider: 'codex', model: 'x', panel: true }, { provider: 'claude', effort: 'high' }] }));
+  const loaded = loadConfig({ THREADBEAR_HOME: home });
+  assert.deepEqual(loaded.labReviewers, [{ provider: 'codex' }, { provider: 'codex', model: 'x' }, { provider: 'claude', effort: 'high' }], 'hand-edited: the bad and repeated left out, another model of one kept');
+  assert.deepEqual(loaded.labPanel, [{ provider: 'codex', model: 'x' }], "the old form's panel tick becomes the panel");
 
   const h = setup();
   const settings = new SettingsService({ config: h.runner.cfg, publish: () => {} });
@@ -800,6 +802,39 @@ test('labReview: Settings shows the default order, saves a new one, and refuses 
   assert.deepEqual(settings.update({ labReviewers: order }).labReviewers, order);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h.home, 'runner.json'), 'utf8')).labReviewers, order, 'saved');
   assert.deepEqual(h.runner.cfg.labReviewers, order, 'used at once');
+  assert.deepEqual(settings.get().labPanel, [], 'no panel to begin with');
+  assert.equal(settings.get().labPanelLines, 150);
+});
+
+test('labReview: the panel is a list of its own, and an app from before it keeps its ticks', () => {
+  const h = setup();
+  const settings = new SettingsService({ config: h.runner.cfg, publish: () => {} });
+  const update = settingsMethods(settings)['settings.update'];
+  const saved = () => JSON.parse(fs.readFileSync(path.join(h.home, 'runner.json'), 'utf8'));
+  const panel = [{ provider: 'codex' as const }, { provider: 'opencode' as const, model: 'google/gemini-4-neon', effort: 'high' as const }];
+  update({ labPanel: panel });
+  assert.deepEqual(settings.get().labPanel, panel);
+  assert.deepEqual(saved().labPanel, panel, 'saved');
+  update({ labReviewers: [{ provider: 'grok' }] });
+  assert.deepEqual(settings.get().labPanel, panel, 'changing the first list leaves the panel');
+  assert.deepEqual(saved().labPanel, panel);
+  // An app from before the two lists sends its ticks in the one list.
+  update({ labReviewers: [{ provider: 'codex', panel: true }, { provider: 'claude', panel: true }, { provider: 'grok' }] });
+  assert.deepEqual(settings.get().labReviewers, [{ provider: 'codex' }, { provider: 'claude' }, { provider: 'grok' }], 'ticked ones review every change, as they did');
+  assert.deepEqual(settings.get().labPanel, [{ provider: 'codex' }, { provider: 'claude' }]);
+  update({ labReviewers: [{ provider: 'codex' }] });
+  assert.deepEqual(settings.get().labPanel, [{ provider: 'codex' }, { provider: 'claude' }], "an old app that doesn't see the panel can't wipe it");
+  assert.throws(() => update({ labPanel: [{ provider: 'gemini' }] }), /labPanel provider must be one of/);
+  update({ labPanel: [] });
+  assert.deepEqual(settings.get().labPanel, []);
+});
+
+test('labReview: the panel reviews big changes only, and a reviewer only on it never reviews a small one', async () => {
+  const h = withOpenCode(setup({ accounts: [...withCodex(), OPENCODE], cfg: { labReviewers: [{ provider: 'codex' }], labPanel: [{ provider: 'codex' }, { provider: 'opencode', model: 'google/gemini-4-neon' }] } }));
+  const rec = h.runner.threads.get(start(h))!.rec;
+  assert.equal(rec.provider, 'claude');
+  assert.deepEqual(h.runner.reviewLogins(rec, false).map((x) => x.account.provider), ['codex']);
+  assert.deepEqual(h.runner.reviewLogins(rec, true).map((x) => x.account.provider), ['codex', 'opencode']);
 });
 
 test('labReview: settings.update says which reviewer entry is wrong', () => {
@@ -950,4 +985,217 @@ test('labReview: a review that fails on a runner handing over still releases the
   (h.runner as unknown as { draining: object }).draining = new Proxy({}, { get: () => () => {} });
   rs.kill();
   assert.ok(h.runner.threads.get(reviewId)!.rec.finished, 'the finish is in the record for whoever adopts it');
+});
+
+// ------------------------------------------------------- the review panel
+// Mike, 19 Nov 2026: several reviewers at once for a big or risky change,
+// the same provider more than once on different models if he likes.
+
+const PANEL = {
+  labReviewers: [{ provider: 'codex', model: 'gpt-6.1-sol' }, { provider: 'codex', model: 'gpt-6-luna' }, { provider: 'claude' }],
+  labPanel: [{ provider: 'codex', model: 'gpt-6.1-sol' }, { provider: 'codex', model: 'gpt-6-luna' }],
+} as const;
+
+function reviewsOf(h: ReturnType<typeof setup>, id: string) {
+  return (h.runner.threads.get(id)!.rec.waitingOn ?? []).filter((w) => w.review);
+}
+
+function finishOne(h: ReturnType<typeof setup>, reviewId: string, input: Record<string, unknown>, reply = 'See findings.') {
+  const rs = h.codex.sessions.find((s) => s.opts.threadId === reviewId)!;
+  rs.init();
+  turn(h, reviewId, { session: rs, reply, input });
+}
+
+test('labReview panel: a small change still gets one reviewer', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 10)] });
+  assert.equal(reviewsOf(h, id).length, 1);
+  assert.equal(h.runner.threads.get(id)!.rec.labReview?.panel, undefined);
+});
+
+test('labReview panel: a big change goes to every ticked reviewer at once, each on its own model', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const waits = reviewsOf(h, id);
+  assert.equal(waits.length, 2, 'both ticked reviewers');
+  assert.deepEqual(waits.map((w) => h.runner.get(w.threadId).model).sort(), ['gpt-6-luna', 'gpt-6.1-sol']);
+  const ledger = h.runner.threads.get(id)!.rec.labReview!;
+  assert.equal(ledger.panel?.length, 2);
+  assert.match(ledger.reviewer, /gpt-6\.1-sol.*, .*gpt-6-luna/);
+  assert.ok(h.events(id).some((e) => e.type === 'system.note' && /^A review panel is checking this change/.test(e.text)));
+  const brief = h.events(waits[0].threadId).find((e) => e.type === 'user.message').text as string;
+  assert.match(brief, /Other reviewers are looking at the same change at once/);
+});
+
+test('labReview panel: a small change to a risky path gets the panel too', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/auth/session.ts', 10)] });
+  assert.equal(reviewsOf(h, id).length, 2);
+  // Not a name that only contains a risky word.
+  const h2 = setup({ cfg: { ...PANEL } });
+  const id2 = start(h2);
+  turn(h2, id2, { diffs: [codeDiff('src/authorship.ts', 10)] });
+  assert.equal(reviewsOf(h2, id2).length, 1);
+});
+
+test('labReview panel: labPanelLines sets how big a change has to be', () => {
+  const h = setup({ cfg: { ...PANEL, labPanelLines: 10 } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 10)] });
+  assert.equal(reviewsOf(h, id).length, 2);
+});
+
+test('labReview panel: the thread waits for every reviewer, then wakes with all findings numbered together, each saying who found it', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  finishOne(h, a, { needs: 'nothing', findings: [FINDINGS[0]] }, 'Session bug.');
+  assert.ok(h.runner.get(id).snoozedUntil, 'still waiting on the other');
+  assert.equal(h.events(id).filter((e) => e.type === 'user.message' && e.origin === 'runner').length, 0);
+  finishOne(h, b, { needs: 'nothing', findings: [FINDINGS[1]] }, 'Token in logs.');
+  assert.equal(h.runner.get(id).snoozedUntil, undefined, 'awake');
+  const msg = h.events(id).filter((e) => e.type === 'user.message').at(-1).text as string;
+  assert.match(msg, /^A review panel checked the change/);
+  assert.match(msg, /#1 \[high\] \(Codex \([^)]*gpt-6\.1-sol\)\) src\/app\.ts:3: Drops the session/);
+  assert.match(msg, /#2 \[low\] \(Codex \([^)]*gpt-6-luna\)\)/);
+  assert.match(msg, /Session bug\./);
+  assert.match(msg, /Token in logs\./);
+  assert.match(msg, /"id": 1, "outcome": "fixed"/);
+  assert.deepEqual(h.runner.reviewOwes(id)?.open?.map((f) => f.id), [1, 2]);
+  assert.ok(h.runner.get(a).archivedAt && h.runner.get(b).archivedAt, 'both put away');
+  // The answering turn's card has the panel and who found each.
+  turn(h, id, { input: { needs: 'nothing', findings: [{ id: 1, outcome: 'fixed' }, { id: 2, outcome: 'disputed', note: 'A hash.' }] } });
+  const card = lastCard(h, id).review;
+  assert.equal(card.panel.length, 2);
+  assert.match(card.findings[0].by, /gpt-6\.1-sol/);
+  assert.match(card.findings[1].by, /gpt-6-luna/);
+});
+
+test('labReview panel: it passes only when every reviewer found nothing', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  finishOne(h, a, { needs: 'nothing', findings: [] });
+  finishOne(h, b, { needs: 'nothing', findings: [] });
+  const msg = h.events(id).filter((e) => e.type === 'user.message').at(-1).text as string;
+  assert.match(msg, /None of them found anything that holds up/);
+  assert.equal(h.runner.threads.get(id)!.rec.labReview?.passed, true);
+  assert.equal(h.runner.reviewOwes(id), undefined);
+});
+
+test('labReview panel: one put away before it finished leaves the rest to count', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  h.runner.update({ threadId: a, archived: true });
+  finishOne(h, b, { needs: 'nothing', findings: [FINDINGS[0]] });
+  const msg = h.events(id).filter((e) => e.type === 'user.message').at(-1).text as string;
+  assert.match(msg, /didn't finish: its thread was put away first/);
+  assert.deepEqual(h.runner.reviewOwes(id)?.open?.map((f) => f.id), [1]);
+});
+
+test('labReview panel: with fewer than two of the panel able to review, the usual one does', () => {
+  const h = setup({ accounts: ACCOUNTS, cfg: { labReviewers: [{ provider: 'codex' }, { provider: 'claude' }], labPanel: [{ provider: 'codex' }, { provider: 'claude' }] } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  // No Codex login: only Claude of the panel can, so one fresh Claude session.
+  assert.equal(reviewsOf(h, id).length, 1);
+  assert.equal(h.runner.threads.get(id)!.rec.labReview?.panel, undefined);
+});
+
+test("labReview panel: a panel all of the thread's own lab doesn't take over from another lab's review", () => {
+  // A Claude thread, only Claude models ticked, and Codex to hand.
+  const h = setup({ cfg: { labReviewers: [{ provider: 'claude', model: 'opus' }, { provider: 'claude', model: 'sonnet' }, { provider: 'codex' }], labPanel: [{ provider: 'claude', model: 'opus' }, { provider: 'claude', model: 'sonnet' }] } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const waits = reviewsOf(h, id);
+  assert.equal(waits.length, 1);
+  assert.equal(h.runner.get(waits[0].threadId).provider, 'codex');
+});
+
+test('labReview panel: a model OpenCode reaches for another lab is named by that lab', async () => {
+  const { labOfModel } = await import('../../src/runner/lab-review.ts');
+  assert.equal(labOfModel('google/gemini-4-carbon'), 'Gemini');
+  assert.equal(labOfModel('opencode/gpt-6.1-sol'), 'GPT');
+  assert.equal(labOfModel('opencode/kimi-k3'), undefined);
+});
+
+// From Codex's and Gemini's review of the panel (19 Nov 2026).
+
+test('labReview panel: a reviewer done while the others work is put away at once', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  finishOne(h, a, { needs: 'nothing', findings: [FINDINGS[0]] });
+  assert.ok(h.runner.get(a).archivedAt, 'out of the inbox');
+  assert.ok(h.runner.get(id).snoozedUntil, 'still waiting on the other');
+  finishOne(h, b, { needs: 'nothing', findings: [] });
+  assert.deepEqual(h.runner.reviewOwes(id)?.open?.map((f) => f.id), [1], "the first one's finding still counts");
+});
+
+test("labReview panel: a reviewer deleted after it finished keeps its findings", () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  finishOne(h, a, { needs: 'nothing', findings: [FINDINGS[0]] });
+  h.runner.threads.delete(a);
+  finishOne(h, b, { needs: 'nothing', findings: [] });
+  assert.deepEqual(h.runner.reviewOwes(id)?.open?.map((f) => f.claim), [FINDINGS[0].claim]);
+  assert.equal(h.runner.threads.get(id)!.rec.labReview?.passed, false);
+});
+
+test('labReview panel: one put away before it reviewed means no pass', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  h.runner.update({ threadId: a, archived: true });
+  finishOne(h, b, { needs: 'nothing', findings: [] });
+  assert.equal(h.runner.threads.get(id)!.rec.labReview?.passed, false);
+});
+
+test('labReview panel: all put away before any reviewed leaves the round undelivered', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  h.runner.update({ threadId: a, archived: true });
+  h.runner.update({ threadId: b, archived: true });
+  const msg = h.events(id).filter((e) => e.type === 'user.message').at(-1).text as string;
+  assert.match(msg, /wasn't reviewed/);
+  assert.equal(h.runner.threads.get(id)!.rec.labReview?.delivered, undefined);
+});
+
+test('labReview panel: no more than 20 findings in all, the most serious kept', () => {
+  const h = setup({ cfg: { ...PANEL } });
+  const id = start(h);
+  turn(h, id, { diffs: [codeDiff('src/app.ts', 200)] });
+  const [a, b] = reviewsOf(h, id).map((w) => w.threadId);
+  const many = (sev: string, n: number, tag: string) => [...Array(n)].map((_, i) => ({ severity: sev, where: `src/app.ts:${i}`, claim: `${tag} ${i}.`, case: 'x' }));
+  finishOne(h, a, { needs: 'nothing', findings: [...many('low', 8, 'A low'), ...many('high', 4, 'A high')] });
+  finishOne(h, b, { needs: 'nothing', findings: [...many('medium', 6, 'B med'), ...many('high', 4, 'B high')] });
+  const open = h.runner.reviewOwes(id)?.open ?? [];
+  assert.equal(open.length, 20);
+  assert.equal(open.filter((f) => f.severity === 'low').length, 6, 'two lows left out');
+  const msg = h.events(id).filter((e) => e.type === 'user.message').at(-1).text as string;
+  assert.match(msg, /these less serious ones have no number/);
+  assert.match(msg, /- \[low\] \(Codex [^\n]*A low 6\./);
+});
+
+test('labReview: a reviewer billed per token (OpenCode) gets a reading budget in its brief, a subscription one does not', async () => {
+  const { reviewBrief, READING_BUDGET } = await import('../../src/runner/lab-review.ts');
+  const h = setup();
+  const rec = h.runner.threads.get(start(h))!.rec;
+  const change = { files: [{ path: 'src/app.ts', added: 5, removed: 5 }], codeLines: 10, diff: '--- src/app.ts\n+new\n', clipped: false };
+  const base = { rec, ask: 'Fix it', change, independent: true, round: 1 };
+  assert.ok(reviewBrief({ ...base, lean: true }).includes(READING_BUDGET));
+  assert.ok(!reviewBrief(base).includes('Reading budget'));
 });

@@ -25,7 +25,7 @@ afterEach(() => {
 
 const ACTIONS = new Set(['createBox', 'wakeBox', 'sleepBox', 'destroyBox', 'checkBox', 'retireBox', 'reapBoxes', 'reapService', 'reapOne', 'driftOne']);
 // What run() runs of what's scheduled: the service's steps, and a move's rehoming.
-const RUNS = new Set(['boxes.wakeFor', 'boxes.archiveIfStill', 'boxes.wakeWaiting', 'boxes.wakeAllWaiting', 'boxes.failExpired', 'moves.rehomeRows']);
+const RUNS = new Set(['boxes.releaseForToken', 'boxes.archiveUnstarted', 'boxes.wakeFor', 'boxes.archiveIfStill', 'boxes.wakeWaiting', 'boxes.wakeAllWaiting', 'boxes.failExpired', 'moves.rehomeRows']);
 const REPO = { origin: 'https://github.com/mikecann/threadbear.git', subfolder: '', baseBranch: 'main' };
 const AT = new Date().toISOString();
 const MINUTE = 60_000;
@@ -132,12 +132,13 @@ test('a thread starts on a virtual runner: its runner, its box and its create, t
   assert.deepEqual({ runnerId: cmd.runnerId, threadId: cmd.threadId, kind: cmd.kind, state: cmd.state }, { runnerId, threadId: 'T2', kind: 'create', state: 'pending' });
   assert.deepEqual(cmd.args, { text: 'hello', permissionMode: 'ask', from: 'mac' });
   assert.deepEqual(await s.run(), ['createBox']);
-  // One machine, of the virtual runner's image and size, its boot token and the deployment's address in its environment and nothing else.
+  // One machine, of the virtual runner's image and size, its boot token, the deployment's address and the name of its machine-id variable in its environment and nothing else.
   assert.equal(s.fly.live().length, 1);
   const m = s.fly.live()[0]!;
   assert.equal(m.config.image, 'registry.fly.io/threadbear-box:1');
   assert.deepEqual(m.config.guest, { cpu_kind: 'shared', cpus: 2, memory_mb: 2048 });
-  assert.deepEqual(Object.keys(m.config.env).sort(), ['THREADBEAR_BOX_BOOT', 'THREADBEAR_SYNC_URL']);
+  assert.deepEqual(Object.keys(m.config.env).sort(), ['THREADBEAR_BOX_BOOT', 'THREADBEAR_MACHINE_ID_ENV', 'THREADBEAR_SYNC_URL']);
+  assert.equal(m.config.env.THREADBEAR_MACHINE_ID_ENV, 'FLY_MACHINE_ID');
   assert.equal(m.config.env.THREADBEAR_SYNC_URL, 'https://dep.convex.cloud');
   assert.match(s.bootOf(m.id), /^tbt_[0-9a-f]{64}$/);
   const row = s.rowOf('T2');
@@ -491,7 +492,7 @@ test('a box asleep, starting or failed counts as reachable: listed with its stat
   const { runnerId } = await s.start('T2');
   // Never heartbeated, creating: listed for the main Mac's runner with its state.
   const listed = async () => (await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'main-mac' })).find((r: { runnerId: string }) => r.runnerId === runnerId);
-  assert.deepEqual((await listed()).box, { state: 'creating' });
+  assert.deepEqual((await listed()).box, { state: 'creating', service: s.serviceId });
   // A machine's runner has no box field.
   await s.ctx.db.insert('runners', { runnerId: 'mini', name: 'mini', version: 'v', startedAt: 'x', draining: false, threadCount: 0, lastSeenAt: Date.now() - 60 * MINUTE });
   assert.equal((await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'main-mac' })).find((r: { runnerId: string }) => r.runnerId === 'mini').box, undefined);
@@ -503,7 +504,7 @@ test('a box asleep, starting or failed counts as reachable: listed with its stat
   assert.equal(await outcome(call(s.ctx, moves.startMove, { key: OWNER, threadId: 'T9', to: runnerId })), 'conflict');
   // Archived and gone: not listed as reachable.
   await call(s.ctx, boxes.archiveBox, { key: OWNER, threadId: 'T2' });
-  assert.deepEqual((await listed()).box, { state: 'destroying' });
+  assert.deepEqual((await listed()).box, { state: 'destroying', service: s.serviceId });
 });
 
 test("the phone never picks a box's runner for a new thread, and can't name one", async () => {
@@ -532,9 +533,29 @@ test('only the owner makes, changes and lists virtual runners, and the values ar
   assert.deepEqual(big.limits, { maxBoxes: 3, idleSleepMinutes: 10, maxAwakeHoursPerDay: 8, deleteAfterDays: 14 });
   assert.equal(big.region, 'syd');
   assert.equal(listed.find((x: { serviceId: string }) => x.serviceId === s.serviceId).running, 1, "the helper's own box is creating");
-  const bad = (a: Record<string, unknown>) => outcome(call(s.ctx, boxes.setRunnerService, { key: OWNER, name: 'X', provider: 'fly', image: 'img:1', box: { cpus: 1, memoryMb: 1024 }, ...a }));
+  // No image: the box image this repo's workflow pushes to the boxes' own
+  // Fly app (runner/box/Dockerfile), private to its organisation; with no
+  // FLY_APP there's no default, so one must be given. Changing a virtual
+  // runner without one keeps the image it has.
+  const imageOf = async (id: string) => (await call(s.ctx, boxes.runnerServices, { key: OWNER })).find((x: { serviceId: string }) => x.serviceId === id).image;
+  const was = process.env.FLY_APP;
+  try {
+    delete process.env.FLY_APP;
+    assert.equal(await outcome(call(s.ctx, boxes.setRunnerService, { key: OWNER, name: 'Plain', provider: 'fly', box: { cpus: 1, memoryMb: 1024 } })), 'badArgs');
+    process.env.FLY_APP = 'tb-boxes-test';
+    const plain = await call(s.ctx, boxes.setRunnerService, { key: OWNER, name: 'Plain', provider: 'fly', box: { cpus: 1, memoryMb: 1024 } });
+    assert.equal(await imageOf(plain), 'registry.fly.io/tb-boxes-test:latest');
+  } finally {
+    if (was === undefined) delete process.env.FLY_APP; else process.env.FLY_APP = was;
+  }
+  await call(s.ctx, boxes.setRunnerService, { key: OWNER, serviceId: made, name: 'Big', provider: 'fly', box: { cpus: 4, memoryMb: 2048 } });
+  assert.equal(await imageOf(made), 'img:1');
+  const bad =(a: Record<string, unknown>) => outcome(call(s.ctx, boxes.setRunnerService, { key: OWNER, name: 'X', provider: 'fly', image: 'img:1', box: { cpus: 1, memoryMb: 1024 }, ...a }));
   assert.equal(await bad({ provider: 'aws' }), 'badArgs');
   assert.equal(await bad({ box: { cpus: 1, memoryMb: 1000 } }), 'badArgs');
+  // Under 1024 MB, a box may not have the memory to restore its thread's save (box-save.ts).
+  assert.equal(await bad({ box: { cpus: 1, memoryMb: 768 } }), 'badArgs');
+  assert.equal(await bad({ box: { cpus: 1, memoryMb: 256 } }), 'badArgs');
   assert.equal(await bad({ box: { cpus: 0, memoryMb: 1024 } }), 'badArgs');
   assert.equal(await bad({ image: 'has space' }), 'badArgs');
   assert.equal(await bad({ limits: { maxBoxes: 0 } }), 'badArgs');
@@ -555,6 +576,236 @@ test('only the owner makes, changes and lists virtual runners, and the values ar
   assert.equal(await outcome(s.start('T7')), 'conflict');
   assert.equal(await outcome(s.start('T2')), 'conflict');
   assert.equal(s.rows('runners').filter((r) => r.box).length, 1, "T2's runner only: a refused start writes none");
+});
+
+// ------------------------------------------------------------ cloud tokens from the Mac (slice 5, API 94)
+
+const OTHER_LOGIN = 'other@example.com';
+const otherToken = `sk-ant-oat01-${'O'.repeat(60)}`;
+const setFor = (s: Awaited<ReturnType<typeof setup>>, login: string, token = otherToken) => call(s.a, boxes.setCloudToken, { key: OWNER, login, token });
+const startAs = (s: Awaited<ReturnType<typeof setup>>, threadId: string, login: string, extra: Record<string, unknown> = {}) =>
+  call(s.a, boxes.startThread, { key: OWNER, serviceId: s.serviceId, threadId, repo: REPO, login, text: 'first line\nsecond', permissionMode: 'ask', ...extra });
+
+test('a thread whose login has no cloud token waits for one: no box, its create pending; setting one starts it', async () => {
+  const s = await setup();
+  const { runnerId, commandId } = await startAs(s, 'T2', OTHER_LOGIN);
+  assert.equal(s.stateOf('T2'), 'needsToken');
+  assert.deepEqual(await s.run(), [], 'nothing asked of the provider');
+  assert.equal(s.fly.live().length, 0);
+  assert.equal(s.rows('commands').find((c) => c._id === commandId)!.state, 'pending');
+  // A message for it meanwhile wakes nothing: it waits behind the create.
+  const sent = await call(s.ctx, relay.queueCommand, { key: OWNER, runnerId, threadId: 'T2', kind: 'send', args: { text: 'and this' } });
+  assert.deepEqual(await s.run(), []);
+  assert.equal(s.rows('commands').find((c) => c._id === sent)!.state, 'pending');
+  // Another login's token releases nothing.
+  await setFor(s, 'third@example.com');
+  assert.deepEqual(await s.run(), ['releaseForToken']);
+  assert.equal(s.stateOf('T2'), 'needsToken');
+  await setFor(s, OTHER_LOGIN);
+  assert.deepEqual(await s.run(), ['releaseForToken', 'createBox']);
+  assert.equal(s.stateOf('T2'), 'starting');
+  assert.equal(s.fly.live().length, 1);
+  const got = await s.exchange(s.bootOf(s.fly.live()[0]!.id));
+  assert.equal(got.claudeToken, otherToken);
+  assert.equal(s.stateOf('T2'), 'awake');
+  const pending = await call(s.ctx, sync.pendingCommands, { key: got.boxKey, runnerId });
+  assert.deepEqual(pending.map((c: { kind: string }) => c.kind), ['create', 'send']);
+});
+
+test("a login whose cloud token was refused starts its next thread waiting; a new token releases it, and an old refusal can't kill the new one", async () => {
+  const s = await setup();
+  await s.start('T2');
+  await s.run();
+  const got = await s.boot('T2', s.fly.live()[0]!.id);
+  const firstSetAt = got.tokenSetAt;
+  assert.equal(typeof firstSetAt, 'number');
+  await call(s.ctx, boxes.tokenRefused, { key: got.boxKey, setAt: firstSetAt });
+  assert.equal(s.rows('cloudTokens').find((t) => t.login === LOGIN)!.tokenState.kind, 'dead');
+  await startAs(s, 'T3', LOGIN);
+  assert.equal(s.stateOf('T3'), 'needsToken');
+  assert.deepEqual(await s.run(), []);
+  await setFor(s, LOGIN);
+  assert.deepEqual(await s.run(), ['releaseForToken', 'createBox']);
+  assert.equal(s.stateOf('T3'), 'starting');
+  // T2's box still holds the old token: its refusal again leaves the new one valid.
+  await call(s.ctx, boxes.tokenRefused, { key: got.boxKey, setAt: firstSetAt });
+  const row = s.rows('cloudTokens').find((t) => t.login === LOGIN)!;
+  assert.equal(row.tokenState.kind, 'valid');
+  assert.ok(row.setAt > firstSetAt);
+  const listed = await call(s.ctx, boxes.cloudTokens, { key: OWNER });
+  assert.equal(listed.find((t: { login: string }) => t.login === LOGIN).state, 'valid');
+});
+
+test('a box fetches its login\'s new token only while it\'s valid, on its own key only', async () => {
+  const s = await setup();
+  await s.start('T2');
+  await s.run();
+  const got = await s.boot('T2', s.fly.live()[0]!.id);
+  const fetch = (key: string) => call(s.a, boxes.boxCloudToken, { key });
+  const now = await fetch(got.boxKey);
+  assert.equal(now.setAt, got.tokenSetAt);
+  assert.equal(now.token, got.claudeToken);
+  await call(s.ctx, boxes.tokenRefused, { key: got.boxKey, setAt: got.tokenSetAt });
+  assert.equal(await fetch(got.boxKey), null, 'dead: nothing to fetch');
+  const fresh = `sk-ant-oat01-${'N'.repeat(60)}`;
+  await setFor(s, LOGIN, fresh);
+  // A box that has saved holds no work; reading its token doesn't change that.
+  s.rowOf('T2').workAttempts = [];
+  const after = await fetch(got.boxKey);
+  assert.equal(after.token, fresh);
+  assert.ok(after.setAt > got.tokenSetAt);
+  // Reading it isn't work.
+  assert.deepEqual(s.rowOf('T2').workAttempts, []);
+  // Only a box's own key: not the owner, nor a box whose key is gone.
+  assert.equal(await outcome(fetch(OWNER)), 'forbidden');
+  assert.equal(await outcome(call(s.ctx, boxes.tokenRefused, { key: OWNER, setAt: 1 })), 'forbidden');
+  assert.equal(await outcome(fetch(`tbb_${'0'.repeat(64)}`)), 'auth');
+  // Nor a machine's runner key.
+  const { sha256 } = load('lib') as { sha256: (x: string) => Promise<string> };
+  await s.ctx.db.insert('runnerKeys', { runnerId: 'cb921b2447ea', keyHash: await sha256('tbr_mini'), name: 'mini', createdAt: 1 });
+  assert.equal(await outcome(fetch('tbr_mini')), 'forbidden');
+  assert.equal(await outcome(call(s.ctx, boxes.tokenRefused, { key: 'tbr_mini', setAt: after.setAt })), 'forbidden');
+  assert.equal(s.rows('cloudTokens').find((t) => t.login === LOGIN)!.tokenState.kind, 'valid');
+});
+
+test("the owner sees each box's virtual runner, and its login when it has no token or a refused one", async () => {
+  const s = await setup();
+  const waiting = await startAs(s, 'T2', OTHER_LOGIN);
+  const up = await s.start('T3');
+  await s.run();
+  const got = await s.boot('T3', s.fly.live()[0]!.id);
+  const list = async () => (await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'mainmac00001' })) as { runnerId: string; box?: Record<string, unknown> }[];
+  const boxOf = async (runnerId: string) => (await list()).find((r) => r.runnerId === runnerId)!.box!;
+  assert.deepEqual(await boxOf(waiting.runnerId), { state: 'needsToken', service: s.serviceId, token: 'none', login: OTHER_LOGIN });
+  assert.deepEqual(await boxOf(up.runnerId), { state: 'awake', service: s.serviceId });
+  await call(s.ctx, boxes.tokenRefused, { key: got.boxKey, setAt: got.tokenSetAt });
+  assert.deepEqual(await boxOf(up.runnerId), { state: 'awake', service: s.serviceId, token: 'dead', login: LOGIN });
+});
+
+test("a thread on a virtual runner is listed from its start, with its first line, before its box writes anything", async () => {
+  const s = await setup();
+  const { runnerId } = await startAs(s, 'T2', OTHER_LOGIN, { cwd: '/Users/me/dev/threadbear', accountId: 'claude-2', model: 'claude-opus-5-5' });
+  const row = s.rows('threadIndex').find((r) => r.threadId === 'T2')!;
+  assert.equal(row.runnerId, runnerId);
+  assert.equal(row.title, 'first line');
+  assert.equal(row.preview, 'first line');
+  assert.equal(row.status, 'starting');
+  assert.equal(row.cwd, '/Users/me/dev/threadbear');
+  assert.equal(row.accountId, 'claude-2');
+  assert.equal(row.provider, 'claude');
+  assert.equal(row.permissionMode, 'ask');
+  assert.equal(typeof row.updatedMs, 'number');
+  const since = await call(s.ctx, sync.threadIndexSince, { key: OWNER, runners: [{ runnerId }] });
+  assert.deepEqual(since.map((r: { threadId: string }) => r.threadId), ['T2']);
+});
+
+test('archiving a thread that never got its token ends it: the archive works, its row is archived, its other commands fail', async () => {
+  const s = await setup();
+  const { runnerId, commandId } = await startAs(s, 'T2', OTHER_LOGIN);
+  const archived = await call(s.ctx, relay.queueCommand, { key: OWNER, runnerId, threadId: 'T2', kind: 'update', args: { archive: true } });
+  await s.run();
+  assert.equal(s.stateOf('T2'), 'expired');
+  assert.equal(s.rows('commands').find((c) => c._id === commandId)!.state, 'failed');
+  // Codex's review of slice 5, 3: the archive itself worked, and the sidebar row says so.
+  assert.equal(s.rows('commands').find((c) => c._id === archived)!.state, 'done');
+  const row = s.rows('threadIndex').find((r) => r.threadId === 'T2')!;
+  assert.equal(typeof row.archivedAt, 'string');
+  const since = await call(s.ctx, sync.threadIndexSince, { key: OWNER, runners: [{ runnerId }] });
+  assert.equal(since.find((r: { threadId: string }) => r.threadId === 'T2').archivedAt, row.archivedAt);
+  // A token set later starts nothing for it.
+  await setFor(s, OTHER_LOGIN);
+  assert.deepEqual(await s.run(), ['releaseForToken']);
+  assert.equal(s.fly.live().length, 0);
+});
+
+// Codex's review of slice 5, 1: the first line went into the sidebar unscrubbed.
+test("a virtual runner thread's first sidebar row has its secrets taken out, before it's cut short", async () => {
+  const s = await setup();
+  const claude = `sk-ant-oat01-${'A'.repeat(80)}`;
+  const boxKey = `tbb_${'a'.repeat(64)}`;
+  const boot = `tbt_${'b'.repeat(64)}`;
+  await startAs(s, 'T2', OTHER_LOGIN, { text: `use ${claude} ${boxKey} ${boot}\nsecond` });
+  // One that starts just before the title's cut: cut first, what's left of it wouldn't look like a key.
+  await startAs(s, 'T3', OTHER_LOGIN, { text: `${'x '.repeat(55)}${claude}` });
+  for (const id of ['T2', 'T3']) {
+    const row = s.rows('threadIndex').find((r) => r.threadId === id)!;
+    for (const field of [row.title, row.preview]) {
+      assert.ok(!field.includes('sk-ant'), `${id}: no claude token in ${field}`);
+      assert.ok(!field.includes('tbb_aaaa') && !field.includes('tbt_bbbb'), `${id}: no box key or boot token in ${field}`);
+    }
+  }
+});
+
+// Codex's review of slice 5, 2: setting a token released every waiting box at once, past maxBoxes.
+test('setting a token starts only as many waiting threads as there is room for; the rest start as room frees', async () => {
+  const s = await setup();
+  // The helper's own box is creating: one of two.
+  await setLimits(s, { maxBoxes: 2 });
+  for (const id of ['T2', 'T3', 'T4']) await startAs(s, id, OTHER_LOGIN);
+  assert.deepEqual(['T2', 'T3', 'T4'].map(s.stateOf), ['needsToken', 'needsToken', 'needsToken']);
+  await setFor(s, OTHER_LOGIN);
+  const ran = await s.run();
+  assert.equal(ran.filter((n) => n === 'createBox').length, 1, 'one box made');
+  assert.equal(s.fly.live().length, 1);
+  assert.deepEqual(['T2', 'T3', 'T4'].map(s.stateOf), ['starting', 'waitingForRoom', 'waitingForRoom']);
+  // The app shows the rest waiting, with no token card.
+  const list = (await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'mainmac00001' })) as { runnerId: string; box?: Record<string, unknown> }[];
+  const t3 = list.find((r) => r.runnerId === s.rowOf('T3').runnerId)!.box!;
+  assert.equal(t3.state, 'waitingForRoom');
+  assert.equal(t3.waiting, true);
+  assert.equal(t3.token, undefined);
+  // T2 archived: its room goes to T3, the oldest waiting.
+  await call(s.ctx, boxes.archiveBox, { key: OWNER, threadId: 'T2' });
+  await s.run();
+  assert.deepEqual(['T3', 'T4'].map(s.stateOf), ['starting', 'waitingForRoom']);
+  // T4 archived while it waits for room: it ends, its archive done, its row archived.
+  const t4 = s.rowOf('T4').runnerId;
+  const archived = await call(s.ctx, relay.queueCommand, { key: OWNER, runnerId: t4, threadId: 'T4', kind: 'update', args: { archive: true } });
+  await s.run();
+  assert.equal(s.stateOf('T4'), 'expired');
+  assert.equal(s.rows('commands').find((c) => c._id === archived)!.state, 'done');
+  assert.equal(typeof s.rows('threadIndex').find((r) => r.threadId === 'T4')!.archivedAt, 'string');
+});
+
+// Codex's second look at slice 5, 1: a thread waiting for room started on a token refused meanwhile.
+test("a thread waiting for room whose login's token was refused meanwhile goes back to waiting for a token, using no room", async () => {
+  const s = await setup();
+  await setLimits(s, { maxBoxes: 2 });
+  for (const id of ['T2', 'T3']) await startAs(s, id, OTHER_LOGIN);
+  await setFor(s, OTHER_LOGIN);
+  await s.run();
+  assert.deepEqual(['T2', 'T3'].map(s.stateOf), ['starting', 'waitingForRoom']);
+  const got = await s.boot('T2', s.fly.live()[0]!.id);
+  await call(s.ctx, boxes.tokenRefused, { key: got.boxKey, setAt: got.tokenSetAt });
+  // Room for T3 now, but its token is dead.
+  await setLimits(s, { maxBoxes: 3 });
+  await call(s.ctx, boxes.wakeWaiting, { serviceId: s.serviceId });
+  const ran = await s.run();
+  assert.equal(s.stateOf('T3'), 'needsToken');
+  assert.equal(ran.filter((n) => n === 'createBox').length, 0, 'no machine for a dead token');
+  const list = (await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'mainmac00001' })) as { runnerId: string; box?: Record<string, unknown> }[];
+  assert.equal(list.find((r) => r.runnerId === s.rowOf('T3').runnerId)!.box!.token, 'dead');
+  // A new token starts it.
+  await setFor(s, OTHER_LOGIN, `sk-ant-oat01-${'Q'.repeat(60)}`);
+  await s.run();
+  assert.equal(s.stateOf('T3'), 'starting');
+});
+
+// Codex's second look at slice 5, 2: a token's release jumped the room queue.
+test("a token's threads join the room queue in the order they started: older threads waiting for room go first", async () => {
+  const s = await setup();
+  await setLimits(s, { maxBoxes: 2 });
+  for (const id of ['T2', 'T3']) await startAs(s, id, OTHER_LOGIN);
+  await setFor(s, OTHER_LOGIN);
+  await s.run();
+  assert.deepEqual(['T2', 'T3'].map(s.stateOf), ['starting', 'waitingForRoom']);
+  // One more slot, and a younger thread on another login, whose token is set before any idle check: T3, older, takes the slot.
+  await setLimits(s, { maxBoxes: 3 });
+  await startAs(s, 'T4', 'third@example.com');
+  assert.equal(s.stateOf('T4'), 'needsToken');
+  await setFor(s, 'third@example.com');
+  await s.run();
+  assert.deepEqual(['T3', 'T4'].map(s.stateOf), ['starting', 'waitingForRoom']);
 });
 
 // ------------------------------------------------------------ Codex's review of 66ccfc1c4 (18 Nov 2026)
@@ -617,7 +868,7 @@ test('a wake past maxBoxes waits, its message pending, and wakes when another bo
   assert.ok(s.rowOf('T2').wantsWakeAt);
   assert.equal(s.rows('commands').find((c) => c._id === cmd)!.state, 'pending');
   const listed = (await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'main-mac' })).find((r: { runnerId: string }) => r.runnerId === runnerId);
-  assert.deepEqual(listed.box, { state: 'asleep', waiting: true });
+  assert.deepEqual(listed.box, { state: 'asleep', waiting: true, service: s.serviceId });
   // T3 sleeps: T2 wakes in its place.
   await s.sleepWith('T3', got3.boxKey);
   assert.equal(s.stateOf('T2'), 'awake');
@@ -723,7 +974,7 @@ test("once an archived thread's save is deleted, what's sent to it fails saying 
   assert.equal(c.state, 'failed');
   assert.match(c.note, /can't come back/);
   assert.equal(s.fly.live().length, 0);
-  assert.deepEqual((await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'main-mac' })).find((r: { runnerId: string }) => r.runnerId === runnerId).box, { state: 'expired' });
+  assert.deepEqual((await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'main-mac' })).find((r: { runnerId: string }) => r.runnerId === runnerId).box, { state: 'expired', service: s.serviceId });
 });
 
 // 7. The reaper acted on a plan the row had moved on from, and a refused RESUMED stopped the wake.
@@ -1215,7 +1466,7 @@ test('a waking command behind fifty that wake nothing still brings an archived b
 });
 
 // 6. Fifty boxes waiting for tomorrow's hours kept one waiting for room from waking.
-test("boxes waiting for room wake though many waiting for tomorrow's hours came first", async () => {
+test("boxes waiting for room wake though many waiting for tomorrow's hours came first", () => atNoon(async () => {
   const s = await setup();
   await setLimits(s, { maxBoxes: 100, maxAwakeHoursPerDay: 1 });
   const today = new Date().toISOString().slice(0, 10);
@@ -1239,7 +1490,7 @@ test("boxes waiting for room wake though many waiting for tomorrow's hours came 
   await call(s.ctx, boxes.wakeWaiting, { serviceId: s.serviceId });
   assert.equal(s.stateOf('E1'), 'waking');
   assert.ok(capped.every((_, i) => s.stateOf(`C${i}`) === 'asleep'));
-});
+}));
 
 // ------------------------------------------------------------ Codex's fourth round (18 Nov 2026)
 // A box is only given up when the provider says it's gone (or has lost its disk).
@@ -1338,7 +1589,7 @@ test("a box that stops heartbeating but is still running is kept, marked unreach
   assert.equal(s.stateOf('T2'), 'awake', 'the provider has it running: kept');
   assert.equal(s.rowOf('T2').boxAttempt, 1);
   const listed = (await call(s.ctx, sync.otherRunnersList, { key: OWNER, runnerId: 'main-mac' })).find((r: { runnerId: string }) => r.runnerId === runnerId);
-  assert.deepEqual(listed.box, { state: 'awake', unreachable: true });
+  assert.deepEqual(listed.box, { state: 'awake', unreachable: true, service: s.serviceId });
   // It's back: heartbeating clears it.
   assert.equal(await outcome(s.beat(got.boxKey, runnerId)), 'ok');
   assert.equal(s.rowOf('T2').unreachableSince, undefined);
@@ -1452,7 +1703,7 @@ test('M: the billing guard pauses a running box that should be asleep, every pas
 });
 
 // 4. M: a capped box kept running billed for ever.
-test("M: a box kept running asleep is counted and charged, and is let go after its virtual runner's days", async () => {
+test("M: a box kept running asleep is counted and charged, and is let go after its virtual runner's days", () => atNoon(async () => {
   // Too big to pause (a virtual runner from before 2 GB was the most): its size says so.
   const s = await setup(4096);
   const refuse = s.fly.failWhile(() => false, 400);
@@ -1473,10 +1724,10 @@ test("M: a box kept running asleep is counted and charged, and is let go after i
   await s.send(runnerId, 'T2');
   await s.run();
   assert.equal(s.stateOf('T2'), 'starting');
-});
+}));
 
 // 5. M: a resume that half worked ran for ever, uncounted.
-test('M: a wake whose box runs but never comes up is charged, and paused once its grace is out', async () => {
+test('M: a wake whose box runs but never comes up is charged, and paused once its grace is out', () => atNoon(async () => {
   const s = await setup();
   const { runnerId, m, got } = await unsavedPaused(s);
   const stuck = s.fly.failWhile((r) => r.path.endsWith('/wait') && r.query.get('state') === 'started', 503);
@@ -1502,7 +1753,7 @@ test('M: a wake whose box runs but never comes up is charged, and paused once it
   assert.equal(s.stateOf('T2'), 'asleep');
   assert.ok(s.rowOf('T2').boxKeyHash);
   stuck.stop();
-});
+}));
 
 // ------------------------------------------------------------ Codex's sixth round (18 Nov 2026)
 
@@ -1772,7 +2023,7 @@ test("a retirement cut short stays retiring, a message waits, and it's finished 
 });
 
 // 3. A row-wide stamp moved by one machine undercharged another.
-test("each machine is charged from its own last observation, not a stamp another machine moved", async () => {
+test("each machine is charged from its own last observation, not a stamp another machine moved", () => atNoon(async () => {
   const s = await setup();
   await pausedWithMessage(s);
   const boxId = boxIdOf(s, 'T2');
@@ -1781,7 +2032,7 @@ test("each machine is charged from its own last observation, not a stamp another
   await call(s.ctx, service.observe, { serviceId: s.serviceId, boxes: [{ providerBoxId: 'old', state: 'stopped', boxId, attempt: 1 }] });
   await later(1000, () => call(s.ctx, service.observe, { serviceId: s.serviceId, boxes: [{ providerBoxId: 'new', state: 'running', boxId, attempt: 2 }] }));
   assert.ok((s.rowOf('T2').awakeToday?.ms ?? 0) - before >= 4 * MINUTE, 'charged as a whole pass, not a second');
-});
+}));
 
 // 4. countRunning could count one row twice and miss another.
 test('maxBoxes counts every box seen running once, whatever order they come in', async () => {
@@ -2169,7 +2420,7 @@ test('the exchange takes a machine id only of the shape a provider gives', async
 });
 
 // 2. A duplicate's running time went uncharged because its attempt was the row's.
-test("a running duplicate is charged by observation while the row's own machine is charged by its state", async () => {
+test("a running duplicate is charged by observation while the row's own machine is charged by its state", () => atNoon(async () => {
   const s = await setup();
   const { a } = await withDuplicate(s, 'started');
   const boxId = boxIdOf(s, 'T2');
@@ -2177,7 +2428,7 @@ test("a running duplicate is charged by observation while the row's own machine 
   await call(s.ctx, service.observe, { serviceId: s.serviceId, boxes: [{ providerBoxId: a.id, state: 'running', boxId, attempt: 1 }, { providerBoxId: 'dup', state: 'running', boxId, attempt: 1 }] });
   const charged = (s.rowOf('T2').awakeToday?.ms ?? 0) - before;
   assert.ok(charged >= 4 * MINUTE && charged <= 6 * MINUTE, `one pass, for the duplicate only (${charged})`);
-});
+}));
 
 // 3. A queue mark made after another was deleted could be cleared by an old step.
 test("an old reaper step leaves alone a mark queued after its own was deleted", async () => {

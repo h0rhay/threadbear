@@ -310,7 +310,7 @@ impl Threadbear {
         }
         let field = cx.new(|cx| InputState::new(window, cx).placeholder("Thread title").default_value(title));
         // A new name typed and not yet taken: an update's restart waits for it.
-        crate::unsent::watch(&field, "a thread's new title", cx);
+        crate::unsent::watch_in(&field, "the title box", Some(id.clone()), cx);
         // The whole name selected, so typing replaces it, as a click on the
         // Swift app's title does (Mike, 11 Nov).
         field.update(cx, |s, cx| s.select_all(window, cx));
@@ -1457,12 +1457,10 @@ impl Threadbear {
             NOT_CONNECTED if held => return self.show_connection_error(crate::thread::NOT_CONNECTED_TEXT.to_owned(), cx),
             NOT_CONNECTED => "Couldn't reach the runner.".to_owned(),
             CLOSED => "Lost the connection to the runner.".to_owned(),
-            TIMED_OUT => "The runner didn't answer threads.send in time.".to_owned(),
+            TIMED_OUT => "The runner didn't answer in time.".to_owned(),
             _ => return self.show_error(error.message.clone(), cx),
         };
-        let title = title.trim();
-        let name = if title.is_empty() { "this thread".to_owned() } else { format!("\u{201C}{title}\u{201D}") };
-        self.show_error(format!("{what} Your message to {name} wasn't sent. It's back in its box."), cx);
+        self.show_error(send_failed_text(&what, title, error.code == TIMED_OUT), cx);
     }
 
     fn dismiss_error(&mut self, cx: &mut Context<Self>) {
@@ -1747,11 +1745,7 @@ fn icon(name: &str, size: f32, color: Hsla) -> Icon {
 
 /// `abbreviatingHome`, for tooltips.
 fn abbreviate(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path == home => "~".into(),
-        Ok(home) if !home.is_empty() && path.starts_with(&format!("{home}/")) => format!("~{}", &path[home.len()..]),
-        _ => path.to_string(),
-    }
+    threadbear_core::new_thread::abbreviate_home(path, &crate::files::home_dir())
 }
 
 /// The sign-in script, readable and runnable by Mike only, written whole:
@@ -1760,4 +1754,35 @@ fn abbreviate(path: &str) -> String {
 /// Swift's `write(to:atomically:)` does (`private_file`).
 fn write_script(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     threadbear_core::private_file::write_with_mode(path, text.as_bytes(), 0o700)
+}
+
+/// The error bar's words for a send that didn't go (`show_send_failed`).
+/// `unanswered`: the runner never answered, and the message wasn't in the
+/// thread when the app looked, but a stalled runner may still take it, so
+/// it doesn't say it wasn't sent.
+fn send_failed_text(what: &str, title: &str, unanswered: bool) -> String {
+    let title = title.trim();
+    let name = if title.is_empty() { "this thread".to_owned() } else { format!("\u{201C}{title}\u{201D}") };
+    if unanswered {
+        format!("{what} Your message to {name} hasn't shown up there, so it's back in its box. It may still arrive: look before sending it again.")
+    } else {
+        format!("{what} Your message to {name} wasn't sent. It's back in its box.")
+    }
+}
+
+#[cfg(test)]
+mod send_failed_tests {
+    use super::send_failed_text;
+
+    #[test]
+    fn a_send_with_no_answer_doesnt_say_it_wasnt_sent() {
+        let text = send_failed_text("The runner didn't answer in time.", "Daily brief", true);
+        assert!(!text.contains("wasn't sent"), "{text}");
+        assert!(text.contains("\u{201C}Daily brief\u{201D}") && text.contains("back in its box"), "{text}");
+    }
+
+    #[test]
+    fn a_lost_connection_says_it_wasnt_sent() {
+        assert_eq!(send_failed_text("Couldn't reach the runner.", "  ", false), "Couldn't reach the runner. Your message to this thread wasn't sent. It's back in its box.");
+    }
 }

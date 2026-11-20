@@ -145,7 +145,8 @@ test('every function in convex/sync.ts, relay.ts, moves.ts, boxes.ts and boxServ
     if (KEYLESS.includes(name)) continue;
     const body = parts.find((p) => p.startsWith(`export const ${name} =`))!;
     // An action has no database, so it asks the gate through a query (boxes.ts actionAuth).
-    assert.match(body, new RegExp(`(runnerAuth|actionAuth)\\(ctx, key, '${name}'\\)`), `${name} asks runnerAuth as '${name}'`);
+    // An options argument may follow (a box's housekeeping, lib.ts runnerAuth).
+    assert.match(body, new RegExp(`(runnerAuth|actionAuth)\\(ctx, key, '${name}'(, \\{[^}]*\\})?\\)`), `${name} asks runnerAuth as '${name}'`);
     assert.doesNotMatch(body, /checkRunnerKey/, `${name} doesn't use the old check`);
   }
 });

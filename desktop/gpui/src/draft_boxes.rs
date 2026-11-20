@@ -240,7 +240,7 @@ fn start_edit(key: String, thread: String, draft: &DraftBlock, window: &mut Wind
         None => {
             let source = draft.source.clone();
             let editor = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 30).default_value(source));
-            crate::unsent::watch(&editor, "a draft being changed in a reply", cx);
+            crate::unsent::watch_in(&editor, "a reply's draft box", Some(thread.clone()), cx);
             // ⌘Return is Done, as it saves a project's notes. Return is a new line.
             let done_key = key.clone();
             let keys = cx.subscribe(&editor, move |_, event: &InputEvent, cx| {

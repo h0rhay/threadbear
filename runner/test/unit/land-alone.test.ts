@@ -5,8 +5,10 @@
 // on each landing by itself first, which names the broken ones in one pass.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { land, landLimits, onlyFailed, onlyRan, type LandTarget } from '../../src/worktrees.ts';
 import { LAND_TIMES_FILE, typicalCheckSeconds, waiting } from '../../src/land-queue.ts';
 import { passedLandCheck } from '../../src/update.ts';
@@ -332,6 +334,17 @@ test("what a failed check says to run again is read only in check.sh's own words
   for (const v of ['x$(id)', 'a`b`', "a'b", '-rf', 'a\\b', 'a&b', 'a|b', 'a>b', '']) assert.equal(onlyFailed(line(v)), undefined, v);
   // Not from the middle of a line a test printed.
   assert.equal(onlyFailed('  not ok 3 - To run only what failed again: --only "site build"\n'), undefined);
+  // As check.sh says it now, a command that runs as printed (19 Nov), and
+  // as an older check.sh said it.
+  assert.equal(onlyFailed('To run only what failed again: ./check.sh --only "lint"\n'), 'lint');
+  assert.equal(onlyFailed('To run only what failed again: tb land --only "lint"\n'), undefined);
+});
+
+test('tb land refuses --only, and says so with a failing exit', () => {
+  // A background `tb land --only lint` had to fail, not seem to land.
+  const r = spawnSync(process.execPath, [path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../bin/tb'), 'land', '--only', 'lint'], { encoding: 'utf8' });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /Unknown option '--only'/);
 });
 
 test("what a run with --only says it ran is read the same way", () => {

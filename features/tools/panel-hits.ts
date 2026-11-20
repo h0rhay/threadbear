@@ -15,11 +15,11 @@
 //     env TB_WEB_RUNTIME_ARCHIVE=<the pinned archive> node features/tools/panel-hits.ts
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { GpuiDriver } from '../support/gpui.ts';
 import { sleep, type Dump } from '../support/driver.ts';
 import { startSites, stopSites } from '../support/web-pages.ts';
+import { runtimeParent } from '../support/web-runtime.ts';
 import { assertInFront, recording, windowFrame, work } from './real-screen.ts';
 
 const archive = process.env.TB_WEB_RUNTIME_ARCHIVE;
@@ -43,7 +43,7 @@ execFileSync('swiftc', ['-O', `${tool}.swift`, '-o', tool]);
 const awake = spawn('/usr/bin/caffeinate', ['-u', '-d', '-w', String(process.pid)], { stdio: 'ignore' });
 awake.unref();
 
-const runtime = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'tb-panel-hits-runtime-'));
+const runtime = fs.mkdtempSync(path.join(runtimeParent(), 'tb-panel-hits-runtime-'));
 process.env.THREADBEAR_WEB_RUNTIME_DIR = runtime;
 const sites = await startSites();
 const app = new GpuiDriver();

@@ -61,20 +61,21 @@ fn mac_home(home: &Path) -> PathBuf {
     home.join("Library").join("Application Support").join("Threadbear")
 }
 
-/// Windows: %LOCALAPPDATA%\Threadbear, where the native runner lives. A
-/// PC whose runner is still in WSL has its token copied to the Mac's
-/// folder names under the profile instead, so while that folder has a
-/// token and the new one doesn't, the old one is the runner's (until the
-/// WSL runners have moved over, 17 Nov 2026).
+/// Windows: %LOCALAPPDATA%\Threadbear, where the runner lives. An app from
+/// before 19 Nov kept its own settings in the Mac's folder names under the
+/// profile (where the WSL runner's token was copied), so those two files
+/// come across once, while the new folder has none. Drop this once the
+/// Windows PCs have all started a newer app.
 fn windows_home(local: Option<PathBuf>, home: &Path) -> PathBuf {
     let new = local.unwrap_or_else(|| home.join("AppData").join("Local")).join("Threadbear");
     let old = mac_home(home);
-    let token = |d: &Path| d.join("secrets").join("runner-token").is_file();
-    if !token(&new) && token(&old) {
-        old
-    } else {
-        new
+    for name in ["desktop-settings.json", "gpui-prefs.json"] {
+        let (from, to) = (old.join(name), new.join(name));
+        if from.is_file() && !to.exists() && std::fs::create_dir_all(&new).is_ok() {
+            let _ = std::fs::copy(&from, &to);
+        }
     }
+    new
 }
 
 /// Why a scripted app (one with THREADBEAR_AUTOMATION set) mustn't start
@@ -137,23 +138,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_finds_the_native_runner_and_falls_back_to_the_wsl_token() {
+    fn windows_uses_local_app_data_and_brings_the_old_settings_across_once() {
         let dir = std::env::temp_dir().join(format!("tb-desktop-home-{}", std::process::id()));
         let local = dir.join("AppData").join("Local");
         let new = local.join("Threadbear");
         let old = mac_home(&dir);
-        // Neither has a token yet: the native runner's place.
+        // Nothing anywhere: the native runner's place, and nothing made.
         assert_eq!(windows_home(Some(local.clone()), &dir), new);
-        // Only the WSL runner's copied token: that one.
+        assert!(!new.exists());
+        // An older app's settings, and a copied token, in the old place:
+        // the settings come across, the token doesn't, and the old place
+        // is never used.
         std::fs::create_dir_all(old.join("secrets")).unwrap();
         std::fs::write(old.join("secrets").join("runner-token"), "t").unwrap();
-        assert_eq!(windows_home(Some(local.clone()), &dir), old);
-        // Once the native runner has one, it wins.
-        std::fs::create_dir_all(new.join("secrets")).unwrap();
-        std::fs::write(new.join("secrets").join("runner-token"), "t").unwrap();
+        std::fs::write(old.join("desktop-settings.json"), "{\"a\":1}").unwrap();
+        std::fs::write(old.join("gpui-prefs.json"), "{\"b\":2}").unwrap();
+        assert_eq!(windows_home(Some(local.clone()), &dir), new);
+        assert_eq!(std::fs::read_to_string(new.join("desktop-settings.json")).unwrap(), "{\"a\":1}");
+        assert_eq!(std::fs::read_to_string(new.join("gpui-prefs.json")).unwrap(), "{\"b\":2}");
+        assert!(!new.join("secrets").exists());
+        // Once there, the new folder's own are kept.
+        std::fs::write(new.join("desktop-settings.json"), "{\"a\":3}").unwrap();
         assert_eq!(windows_home(Some(local), &dir), new);
+        assert_eq!(std::fs::read_to_string(new.join("desktop-settings.json")).unwrap(), "{\"a\":3}");
         // No LOCALAPPDATA: where Windows puts it.
-        assert_eq!(windows_home(None, &dir), new);
+        assert_eq!(windows_home(None, &dir), dir.join("AppData").join("Local").join("Threadbear"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

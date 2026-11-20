@@ -13,6 +13,18 @@ export const BOX_RUNNER = 'box0thread01';
 export const THREAD = 'box-thread-1';
 export const ORIGIN_WITH_TOKEN = 'https://mike:ghp_SECRETSECRET@github.com/mikecann/threadbear.git';
 
+// The box tests' clock starts at midday (UTC) today. A box's awake time is
+// counted by the UTC day (convex/boxMachine.ts awakeAdded), and a test that
+// moves the clock on a few minutes with later() saw the count go back to
+// nothing when that crossed midnight: GitHub's Windows run at 23:54 UTC on
+// 18 Nov failed two of box-service's charging tests that pass any other time.
+{
+  const realNow = Date.now;
+  const midday = new Date(realNow()).setUTCHours(12, 0, 0, 0);
+  const offset = midday - realNow();
+  Date.now = () => realNow() + offset;
+}
+
 const boxes = load('boxes');
 const machinesModule = load('machines');
 
@@ -44,7 +56,8 @@ export async function later<T>(ms: number, f: () => Promise<T>): Promise<T> {
   }
 }
 
-export async function boxBackend() {
+// opts.token false: the login has no cloud token, so the helper's box waits in needsToken.
+export async function boxBackend(opts: { token?: boolean } = {}) {
   process.env.RUNNER_KEY = OWNER;
   delete process.env.RUNNER_KEY_NEXT;
   process.env.BOX_SEAL_KEY = SEAL_KEY;
@@ -53,8 +66,10 @@ export async function boxBackend() {
   const a = actionCtx(b);
   const serviceId = await b.ctx.db.insert('runnerServices', { name: 'Cloud (Fly)', provider: 'fly', box: { cpus: 2, memoryMb: 4096 }, image: 'registry.fly.io/threadbear-box:1', limits: { ...boxes.BOX_LIMITS }, createdAt: Date.now() });
   const newBox = (threadId = THREAD, runnerId = BOX_RUNNER) => call(a, boxes.newBox, { serviceId, threadId, runnerId, login: LOGIN, repo: { origin: ORIGIN_WITH_TOKEN, subfolder: 'runner', baseBranch: 'main' } });
-  const boxId = await newBox();
   const setToken = (token = CLAUDE_TOKEN, login = LOGIN, key = OWNER) => call(a, boxes.setCloudToken, { key, login, token });
+  // A login with a cloud token, as a box's thread needs to start (boxMachine.ts needsToken).
+  if (opts.token !== false) await setToken();
+  const boxId = await newBox();
   const mint = async (threadId = THREAD, key = OWNER): Promise<string> => (await call(a, boxes.mintBootToken, { key, threadId })).bootToken;
   const exchange = (bootToken: string) => call(a, boxes.exchange, { bootToken });
   const report = (event: Record<string, unknown>, threadId = THREAD): Promise<boolean> => call(b.ctx, boxes.report, { threadId, event });

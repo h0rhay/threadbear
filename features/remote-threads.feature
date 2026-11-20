@@ -95,20 +95,46 @@ Feature: Other runners' threads
     And the row "Tidy the media drive" is on the runner "On mac-mini"
     And the composer is on the runner "mac-mini"
 
-  # Its picture is a path on mac-mini: asked of the runner, which keeps another
-  # Mac's files there for now, so the tile says it couldn't get it, and never
-  # shows whatever this Mac has at that path.
+  # Its picture is a path on mac-mini: asked of the runner, which gets a
+  # picture pasted there from the backend (API 87), never whatever this Mac
+  # has at that path.
+  @transcript.images @remote-threads @swift-pending
+  Scenario: Another Mac's pasted picture comes from that Mac
+    When I open the thread "Check the photo library backup"
+    Then the pictures of my message say "picture"
+
+  # A click on it opens the viewer, as one of this Mac's does (Mike, 18 Nov:
+  # it showed, but a click on it opened nothing).
+  @transcript.images @remote-threads @swift-pending
+  Scenario: A click on another Mac's picture shows it in the viewer
+    When I open the thread "Check the photo library backup"
+    And the pictures of my message say "picture"
+    And I click picture 1 of my message
+    Then the viewer shows picture 1 of 1 "backblaze.png"
+
+  # Its chip names the same file on mac-mini: pressed, it opens that Mac's
+  # picture in the viewer, never this Mac's file at that path (Codex, 12 Nov).
+  @rich.picturechips @remote-threads @swift-pending
+  Scenario: Another Mac's picture chip opens that Mac's picture
+    When I open the thread "Check the photo library backup"
+    Then pressing the picture chip in my message opens picture 1 of 1 "backblaze.png"
+
+  # One that Mac never put up (an older runner's): the tile says it couldn't
+  # get it, rather than showing a file of this Mac's.
   @transcript.images @remote-threads
-  Scenario: Another Mac's picture says where it is rather than showing a file of this Mac's
+  Scenario: Another Mac's picture it couldn't get says where it is
+    Given mac-mini's pasted pictures were never put up
     When I open the thread "Check the photo library backup"
     Then the pictures of my message say "Couldn't get it from mac-mini"
 
-  # Its chip names the same file on mac-mini: pressed here it opens nothing, as
-  # this Mac's file at that path isn't the one meant (Codex, 12 Nov).
-  @rich.picturechips @remote-threads
-  Scenario: Another Mac's picture chip opens nothing on this Mac
+  # Its chip still opens the viewer, which says it couldn't show it rather
+  # than "Loading…" for ever (Codex, 18 Nov).
+  @rich.picturechips @remote-threads @swift-pending
+  Scenario: Another Mac's picture chip says when the picture couldn't be got
+    Given mac-mini's pasted pictures were never put up
     When I open the thread "Check the photo library backup"
-    Then pressing the picture chip in my message opens nothing
+    And the pictures of my message say "Couldn't get it from mac-mini"
+    Then pressing the picture chip in my message says it couldn't show picture 1 of 1 "backblaze.png"
 
   @sidebar.row.remote @remote-threads
   Scenario: It takes a message like any other thread

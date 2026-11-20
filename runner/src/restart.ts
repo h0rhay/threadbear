@@ -617,7 +617,7 @@ export class Restarter {
       // release that isn't the one it deployed, from the message itself.
       const heads = [this.deps.rolledBack, warning].filter(Boolean);
       const text = heads.length ? `Note from the runner: ${heads.join(' ')} Check tb logs before going on. Your message for after the restart follows.\n\n${r.text}` : r.text;
-      runner.send(r.threadId, text, [], { origin: 'runner' });
+      runner.send(r.threadId, text, [], { origin: 'runner', wakeReason: 'The runner restarted' });
       log.info('resumed a thread after the restart', { threadId: r.threadId });
     } catch (e) {
       log.error('could not resume a thread after the restart', { threadId: r.threadId, error: String(e) });

@@ -1,4 +1,4 @@
-// Compact when cold (experiment coldCompact): a long Claude thread woken
+// Compact when cold: a long Claude thread woken
 // after its prompt cache has expired compacts first, then runs the turn.
 //
 // Why (the weekly step back, 15 Nov 2026, thread 9369030d): Opus turns that
@@ -22,9 +22,6 @@ import { fromMike, isAutomaticInput } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
 import type { QueuedSend } from '../store.ts';
 import type { TurnResult } from '../adapters/types.ts';
-import { experimentOn } from '../experiments.ts';
-
-export const COLD_COMPACT = 'coldCompact';
 
 // The thread's context (its last model call's, rec.contextTokens) from
 // which a cold wake compacts. Measured on 402 cold wakes of Opus threads
@@ -138,7 +135,7 @@ export const coldCompactPart = {
     const { rec, rt } = st;
     const turn = rt.turn;
     if (!turn || !rt.session || turn.precompact || turn.command) return false;
-    if (rec.provider !== 'claude' || !experimentOn(this.cfg.home, COLD_COMPACT)) return false;
+    if (rec.provider !== 'claude') return false;
     const cold = coldWake(rec, msg, () => this.lastModelMs(st), this.clock.now());
     if (!cold) return false;
     // A real uuid: the SDK drops one that isn't, and with it the frames

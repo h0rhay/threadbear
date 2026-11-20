@@ -243,6 +243,12 @@ test('a moving thread\'s repo is cloned only from an https or ssh address', () =
 // be untracked here, which trust reads as installed and doesn't hash.
 test("a move whose uncommitted work brings files under node_modules doesn't unpack", async () => {
   const { root, s, t } = repos();
+  // A global gitignore with node_modules/ in it (a common one) would keep the
+  // package out of the pack, and the move would go through without it. An
+  // empty file, not /dev/null, which Windows' git doesn't have.
+  const noExcludes = path.join(root, 'no-excludes');
+  fs.writeFileSync(noExcludes, '');
+  git(s, 'config', 'core.excludesFile', noExcludes);
   const sw = path.join(root, 's-threads/slot-1');
   git(s, 'worktree', 'add', '-q', '-b', 'thread/abcd1234', sw, 'main');
   const tw = path.join(root, 't-threads/slot-1');

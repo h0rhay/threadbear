@@ -8,7 +8,7 @@
 // runner's `github.pr` answer holds, and the words the tab shows.
 
 use crate::reducer::event::{DiffHunk, EditDiff};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A PR link's repo and number: `https://github.com/<owner>/<repo>/pull/<n>`,
 /// with anything after the number (`/files`, `#discussion`) left off, as the
@@ -50,9 +50,52 @@ impl PrRef {
     pub fn tab_title(&self) -> String {
         format!("#{}", self.number)
     }
+
+    /// Its file's name in the app's cache of PRs read before
+    /// (`CachedPr`). Owners and repos have no `~`, so no two PRs share one.
+    pub fn cache_name(&self) -> String {
+        format!("{}~{}~{}.json", self.owner, self.repo, self.number)
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Default)]
+/// A PR as the app keeps it between runs, to show at once the next time
+/// while it reads it again (Mike asked for stale-while-revalidate, 19 Nov).
+/// Only a whole read is kept, its files included.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedPr {
+    pub read_at: i64,
+    pub pr: PrView,
+}
+
+/// How long a read counts as new: opening its tab again inside this shows
+/// it as it is; after, it's shown and read again behind it.
+pub const PR_FRESH_MS: i64 = 60_000;
+
+/// How many of a thread's latest messages are looked at for PR links to read
+/// ahead, and how many PRs at most: each read is three gh calls.
+pub const RECENT_MESSAGES: usize = 4;
+pub const RECENT_PRS: usize = 4;
+
+/// The PR links in `texts` (the newest message first), newest first, once
+/// each and at most `max`: the ones read as a thread shows, as the PRs a
+/// thread's last replies name are the ones likely to be clicked.
+pub fn recent_pr_links<'a>(texts: impl IntoIterator<Item = &'a str>, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for text in texts {
+        for url in pr_links(text) {
+            if out.len() == max {
+                return out;
+            }
+            if !out.contains(&url) {
+                out.push(url);
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PrState {
     #[default]
@@ -83,7 +126,7 @@ impl PrState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckState {
     Passed,
@@ -93,7 +136,7 @@ pub enum CheckState {
     Skipped,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct PrCheck {
     pub name: String,
     pub state: CheckState,
@@ -103,7 +146,7 @@ pub struct PrCheck {
     pub seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct PrActivity {
     pub kind: String,
     pub author: String,
@@ -115,7 +158,7 @@ pub struct PrActivity {
     pub review: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrHunk {
     pub old_start: i64,
@@ -125,7 +168,7 @@ pub struct PrHunk {
     pub lines: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct PrFile {
     pub path: String,
     #[serde(default)]
@@ -152,7 +195,7 @@ impl PrFile {
 }
 
 /// The runner's `github.pr` answer. Fields it adds later are ignored.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrView {
     pub url: String,
@@ -199,9 +242,48 @@ pub struct PrView {
     pub files_error: Option<String>,
     #[serde(default)]
     pub files_cut: Option<u64>,
+    /// Read without its files (`github.pr` with `files: false`): they come
+    /// from `github.prFiles`.
+    #[serde(default)]
+    pub files_later: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+/// A PR's files alone (`github.prFiles`), read apart from the rest as a big
+/// PR's diff is the slowest read.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrFiles {
+    #[serde(default)]
+    pub files: Vec<PrFile>,
+    #[serde(default)]
+    pub files_error: Option<String>,
+    #[serde(default)]
+    pub files_cut: Option<u64>,
+}
+
+impl PrView {
+    /// Its files, as `github.prFiles` read them.
+    pub fn with_files(mut self, files: PrFiles) -> Self {
+        self.files = files.files;
+        self.files_error = files.files_error;
+        self.files_cut = files.files_cut;
+        self.files_later = false;
+        self
+    }
+
+    /// Read without its files, it keeps those an earlier read had until
+    /// its own come: a refresh shouldn't empty the Diff tab meanwhile.
+    pub fn keeping_files_of(mut self, before: &PrView) -> Self {
+        if self.files_later && !before.files_later {
+            self.files = before.files.clone();
+            self.files_error = before.files_error.clone();
+            self.files_cut = before.files_cut;
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MergeMethod {
     Rebase,
@@ -333,6 +415,57 @@ pub fn work_prompt(pr: &PrView) -> String {
     format!("Pull request {} (\"{}\" by {}). ", pr.url, pr.title, pr.author)
 }
 
+/// The link a PR's state mark is drawn for in a reply:
+/// `[\u{2060}](tbpr:<url>)` just before the PR's own link, as thread links
+/// get theirs (link_marks.rs). Mike expected PR links in replies to show
+/// whether they're open, merged or closed (19 Nov 2026).
+pub const MARK_SCHEME: &str = "tbpr:";
+
+/// Each PR a reply links to, its tidy url, once each in order.
+pub fn pr_links(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, url) in pr_link_starts(text) {
+        if !out.contains(&url) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// `text` with a state mark's link before each link to a PR, or `text` as
+/// it was when there's none. Links in code are text, so they're left alone.
+pub fn with_pr_marks(text: &str) -> std::borrow::Cow<'_, str> {
+    let at = pr_link_starts(text);
+    if at.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + at.len() * 60);
+    let mut from = 0;
+    for (start, url) in at {
+        out.push_str(&text[from..start]);
+        out.push_str(&format!("[\u{2060}]({MARK_SCHEME}{url})"));
+        from = start;
+    }
+    out.push_str(&text[from..]);
+    std::borrow::Cow::Owned(out)
+}
+
+fn pr_link_starts(text: &str) -> Vec<(usize, String)> {
+    if !text.contains("github.com/") {
+        return Vec::new();
+    }
+    let Ok(tree) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) else { return Vec::new() };
+    let mut at = Vec::new();
+    crate::link_marks::collect(&tree, &mut |link| {
+        let Some(start) = link.position.as_ref().map(|p| p.start.offset) else { return };
+        if let Some(r) = PrRef::parse(&link.url).filter(|_| text.is_char_boundary(start)) {
+            at.push((start, r.url()));
+        }
+    });
+    at.sort_by_key(|(start, _)| *start);
+    at
+}
+
 fn repo_of(url: &str) -> Option<String> {
     PrRef::parse(url).map(|r| format!("{}/{}", r.owner, r.repo))
 }
@@ -341,6 +474,17 @@ fn repo_of(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_mark_before_each_pr_link_in_a_reply() {
+        let text = "Try [#72](https://github.com/acme/app/pull/72/files) or https://github.com/acme/app/pull/77, not `https://github.com/acme/app/pull/9` or [docs](https://github.com/acme/app).";
+        assert_eq!(
+            with_pr_marks(text),
+            "Try [\u{2060}](tbpr:https://github.com/acme/app/pull/72)[#72](https://github.com/acme/app/pull/72/files) or [\u{2060}](tbpr:https://github.com/acme/app/pull/77)https://github.com/acme/app/pull/77, not `https://github.com/acme/app/pull/9` or [docs](https://github.com/acme/app)."
+        );
+        assert_eq!(pr_links(text), ["https://github.com/acme/app/pull/72", "https://github.com/acme/app/pull/77"]);
+        assert!(matches!(with_pr_marks("No links here"), std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn pr_links_and_only_pr_links() {
@@ -365,6 +509,44 @@ mod tests {
         assert_eq!(pr.merge_methods, vec![MergeMethod::Rebase, MergeMethod::Squash]);
         let diff = pr.files[0].edit_diff("k");
         assert_eq!((diff.path.as_str(), diff.hunks[0].lines.len()), ("a.ts", 2));
+    }
+
+    #[test]
+    fn a_pr_read_without_its_files_takes_them_when_they_come() {
+        let files = |path: &str| serde_json::from_value::<PrFiles>(json!({ "files": [{ "path": path }] })).unwrap();
+        let later = view(json!({ "files": [], "filesLater": true }));
+        assert!(later.files_later && later.files.is_empty());
+        let full = later.clone().with_files(files("a.ts"));
+        assert!(!full.files_later);
+        assert_eq!(full.files[0].path, "a.ts");
+        // A refresh read without its files keeps the last ones meanwhile,
+        // still waiting for its own.
+        let refreshed = later.clone().keeping_files_of(&full);
+        assert_eq!((refreshed.files[0].path.as_str(), refreshed.files_later), ("a.ts", true));
+        assert_eq!(refreshed.with_files(files("b.ts")).files[0].path, "b.ts");
+        // An older runner's answer has its files and no filesLater.
+        assert!(!view(json!({ "files": [{ "path": "c.ts" }] })).files_later);
+        let failed = serde_json::from_value::<PrFiles>(json!({ "files": [], "filesError": "HTTP 502" })).unwrap();
+        assert_eq!(later.with_files(failed).files_error.as_deref(), Some("HTTP 502"));
+    }
+
+    #[test]
+    fn a_kept_pr_reads_back_as_it_was() {
+        let pr = view(json!({ "state": "merged", "mergeMethods": ["squash"], "checks": [{ "name": "Linux", "state": "failed" }], "files": [{ "path": "a.rs", "additions": 2, "hunks": [{ "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 2, "lines": ["-a", "+b", "+c"] }] }], "filesCut": 3 }));
+        let kept = serde_json::to_string(&CachedPr { read_at: 5, pr: pr.clone() }).unwrap();
+        let back: CachedPr = serde_json::from_str(&kept).unwrap();
+        assert_eq!((back.read_at, back.pr), (5, pr));
+        assert_eq!(PrRef::parse("https://github.com/acme/app.js/pull/72/files").unwrap().cache_name(), "acme~app.js~72.json");
+    }
+
+    #[test]
+    fn the_prs_read_ahead_are_the_latest_messages_ones() {
+        let (a, b, c) = ("https://github.com/o/r/pull/1", "https://github.com/o/r/pull/2", "https://github.com/o/r/pull/3");
+        let newest = format!("see {b} and {a}/files");
+        let older = format!("{a} {c}");
+        assert_eq!(recent_pr_links([newest.as_str(), older.as_str()], 4), vec![b, a, c]);
+        assert_eq!(recent_pr_links([newest.as_str(), older.as_str()], 2), vec![b, a]);
+        assert!(recent_pr_links(["no links here"], 4).is_empty());
     }
 
     #[test]

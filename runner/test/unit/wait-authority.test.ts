@@ -144,7 +144,7 @@ test("a lab review's findings are held back from a thread raised since the revie
   const waiter = make('Change it', 'ask');
   const reviewer = make('Review it', 'ask');
   finish(waiter);
-  h.runner.waitOnReview(h.runner.threads.get(waiter)!, reviewer);
+  h.runner.waitOnReview(h.runner.threads.get(waiter)!, [reviewer]);
   assert.ok(h.runner.get(waiter).waitingOn?.length);
   h.runner.update({ threadId: waiter, permissionMode: 'full' });
   finish(reviewer, { needs: 'nothing' }, PAYLOAD);
@@ -159,7 +159,7 @@ test("a lab review of a thread that wasn't raised still comes through", async ()
   const waiter = make('Change it', 'full');
   const reviewer = make('Review it', 'ask');
   finish(waiter);
-  h.runner.waitOnReview(h.runner.threads.get(waiter)!, reviewer);
+  h.runner.waitOnReview(h.runner.threads.get(waiter)!, [reviewer]);
   finish(reviewer, { needs: 'nothing' }, PAYLOAD);
   await until(() => !h.runner.get(waiter).snoozedUntil, 'the wake');
   assert.equal(heard(waiter), true);

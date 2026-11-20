@@ -134,6 +134,46 @@ pub(crate) fn pictures(text: &str, local: bool) -> std::borrow::Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// `![title](/path/page.html)` in this Mac's own reply, with the livePages
+/// experiment on: a fenced block the live page card draws (live_pages.rs),
+/// rather than a link. On its own, with a blank line each side, as a card
+/// sits between paragraphs.
+pub(crate) fn live_pages(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !text.contains("![") || !text.contains(".htm") {
+        return Cow::Borrowed(text);
+    }
+    let Ok(tree) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) else { return Cow::Borrowed(text) };
+    let mut swaps: Vec<(usize, usize, String)> = Vec::new();
+    collect_images(&tree, &mut |image| {
+        let Some(at) = &image.position else { return };
+        let Some(path) = picture_path(&image.url) else { return };
+        let path = path.to_string_lossy().into_owned();
+        let lower = path.to_ascii_lowercase();
+        if !(lower.ends_with(".html") || lower.ends_with(".htm")) || path.contains(['\n', '\r', '`']) {
+            return;
+        }
+        let title: String = image.alt.chars().map(|c| if c == '\n' || c == '\r' || c == '`' { ' ' } else { c }).collect();
+        swaps.push((at.start.offset, at.end.offset, format!("\n\n```{}\n{path}\n{}\n```\n\n", crate::live_pages::fence(), title.trim())));
+    });
+    if swaps.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    swaps.sort_by_key(|s| s.0);
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut at = 0;
+    for (start, end, block) in swaps {
+        if start < at || end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        out.push_str(&text[at..start]);
+        out.push_str(&block);
+        at = end;
+    }
+    out.push_str(&text[at..]);
+    Cow::Owned(out)
+}
+
 fn collect_images(node: &markdown::mdast::Node, found: &mut impl FnMut(&markdown::mdast::Image)) {
     if let markdown::mdast::Node::Image(image) = node {
         found(image);
@@ -390,8 +430,10 @@ pub(crate) fn picture_source(uri: &gpui_kit::SharedUri, local: bool) -> gpui_kit
     }
     #[cfg(not(windows))]
     {
-        let path = picture_path(uri.as_ref()).filter(|path| local && is_picture_file(path)).map(|path| picture_file(&path.to_string_lossy())).unwrap_or_default();
-        gpui_kit::ImageSource::Resource(gpui_kit::Resource::Path(std::sync::Arc::from(path.as_path())))
+        match picture_path(uri.as_ref()).filter(|path| local && is_picture_file(path)) {
+            Some(path) => file_picture(&path.to_string_lossy()),
+            None => gpui_kit::ImageSource::Resource(gpui_kit::Resource::Path(std::sync::Arc::from(std::path::Path::new("")))),
+        }
     }
 }
 
@@ -431,7 +473,15 @@ pub(crate) fn file_picture(path: &str) -> ImageSource {
     }
     #[cfg(not(windows))]
     {
-        picture_file(path).into()
+        let path = picture_file(path);
+        // Over the GPU's limit, gpui's own loader's picture would draw
+        // nothing: read and shrunk to fit instead (fit_picture.rs).
+        // Keyed by its size and time too, so a picture written again at the
+        // same path is read again.
+        let meta = threadbear_core::open_policy::local_metadata(&path).ok().filter(|_| !path.as_os_str().is_empty());
+        let Some(meta) = meta.filter(|meta| crate::fit_picture::file_size(&path, meta).is_some_and(crate::fit_picture::too_big)) else { return path.into() };
+        let key = (path, meta.len(), meta.modified().ok());
+        ImageSource::Custom(std::sync::Arc::new(move |window, cx| crate::fit_picture::use_fitted(&key, window, cx)))
     }
 }
 
@@ -447,8 +497,7 @@ struct PictureRetries {
 #[cfg(windows)]
 impl Global for PictureRetries {}
 
-#[cfg(windows)]
-fn checked_picture_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn checked_picture_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let mut file = threadbear_core::open_policy::local_open(path)?;
     let meta = file.metadata()?;
@@ -477,6 +526,7 @@ impl Asset for LocalPicture {
         async move {
             let bytes = checked_picture_bytes(&path)?;
             let format = crate::viewer::format_of(&path.to_string_lossy(), &bytes).ok_or_else(|| std::io::Error::other("Not a picture"))?;
+            let (format, bytes) = crate::fit_picture::fit_bytes(format, bytes).ok_or_else(|| std::io::Error::other(crate::fit_picture::TOO_BIG))?;
             Image::from_bytes(format, bytes).to_image_data(renderer).map_err(Into::into)
         }
     }
@@ -640,16 +690,11 @@ fn spaced_path_ok(path: &str) -> bool {
     !last.contains(' ') || last.rsplit_once('.').is_some()
 }
 
-/// `Foo.swift:12` or `Foo.swift:12:4` names the file, and a line in it.
+/// `Foo.swift:12`, `Foo.swift:12:4` or `Foo.swift:12-18` names the file, and
+/// a line (or lines) in it: core's rule, so what reads as a path here is what
+/// a click finds.
 fn strip_line(text: &str) -> &str {
-    let mut path = text;
-    for _ in 0..2 {
-        match path.rsplit_once(':') {
-            Some((head, tail)) if !head.is_empty() && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => path = head,
-            _ => break,
-        }
-    }
-    path
+    threadbear_core::file_refs::strip_line(text)
 }
 
 /// A file and any `?query` or `#fragment` for its page, split at the first.
@@ -755,7 +800,7 @@ const DOCUMENTS_KEPT: usize = 600;
 
 #[cfg(test)]
 mod tests {
-    use super::{dead_file_links, looks_like_path, pictures, prepare};
+    use super::{dead_file_links, live_pages, looks_like_path, pictures, prepare};
 
     #[test]
     fn windows_pictures_name_a_drive_file_before_any_file_access() {
@@ -833,6 +878,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Unix paths: `/w/garden.html` isn't a whole path on Windows, where the
+    // rewrite rightly leaves it (Desktop app run 44601898647).
+    #[cfg(unix)]
+    #[test]
+    fn a_page_in_a_reply_becomes_a_live_page_card() {
+        let fence = crate::live_pages::fence();
+        assert_eq!(live_pages("Turn it: ![Garden lights](/w/garden.html) there"), format!("Turn it: \n\n```{fence}\n/w/garden.html\nGarden lights\n```\n\n there"));
+        assert_eq!(live_pages("![](file:///w/a%20b.htm)"), format!("\n\n```{fence}\n/w/a b.htm\n\n```\n\n"));
+        assert_eq!(live_pages("![shot](/w/a.png) ![web](https://x.io/p.html)"), "![shot](/w/a.png) ![web](https://x.io/p.html)", "pictures and web pages aren't pages here");
+        assert_eq!(live_pages("`![g](/w/g.html)` in code"), "`![g](/w/g.html)` in code");
+        let fenced = live_pages("![g](/w/g.html)").into_owned();
+        let tree = markdown::to_mdast(&fenced, &markdown::ParseOptions::gfm()).unwrap();
+        let mut codes = Vec::new();
+        fn walk(n: &markdown::mdast::Node, out: &mut Vec<(Option<String>, String)>) {
+            if let markdown::mdast::Node::Code(c) = n {
+                out.push((c.lang.clone(), c.value.clone()));
+            }
+            for ch in n.children().into_iter().flatten() {
+                walk(ch, out);
+            }
+        }
+        walk(&tree, &mut codes);
+        assert_eq!(codes, vec![(Some(fence.to_owned()), "/w/g.html\ng".to_owned())]);
+    }
+
     #[test]
     fn a_web_picture_or_another_macs_stays_a_link() {
         assert_eq!(pictures("see ![chart](https://x.y/c.png)", true), "see [\\[chart\\]](<https://x.y/c.png>)");
@@ -854,7 +924,6 @@ mod tests {
     fn source_path(url: &str, local: bool) -> String {
         match super::picture_source(&url.to_owned().into(), local) {
             gpui_kit::ImageSource::Resource(gpui_kit::Resource::Path(path)) => path.to_string_lossy().into_owned(),
-            #[cfg(windows)]
             gpui_kit::ImageSource::Custom(_) => super::picture_path(url).filter(|p| super::checked_picture_bytes(p).is_ok()).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             _ => panic!("a path"),
         }
@@ -919,7 +988,7 @@ mod tests {
 
     #[test]
     fn reads_paths_as_paths_and_commands_as_commands() {
-        for path in ["app/Sources/Foo.swift", "Foo.swift:12", "/tmp/a.txt:12:4", "~/.zshrc", "./check.sh", "runner/src/", "guide.md#links"] {
+        for path in ["app/Sources/Foo.swift", "Foo.swift:12", "/tmp/a.txt:12:4", "src/a.ts:121-125", "~/.zshrc", "./check.sh", "runner/src/", "guide.md#links"] {
             assert!(looks_like_path(path), "{path} should read as a path");
         }
         for not_path in ["npm test", "tb land", "example.com", "readme", "-rf", "a*b", "https://x.y/z", "open exports/a.mp4"] {
@@ -933,6 +1002,8 @@ mod tests {
     #[test]
     fn code_paths_become_links_outside_fences_and_links() {
         assert_eq!(prepare("see `src/a.rs` here", "t"), "see [`src/a.rs`](tbpath:?p=src/a.rs) here");
+        // With its lines, which the click takes to the pane.
+        assert_eq!(prepare("see `src/a.ts:121-125`", "t"), "see [`src/a.ts:121-125`](tbpath:?p=src/a.ts%3A121-125)");
         assert_eq!(prepare("`npm test` stays", "t"), "`npm test` stays");
         // Already a link's words, or in a code block: left as they are.
         assert_eq!(prepare("[`src/a.rs`](https://x.y)", "t"), "[`src/a.rs`](https://x.y)");

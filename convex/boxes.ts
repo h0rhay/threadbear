@@ -10,24 +10,28 @@
 // the same, which is wrong for keys, tokens and IVs. Mutations only store
 // hashes and sealed values, and change state atomically.
 //
-// Not built yet (docs/virtual-runners.md, "What's built"): a runner's box
-// mode and its image, and starting or waking one from the phone.
+// Not built yet (docs/virtual-runners.md, "What's built"): starting or
+// waking one from the phone.
 import { ConvexError, v, type Infer } from 'convex/values';
 import { action, internalAction, internalMutation, internalQuery, mutation, query, type ActionCtx, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
 import { internal } from './_generated/api';
-import { box as boxMachine, command as commandMachine, machines, queued } from './machines';
+import { box as boxMachine, cloudToken as tokenMachine, command as commandMachine, machines, queued } from './machines';
 import { BOOT_MS } from './boxStates';
 import { checkRunnerId, forbidden, MACHINE_ID, runnerAuth, sha256, withoutCredentials } from './lib';
 import { commandArgs } from './relay';
 import { PROVIDERS } from './boxProviders/types';
 import { FLY_SUSPEND_MAX_MB } from './boxProviders/fly';
-import { WAKES_FROM } from './boxHooks';
+import { UNSTARTED, WAKES_FROM } from './boxHooks';
 import { MOVE_GOING } from './moves';
-import { BOX_KEY_PREFIX, isThreadId, mayUseStorage } from './runnerAccess';
+import { BOX_KEY_DEAD, BOX_KEY_PREFIX, isThreadId, mayUseStorage } from './runnerAccess';
 import { deleteIfUnused, endCommandFiles, finishedArgs, MAX_RUNNER_UPLOAD_BYTES, uploadedBy } from './sync';
+import { HELD_BACK, scrubText } from './redaction';
 
 // A virtual runner's limits when it's made (runnerServices.limits).
+// The smallest box a virtual runner may have (setRunnerService).
+export const MIN_BOX_MB = 1024;
+
 export const BOX_LIMITS = { maxBoxes: 5, idleSleepMinutes: 10, maxAwakeHoursPerDay: 8, deleteAfterDays: 14 } as const;
 
 // A boot token (`tbt_`) and a box key (`tbb_`, runnerAccess.ts
@@ -52,11 +56,14 @@ export function randomHex(bytes: number): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(bytes)), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// This file's deployment settings (BOX_SEAL_KEY, FLY_APP), read in one place.
+const setting = (name: 'BOX_SEAL_KEY' | 'FLY_APP'): string | undefined => process.env[name];
+
 // BOX_SEAL_KEY: 32 random bytes in base64, set once per deployment
 // (`npx convex env set BOX_SEAL_KEY "$(openssl rand -base64 32)"`).
 // Changing it makes every sealed token and thread key unreadable.
 async function sealKey(): Promise<CryptoKey> {
-  const raw = process.env.BOX_SEAL_KEY;
+  const raw = setting('BOX_SEAL_KEY');
   let bytes: Uint8Array | undefined;
   try {
     bytes = raw ? unb64(raw.trim()) : undefined;
@@ -90,15 +97,17 @@ const threadKeyPurpose = (threadId: string) => `threadKey:${threadId}`;
 
 // An action's own gate: actions have no database, so runnerAuth runs in a
 // query, under the action's own name (runnerAccess.ts ACCESS).
-async function actionAuth(ctx: ActionCtx, key: string, fn: string): Promise<void> {
-  await ctx.runQuery(internal.boxes.authorize, { key, fn });
+// A box's call through an action is read-only (`housekeeping`): a query
+// can't mark its attempt as holding work, and reading makes none.
+async function actionAuth(ctx: ActionCtx, key: string, fn: string, opts: { housekeeping?: boolean } = {}): Promise<void> {
+  await ctx.runQuery(internal.boxes.authorize, { key, fn, ...(opts.housekeeping ? { housekeeping: true } : {}) });
 }
 
 export const authorize = internalQuery({
-  args: { key: v.string(), fn: v.string() },
+  args: { key: v.string(), fn: v.string(), housekeeping: v.optional(v.boolean()) },
   returns: v.null(),
-  handler: async (ctx, { key, fn }) => {
-    await runnerAuth(ctx, key, fn);
+  handler: async (ctx, { key, fn, housekeeping }) => {
+    await runnerAuth(ctx, key, fn, { housekeeping: housekeeping === true });
     return null;
   },
 });
@@ -121,26 +130,109 @@ export const setCloudToken = action({
   },
 });
 
+// The sealed value and its times are the row's own fields; the machine's
+// SET (cloudTokenMachine.ts) makes it valid and releases the boxes waiting
+// on the login (releaseForToken).
 export const storeCloudToken = internalMutation({
   args: { login: v.string(), sealed: v.string(), madeAt: v.number() },
   returns: v.null(),
   handler: async (ctx, { login, sealed, madeAt }) => {
-    const now = Date.now();
+    // Strictly later than the last, so a box's refusal of the old one (by its setAt) never matches the new one.
     const row = await ctx.db.query('cloudTokens').withIndex('by_login', (q) => q.eq('login', login)).unique();
-    if (row) await ctx.db.patch(row._id, { sealed, madeAt, setAt: now });
-    else await ctx.db.insert('cloudTokens', { login, sealed, madeAt, setAt: now });
+    const now = Math.max(Date.now(), (row?.setAt ?? 0) + 1);
+    const r = row
+      ? (await ctx.db.patch(row._id, { sealed, madeAt, setAt: now }), await tokenMachine.send(ctx, row._id, { type: 'SET' }))
+      : await tokenMachine.create(ctx, { login, sealed, madeAt, setAt: now } as never, { type: 'SET' });
+    if (r.status !== 'done') throw conflict(`The token couldn't be set: ${r.reasons.join(' ')}`);
     return null;
   },
 });
 
-/** Which logins have a cloud token, and when each was made and set. Never the token. */
+// Boxes waiting for a token on the login are released (TOKEN_SET), a page
+// at a time, only while its token is still valid (one refused meanwhile
+// leaves them waiting). They join their virtual runner's queue for room
+// (waitingForRoom), which starts the oldest first, by when each thread
+// started, whatever released it (wakeWaiting, run here for each one's
+// virtual runner): a token never passes a thread already waiting.
+const RELEASE_PAGE = 50;
+export const releaseForToken = machines.internalMutation({
+  args: { login: v.string() },
+  returns: v.null(),
+  handler: async (ctx, { login }) => {
+    const token = await ctx.db.query('cloudTokens').withIndex('by_login', (q) => q.eq('login', login)).unique();
+    if (!token || token.tokenState.kind !== 'valid') return null;
+    const waiting = await ctx.db.query('boxes').withIndex('by_login_state', (q) => q.eq('login', login).eq('boxState.kind', 'needsToken')).take(RELEASE_PAGE);
+    const services = new Set<Id<'runnerServices'>>();
+    for (const row of waiting) if ((await boxMachine.send(ctx, row._id, { type: 'TOKEN_SET' })).status === 'done') services.add(row.serviceId);
+    for (const serviceId of services) await ctx.scheduler.runAfter(0, internal.boxes.wakeWaiting, { serviceId });
+    if (waiting.length === RELEASE_PAGE) await ctx.scheduler.runAfter(0, internal.boxes.releaseForToken, { login });
+    return null;
+  },
+});
+
+/** Which logins have a cloud token, when each was made and set, and whether it's valid or dead. Never the token. */
 export const cloudTokens = query({
   args: { key: v.string() },
-  returns: v.array(v.object({ login: v.string(), madeAt: v.number(), setAt: v.number() })),
+  returns: v.array(v.object({ login: v.string(), madeAt: v.number(), setAt: v.number(), state: v.union(v.literal('valid'), v.literal('dead')) })),
   handler: async (ctx, { key }) => {
     await runnerAuth(ctx, key, 'cloudTokens');
     const rows = await ctx.db.query('cloudTokens').withIndex('by_login').collect();
-    return rows.map((r) => ({ login: r.login, madeAt: r.madeAt, setAt: r.setAt }));
+    return rows.map((r) => ({ login: r.login, madeAt: r.madeAt, setAt: r.setAt, state: r.tokenState.kind }));
+  },
+});
+
+/**
+ * A box's turn was refused with the cloud token it was given (a 401): the
+ * token is dead (REFUSED), and the thread's card asks Mike for a new one.
+ * `setAt` is the token the box has (the exchange's tokenSetAt, or the last
+ * boxCloudToken's): a refusal of an older one changes nothing. A box's key only.
+ */
+export const tokenRefused = mutation({
+  args: { key: v.string(), setAt: v.number() },
+  returns: v.null(),
+  handler: async (ctx, { key, setAt }) => {
+    const caller = await runnerAuth(ctx, key, 'tokenRefused');
+    if (caller.owner || !caller.box) throw forbidden("say a box's token was refused: only the box's own key can");
+    const row = (await ctx.db.query('boxes').withIndex('by_threadId', (q) => q.eq('threadId', caller.box!.threadId)).unique())!;
+    const token = await ctx.db.query('cloudTokens').withIndex('by_login', (q) => q.eq('login', row.login)).unique();
+    if (token) await tokenMachine.send(ctx, token._id, { type: 'REFUSED', setAt });
+    return null;
+  },
+});
+
+/**
+ * Its login's token for a box waiting after a refusal (Box mode, "A refused
+ * token"): the token and when it was set while it's valid, else null. A
+ * box's key only; reading it isn't work (no workAttempts).
+ */
+export const boxCloudToken = action({
+  args: { key: v.string() },
+  returns: v.union(v.null(), v.object({ token: v.string(), setAt: v.number() })),
+  handler: async (ctx, { key }): Promise<{ token: string; setAt: number } | null> => {
+    await actionAuth(ctx, key, 'boxCloudToken', { housekeeping: true });
+    const found: { login: string; sealed: string; setAt: number } | null = await ctx.runQuery(internal.boxes.boxTokenFor, { key });
+    if (!found) return null;
+    let token: string;
+    try {
+      token = new TextDecoder().decode(await unseal(await sealKey(), found.sealed, tokenPurpose(found.login)));
+    } catch {
+      throw new ConvexError({ kind: 'config', message: "The login's cloud token can't be unsealed with this deployment's BOX_SEAL_KEY." });
+    }
+    return { token, setAt: found.setAt };
+  },
+});
+
+export const boxTokenFor = internalQuery({
+  args: { key: v.string() },
+  returns: v.union(v.null(), v.object({ login: v.string(), sealed: v.string(), setAt: v.number() })),
+  handler: async (ctx, { key }) => {
+    const caller = await runnerAuth(ctx, key, 'boxCloudToken', { housekeeping: true });
+    if (caller.owner || !caller.box) throw forbidden("read a box's cloud token: only the box's own key can");
+    const row = await ctx.db.query('boxes').withIndex('by_threadId', (q) => q.eq('threadId', caller.box!.threadId)).unique();
+    if (!row) return null;
+    const token = await ctx.db.query('cloudTokens').withIndex('by_login', (q) => q.eq('login', row.login)).unique();
+    if (!token || token.tokenState.kind !== 'valid') return null;
+    return { login: token.login, sealed: token.sealed, setAt: token.setAt };
   },
 });
 
@@ -191,7 +283,8 @@ async function addBox(ctx: MutationCtx, a: NewBox): Promise<Id<'boxes'>> {
     { type: 'START' },
   );
   if (made.status !== 'done') throw conflict(`The box couldn't be made: ${made.reasons.join(' ')}`);
-  await ctx.scheduler.runAfter(0, internal.boxService.createBox, { boxId: made.id as Id<'boxes'> });
+  // One waiting for its login's cloud token (needsToken) is asked for once it's set (TOKEN_SET).
+  if (made.to === 'creating') await ctx.scheduler.runAfter(0, internal.boxService.createBox, { boxId: made.id as Id<'boxes'> });
   return made.id as Id<'boxes'>;
 }
 
@@ -199,6 +292,18 @@ async function addBox(ctx: MutationCtx, a: NewBox): Promise<Id<'boxes'>> {
 
 const SERVICE_NAME = /^[^\u0000-\u001f\u007f]{1,80}$/;
 const IMAGE = /^[\x21-\x7e]{1,300}$/;
+// A virtual runner's image when none is given: the box image this repo's
+// workflow builds from main and pushes to the Fly app the boxes live in
+// (runner/box/Dockerfile, .github/workflows/box-image.yml), so
+// registry.fly.io/<FLY_APP>:latest. It's private to that Fly organisation,
+// as it holds Claude Code, which isn't ours to publish: Fly pulls it for the
+// app's machines with no credentials. A fork's workflow pushes to its own
+// app (docs/forking.md).
+function defaultBoxImage(provider: string): string {
+  const app = setting('FLY_APP')?.trim();
+  if (provider !== 'fly' || !app) throw bad("image must be given: there's no default box image without FLY_APP set on this deployment");
+  return `registry.fly.io/${app}:latest`;
+}
 const REGION = /^[a-z0-9-]{1,20}$/;
 // Each limit's whole-number range.
 const LIMIT_RANGE = { maxBoxes: [1, 100], idleSleepMinutes: [1, 24 * 60], maxAwakeHoursPerDay: [1, 24], deleteAfterDays: [1, 365] } as const;
@@ -252,11 +357,12 @@ export const runnerServices = query({
 
 /**
  * Makes a virtual runner, or changes one (`serviceId`): its name, image,
- * box size, region and limits (any left out: BOX_LIMITS, or as they were).
+ * box size, region and limits (any left out: BOX_LIMITS, or as they were;
+ * the image left out: as it was, or defaultBoxImage).
  * A provider is a virtual runner's for life: another one is a new runner.
  */
 export const setRunnerService = mutation({
-  args: { key: v.string(), serviceId: v.optional(v.id('runnerServices')), name: v.string(), provider: v.string(), image: v.string(), box: v.object({ cpus: v.number(), memoryMb: v.number() }), region: v.optional(v.string()), limits: v.optional(limitsArg) },
+  args: { key: v.string(), serviceId: v.optional(v.id('runnerServices')), name: v.string(), provider: v.string(), image: v.optional(v.string()), box: v.object({ cpus: v.number(), memoryMb: v.number() }), region: v.optional(v.string()), limits: v.optional(limitsArg) },
   returns: v.id('runnerServices'),
   handler: async (ctx, { key, serviceId, ...a }) => {
     await runnerAuth(ctx, key, 'setRunnerService');
@@ -266,9 +372,13 @@ export const setRunnerService = mutation({
     // newer than its save then has to be kept running (boxService.ts): so,
     // for now, only sizes the provider can pause.
     if (a.provider === 'fly' && a.box.memoryMb > FLY_SUSPEND_MAX_MB) throw bad(`box.memoryMb must be ${FLY_SUSPEND_MAX_MB} or less: Fly can't pause a bigger box.`);
-    if (!IMAGE.test(a.image)) throw bad('image must be an image reference, up to 300 characters with no spaces');
+    if (a.image !== undefined && !IMAGE.test(a.image)) throw bad('image must be an image reference, up to 300 characters with no spaces');
     if (!Number.isSafeInteger(a.box.cpus) || a.box.cpus < 1 || a.box.cpus > 16) throw bad('box.cpus must be a whole number from 1 to 16');
     if (!Number.isSafeInteger(a.box.memoryMb) || a.box.memoryMb < 256 || a.box.memoryMb > 65536 || a.box.memoryMb % 256) throw bad('box.memoryMb must be a multiple of 256 from 256 to 65536');
+    // A box's runner holds a save in memory to write it and to restore it
+    // (runner/src/box-save.ts SAVE_MAX_UNPACKED_BYTES), beside Claude Code:
+    // a box smaller than this could take a save its replacement can't read.
+    if (a.box.memoryMb < MIN_BOX_MB) throw bad(`box.memoryMb must be ${MIN_BOX_MB} or more: a smaller box may not have the memory to restore its thread's save.`);
     if (a.region !== undefined && !REGION.test(a.region)) throw bad('region must be a provider region code, like syd');
     const old = serviceId ? await ctx.db.get(serviceId) : null;
     if (serviceId && !old) throw new ConvexError({ kind: 'notFound', message: 'no such virtual runner' });
@@ -280,7 +390,7 @@ export const setRunnerService = mutation({
       if (!Number.isSafeInteger(x) || x < lo || x > hi) throw bad(`limits.${k} must be a whole number from ${lo} to ${hi}`);
       limits[k] = x;
     }
-    const fields = { name: a.name.trim(), provider: a.provider, image: a.image, box: { cpus: a.box.cpus, memoryMb: a.box.memoryMb }, limits };
+    const fields = { name: a.name.trim(), provider: a.provider, image: a.image ?? old?.image ?? defaultBoxImage(a.provider), box: { cpus: a.box.cpus, memoryMb: a.box.memoryMb }, limits };
     if (old) {
       // A region left out goes: the provider picks one.
       await ctx.db.patch(old._id, { ...fields, region: a.region });
@@ -303,6 +413,9 @@ const startArgs = {
   effort: v.optional(v.string()),
   permissionMode: v.optional(v.string()),
   plan: v.optional(v.boolean()),
+  // The folder and login on the Mac it was started from, for its sidebar row only (API 94).
+  cwd: v.optional(v.string()),
+  accountId: v.optional(v.string()),
 };
 
 /**
@@ -343,9 +456,49 @@ export const beginThread = internalMutation({
     await addBox(ctx, { serviceId: a.serviceId, threadId: a.threadId, runnerId: a.runnerId, login: a.login, repo: a.repo, sealedThreadKey: a.sealedThreadKey });
     // For its own thread (the box takes only that), from the main Mac.
     const commandId = await queued(ctx, { runnerId: a.runnerId, threadId: a.threadId, kind: 'create', args: { ...create, from: 'mac' }, createdAt: Date.now() });
+    // Listed at once, everywhere, before its box has written anything (it may wait a while for a token).
+    await ctx.db.insert('threadIndex', firstIndexRow(a));
     return { runnerId: a.runnerId, commandId };
   },
 });
+
+// The sidebar row a thread on a virtual runner has from its start: its first
+// line as title and preview, starting, until its box's runner writes its own.
+const INDEX_TITLE_CHARS = 120;
+const INDEX_PREVIEW_CHARS = 300;
+function firstIndexRow(a: { runnerId: string; threadId: string; text: string; model?: string; permissionMode?: string; plan?: boolean; cwd?: string; accountId?: string }): Omit<Doc<'threadIndex'>, '_id' | '_creationTime'> {
+  // Scrubbed whole, as setThreadIndex scrubs what a runner writes, and before
+  // it's cut: a key cut short could slip past the rules that know its shape.
+  const line = safeScrub(a.text).split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  const now = new Date().toISOString();
+  const mode = a.plan ? 'plan' : a.permissionMode;
+  return {
+    runnerId: a.runnerId,
+    threadId: a.threadId,
+    title: line.slice(0, INDEX_TITLE_CHARS),
+    cwd: (a.cwd ?? '').slice(0, REPO_CHARS),
+    accountId: (a.accountId ?? '').slice(0, 200),
+    provider: 'claude',
+    ...(a.model ? { model: a.model.slice(0, 200) } : {}),
+    status: 'starting',
+    needsYou: false,
+    unread: false,
+    preview: line.slice(0, INDEX_PREVIEW_CHARS),
+    createdAt: now,
+    lastActivityAt: now,
+    ...(mode ? { permissionMode: mode.slice(0, 16) } : {}),
+    updatedMs: Date.now(),
+  };
+}
+
+// A check that throws holds the text back rather than storing it as it came (sync.ts clean).
+function safeScrub(text: string): string {
+  try {
+    return scrubText(text);
+  } catch {
+    return HELD_BACK;
+  }
+}
 
 // ------------------------------------------------------------ boot tokens (decision 5)
 
@@ -409,7 +562,8 @@ export async function newAttempt(ctx: MutationCtx, row: Doc<'boxes'>, bootHash: 
 }
 
 const exchanged = v.object({
-  boxKey: v.string(),
+  // Made here only for a box that sent no boxKeyHash (made its own key).
+  boxKey: v.optional(v.string()),
   runnerId: v.string(),
   threadId: v.string(),
   claudeToken: v.string(),
@@ -418,11 +572,19 @@ const exchanged = v.object({
   repo: v.object({ origin: v.string(), subfolder: v.string(), baseBranch: v.string() }),
   // The last save, to restore from; null for a thread's first box.
   save: v.union(v.null(), v.object({ url: v.string(), at: v.number(), bytes: v.number() })),
+  // The Claude login the box runs on, as its cloud token is kept (an email):
+  // a token login writes no oauthAccount, so the box's runner is told it.
+  login: v.string(),
+  // When the login's token was set (API 94): what the box names in
+  // tokenRefused, and what a newer one from boxCloudToken is newer than.
+  tokenSetAt: v.number(),
 });
 
 type Exchanged = Infer<typeof exchanged>;
-type Peeked = { login: string; threadId: string; sealedToken: string; sealedThreadKey: string };
+type Peeked = { login: string; threadId: string; sealedToken: string; sealedThreadKey: string; tokenSetAt: number };
 type Claimed = { runnerId: string; threadId: string; repo: Exchanged['repo']; save: Exchanged['save'] };
+type Replayed = Peeked & Claimed;
+const KEY_HASH = /^[0-9a-f]{64}$/;
 const refusedBoot = () => new ConvexError({ kind: 'auth', message: 'boot token unknown, used or expired' });
 
 /**
@@ -441,15 +603,34 @@ export const exchange = action({
   // machineId: the provider's id for the box's own machine (BoxProvider
   // machineIdEnv; FLY_MACHINE_ID on Fly). Without it, the key holder's
   // machine is unknown, and every machine of its attempt stays protected.
-  args: { bootToken: v.string(), machineId: v.optional(v.string()) },
+  // boxKeyHash: the SHA-256 of a box key the box made itself, which then
+  // never crosses the network. With it and machineId, the exchange can be
+  // asked again: the same boot token, machine and key hash, while that key
+  // is still the thread's and within the token's 10 minutes, get the same
+  // answer (a box whose answer was lost); anything else is refused.
+  args: { bootToken: v.string(), machineId: v.optional(v.string()), boxKeyHash: v.optional(v.string()) },
   returns: exchanged,
-  handler: async (ctx, { bootToken, machineId }): Promise<Exchanged> => {
+  handler: async (ctx, { bootToken, machineId, boxKeyHash }): Promise<Exchanged> => {
     if (machineId !== undefined && !MACHINE_ID.test(machineId)) throw bad('machineId must be the provider id of the box’s own machine');
+    if (boxKeyHash !== undefined && !KEY_HASH.test(boxKeyHash)) throw bad('boxKeyHash must be a SHA-256 in hex');
     if (!BOOT_TOKEN.test(bootToken)) throw refusedBoot();
     const key = await sealKey();
     const bootHash = await sha256(bootToken);
     const peeked: Peeked | null = await ctx.runQuery(internal.boxes.peekBoot, { bootHash });
-    if (!peeked) throw refusedBoot();
+    if (!peeked) {
+      // Used already: only by this very machine and key, asking again.
+      const again: Replayed | null = boxKeyHash !== undefined && machineId !== undefined ? await ctx.runQuery(internal.boxes.peekReplay, { bootHash, boxKeyHash, machineId }) : null;
+      if (!again) throw refusedBoot();
+      let claudeToken: string;
+      let threadKey: string;
+      try {
+        claudeToken = new TextDecoder().decode(await unseal(key, again.sealedToken, tokenPurpose(again.login)));
+        threadKey = b64(await unseal(key, again.sealedThreadKey, threadKeyPurpose(again.threadId)));
+      } catch {
+        throw new ConvexError({ kind: 'config', message: "The box's secrets can't be unsealed with this deployment's BOX_SEAL_KEY." });
+      }
+      return { runnerId: again.runnerId, threadId: again.threadId, claudeToken, threadKey, repo: again.repo, save: again.save, login: again.login, tokenSetAt: again.tokenSetAt };
+    }
     let claudeToken: string;
     let threadKey: string;
     try {
@@ -458,10 +639,10 @@ export const exchange = action({
     } catch {
       throw new ConvexError({ kind: 'config', message: "The box's secrets can't be unsealed with this deployment's BOX_SEAL_KEY. The boot token still works once that's fixed." });
     }
-    const boxKey = BOX_KEY_PREFIX + randomHex(32);
-    const got: Claimed | null = await ctx.runMutation(internal.boxes.claimBoot, { bootHash, boxKeyHash: await sha256(boxKey), sealedToken: peeked.sealedToken, sealedThreadKey: peeked.sealedThreadKey, ...(machineId !== undefined ? { machineId } : {}) });
+    const boxKey = boxKeyHash === undefined ? BOX_KEY_PREFIX + randomHex(32) : undefined;
+    const got: Claimed | null = await ctx.runMutation(internal.boxes.claimBoot, { bootHash, boxKeyHash: boxKeyHash ?? (await sha256(boxKey!)), sealedToken: peeked.sealedToken, sealedThreadKey: peeked.sealedThreadKey, ...(machineId !== undefined ? { machineId } : {}) });
     if (!got) throw refusedBoot();
-    return { boxKey, runnerId: got.runnerId, threadId: got.threadId, claudeToken, threadKey, repo: got.repo, save: got.save };
+    return { ...(boxKey ? { boxKey } : {}), runnerId: got.runnerId, threadId: got.threadId, claudeToken, threadKey, repo: got.repo, save: got.save, login: peeked.login, tokenSetAt: peeked.tokenSetAt };
   },
 });
 
@@ -478,15 +659,37 @@ async function cloudToken(ctx: QueryCtx, login: string): Promise<Doc<'cloudToken
   return token;
 }
 
+/**
+ * An exchange asked again by the box that made it (its answer lost on the
+ * way): the boot token it used, its own machine and the hash of the key it
+ * made, while that key is still the thread's (not replaced, revoked or
+ * dead) and the token would still have been good. Null for anything else.
+ */
+export const peekReplay = internalQuery({
+  args: { bootHash: v.string(), boxKeyHash: v.string(), machineId: v.string() },
+  returns: v.union(
+    v.null(),
+    v.object({ login: v.string(), threadId: v.string(), sealedToken: v.string(), sealedThreadKey: v.string(), tokenSetAt: v.number(), runnerId: v.string(), repo: v.object({ origin: v.string(), subfolder: v.string(), baseBranch: v.string() }), save: v.union(v.null(), v.object({ url: v.string(), at: v.number(), bytes: v.number() })) }),
+  ),
+  handler: async (ctx, { bootHash, boxKeyHash, machineId }) => {
+    const row = await ctx.db.query('boxes').withIndex('by_box_key', (q) => q.eq('boxKeyHash', boxKeyHash)).first();
+    if (!row || row.boxKeyHash !== boxKeyHash || BOX_KEY_DEAD.includes(row.boxState.kind)) return null;
+    if (!row.exchanged || row.exchanged.bootHash !== bootHash || row.exchanged.until <= Date.now() || row.keyMachineId !== machineId) return null;
+    const token = await cloudToken(ctx, row.login);
+    const url = row.save ? await ctx.storage.getUrl(row.save.storageId) : null;
+    return { login: row.login, threadId: row.threadId, sealedToken: token.sealed, sealedThreadKey: row.sealedThreadKey, tokenSetAt: token.setAt, runnerId: row.runnerId, repo: row.repo, save: row.save && url ? { url, at: row.save.at, bytes: row.save.bytes } : null };
+  },
+});
+
 /** What the exchange unseals, read without using the boot token up. A login with no cloud token refuses here. */
 export const peekBoot = internalQuery({
   args: { bootHash: v.string() },
-  returns: v.union(v.null(), v.object({ login: v.string(), threadId: v.string(), sealedToken: v.string(), sealedThreadKey: v.string() })),
+  returns: v.union(v.null(), v.object({ login: v.string(), threadId: v.string(), sealedToken: v.string(), sealedThreadKey: v.string(), tokenSetAt: v.number() })),
   handler: async (ctx, { bootHash }) => {
     const row = await bootBox(ctx, bootHash);
     if (!row) return null;
     const token = await cloudToken(ctx, row.login);
-    return { login: row.login, threadId: row.threadId, sealedToken: token.sealed, sealedThreadKey: row.sealedThreadKey };
+    return { login: row.login, threadId: row.threadId, sealedToken: token.sealed, sealedThreadKey: row.sealedThreadKey, tokenSetAt: token.setAt };
   },
 });
 
@@ -515,9 +718,11 @@ export const claimBoot = internalMutation({
     if (condemned) return null;
     const token = await cloudToken(ctx, row.login);
     if (token.sealed !== sealedToken || row.sealedThreadKey !== sealedThreadKey) throw conflict("The login's cloud token changed while the box started: try again.");
+    // Taken before READY clears it: how long a lost answer may be asked for again.
+    const until = row.bootExpiresAt ?? Date.now();
     const r = await boxMachine.send(ctx, row._id, { type: 'READY' });
     if (r.status !== 'done') return null;
-    await ctx.db.patch(row._id, { boxKeyHash, keyMachineId: machineId, unsure: undefined });
+    await ctx.db.patch(row._id, { boxKeyHash, keyMachineId: machineId, unsure: undefined, exchanged: { bootHash, until } });
     const url = row.save ? await ctx.storage.getUrl(row.save.storageId) : null;
     return {
       runnerId: row.runnerId,
@@ -771,6 +976,16 @@ export const wakeWaiting = machines.internalMutation({
       if ((await boxMachine.send(machineCtx, row._id, { type: 'WAKE' })).status === 'done') woken++;
       else await ctx.db.patch(row._id, { wantsWakeAt: undefined });
     }
+    // Then threads that have never run, waiting for room to start, oldest first.
+    const max = (await ctx.db.get('runnerServices', serviceId))?.limits.maxBoxes ?? BOX_LIMITS.maxBoxes;
+    // In the order they started (the index keeps rows by creation within a
+    // state). One whose login's token was refused meanwhile goes back to
+    // waiting for a token (ROOM's other step) and uses none of the room.
+    for (const row of await ctx.db.query('boxes').withIndex('by_service_state', (q) => q.eq('serviceId', serviceId).eq('boxState.kind', 'waitingForRoom')).take(WAKE_BATCH)) {
+      if ((await countRunning(ctx, serviceId, max)) >= max) break;
+      const r = await boxMachine.send(machineCtx, row._id, { type: 'ROOM' });
+      if (r.status === 'done' && r.to === 'creating') woken++;
+    }
     return woken;
   },
 });
@@ -836,6 +1051,33 @@ export async function askToSave(ctx: MutationCtx, row: Pick<Doc<'boxes'>, 'runne
 
 // The states archiving does nothing more in.
 const ARCHIVED_ALREADY: readonly string[] = ['archiving', 'shelved', 'destroying', 'gone', 'expired'];
+
+/**
+ * Mike archived a thread whose box never started (boxHooks.ts UNSTARTED):
+ * it ends (ARCHIVE, to expired: nothing was made or saved), the archive
+ * command that asked is done here, as no runner will ever take it, and the
+ * thread's sidebar row is archived, so it goes to Archived everywhere.
+ * What else was waiting for it (its create) fails, saying it can't come
+ * back (failExpired, scheduled by the machine's step, after this).
+ */
+export const archiveUnstarted = internalMutation({
+  args: { threadId: v.string(), commandId: v.optional(v.id('commands')) },
+  returns: v.null(),
+  handler: async (ctx, { threadId, commandId }) => {
+    const row = await ctx.db.query('boxes').withIndex('by_threadId', (q) => q.eq('threadId', threadId)).unique();
+    if (!row) return null;
+    if (UNSTARTED.includes(row.boxState.kind) && (await boxMachine.send(ctx, row._id, { type: 'ARCHIVE' })).status !== 'done') return null;
+    if (row.boxState.kind !== 'expired' && !UNSTARTED.includes(row.boxState.kind)) return null;
+    const c = commandId ? await ctx.db.get('commands', commandId) : null;
+    if (c && c.runnerId === row.runnerId && c.state === 'pending') {
+      await commandMachine.send(ctx, c._id, { type: 'TAKE' });
+      await commandMachine.send(ctx, c._id, { type: 'FINISH', ok: true });
+    }
+    const index = await ctx.db.query('threadIndex').withIndex('by_runner_thread', (q) => q.eq('runnerId', row.runnerId).eq('threadId', threadId)).unique();
+    if (index && !index.archivedAt && !index.deleted) await ctx.db.patch('threadIndex', index._id, { archivedAt: new Date().toISOString(), status: 'idle', updatedMs: Date.now() });
+    return null;
+  },
+});
 
 /** The thread was archived or deleted a while ago (boxHooks.ts archiveSoon): its box goes, unless it's back out. */
 export const archiveIfStill = internalMutation({

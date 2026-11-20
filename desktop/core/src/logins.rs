@@ -323,6 +323,7 @@ pub fn provider_title(id: &str) -> String {
     match id {
         "claude" | "" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
+        "opencode" => "OpenCode".to_owned(),
         other => {
             let mut chars = other.chars();
             chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()

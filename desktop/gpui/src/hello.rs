@@ -778,8 +778,5 @@ fn switch(id: &'static str, on: bool, tip: &'static str, cx: &mut Context<Thread
 }
 
 fn abbreviate_home(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => format!("~{}", &path[home.len()..]),
-        _ => path.to_owned(),
-    }
+    threadbear_core::new_thread::abbreviate_home(path, &crate::files::home_dir())
 }

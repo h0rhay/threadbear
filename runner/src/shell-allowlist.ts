@@ -1152,6 +1152,10 @@ class Allow {
       this.refuse(ctx, line, `runs ${byPath ? 'a path to ' : ''}\`${given}\`, which isn't the shell's \`${name}\`: the shell knows its own words only as written, so this runs something else, ${OFF}.`);
     }
     if (SHELL_BUILTINS.has(name)) this.refuse(ctx, line, `uses the shell's \`${name}\`, ${OFF}.`);
+    // On Windows these run package scripts and programs with cmd.exe, which
+    // looks in the folder for a program before PATH (Codex's reviews of the
+    // Windows port, 18 Nov 2026): none is on the list there.
+    if (process.platform === 'win32' && ['npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'bunx'].includes(name)) this.refuse(ctx, line, `runs ${name}, which on Windows runs package scripts and programs with cmd.exe, which this short list can't read.`);
     if (this.o.live) return this.liveProgram(name, args, ctx, line);
     if (name === 'source' || name === '.') return this.source(args, ctx, line);
     if (ALLOWED_BUILTINS.has(name)) return this.builtin(name, args, ctx, line);
@@ -1583,6 +1587,10 @@ class Allow {
       const text = scripts[n];
       if (typeof text !== 'string') continue;
       const label = `${this.rel(f)}'s "${n}" script`;
+      // npm runs it with cmd.exe on Windows, which finds a program in the
+      // package's folder before PATH and reads the text by its own rules
+      // (Codex's review of the Windows port, 18 Nov 2026).
+      if (process.platform === 'win32') throw new Refused(`${label} runs with cmd.exe on Windows, which this short list can't read.`);
       let l: List;
       try {
         l = parse(text, true);

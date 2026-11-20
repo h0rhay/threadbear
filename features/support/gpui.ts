@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sleep, type Driver, type Dump } from './driver.ts';
 import { ownFolder } from '../../desktop/scripts/own-folder.ts';
+import { runtimeParent } from './web-runtime.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const exe = process.platform === 'win32' ? 'threadbear-gpui.exe' : 'threadbear-gpui';
@@ -88,6 +89,8 @@ export class GpuiDriver implements Driver {
 
   private appProcess?: ChildProcess;
   private display?: string;
+  /** This driver's folder on the home disk, on a remote.sh run (launchApp). */
+  private homeDisk?: string;
 
   private child(cmd: string, args: string[], env: NodeJS.ProcessEnv): ChildProcess {
     // A process group of its own: `dbus-run-session`'s bus and the portals it
@@ -145,6 +148,19 @@ export class GpuiDriver implements Driver {
       THREADBEAR_REDUCE_MOTION: process.env.TB_REDUCE_MOTION ?? 'off',
       ...specShell(),
     };
+    // On a remote.sh run, the app's temp folder and (unless the run chose
+    // one) web runtime go on the home disk: the Chromium helpers it starts
+    // run from the runtime and inherit the temp folder, and on Tinker Desk
+    // remote.sh's are on an external SSD that every new build's helpers asked
+    // macOS for, with nobody at the screen to answer (19 Nov; web-runtime.ts).
+    // One of each per driver, kept across its relaunches: two apps can't
+    // share a Chromium profile.
+    if (process.env.THREADBEAR_WEB_RUNTIME_PARENT) {
+      this.homeDisk ??= fs.mkdtempSync(path.join(runtimeParent(), 'tb-driver-'));
+      env.TMPDIR = path.join(this.homeDisk, 'tmp');
+      fs.mkdirSync(env.TMPDIR, { recursive: true });
+      if (!process.env.THREADBEAR_WEB_RUNTIME_DIR) env.THREADBEAR_WEB_RUNTIME_DIR = path.join(this.homeDisk, 'web-runtime');
+    }
     if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
       // A server: a virtual screen, and a session bus of its own for the
       // desktop settings and portals the app asks for.
@@ -223,6 +239,7 @@ export class GpuiDriver implements Driver {
     if (!fs.existsSync(binary)) throw new Error(`No GPUI app at ${binary}: cargo build -p threadbear-gpui --features automation`);
     // TB_RUNNER_HOME points at a real runner's data folder (a dev runner's), for
     // a one-off check that the app works with the real thing and not just the mock.
+    this.homeDisk = undefined;
     this.home = process.env.TB_RUNNER_HOME ?? fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'tb-spec-'));
     const ready = path.join(this.home, 'mock-ready');
     // TB_MOCK_FIXTURES swaps the demo threads for that folder's, for one-off checks.
@@ -417,5 +434,7 @@ export class GpuiDriver implements Driver {
     }
     await sleep(100);
     if (this.home && !process.env.TB_RUNNER_HOME) await fs.promises.rm(this.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    if (this.homeDisk) await fs.promises.rm(this.homeDisk, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    this.homeDisk = undefined;
   }
 }

@@ -380,7 +380,12 @@ async function main() {
       log('WARN', `release ${plan.start} keeps crashing at startup and there's no other good release to go back to`, { lastGood: state.lastGood });
     }
     const root = path.join(dir, 'releases', plan.start);
-    const proc = spawn(process.execPath, [path.join(root, 'src', 'main.ts')], {
+    // A small young generation: Node's default lets it grow to 16 MB a half,
+    // which a mostly idle runner keeps. With 2 MB a fresh runner's footprint
+    // went from 115 MB to 85 MB (M5, 20 Nov 2026), and that is what stays in
+    // memory after the app quits (ADEMark's A9 counted 168 MB). Only at
+    // launch: v8.setFlagsFromString can't resize it once the heap exists.
+    const proc = spawn(process.execPath, ['--max-semi-space-size=2', path.join(root, 'src', 'main.ts')], {
       cwd: root,
       env: { ...process.env, THREADBEAR_SUPERVISED: '1' },
       stdio: ['ignore', 'pipe', logFd === 2 ? 'inherit' : logFd, 'ipc'],

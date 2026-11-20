@@ -358,6 +358,25 @@ A thread's box on a virtual runner: made when the thread starts, saved and slept
 ```mermaid
 stateDiagram-v2
   direction LR
+  state "needsToken" as needsToken
+  needsToken : since
+  note right of needsToken
+Waiting for a cloud token for its login.
+No box, no key and nothing billed; its
+first message waits in the queue, and
+the thread shows the token card.
+  end note
+  state "waitingForRoom" as waitingForRoom
+  waitingForRoom : since
+  note right of waitingForRoom
+Its login has a token, but its virtual
+runner has maxBoxes up or starting. No
+box and nothing billed; its first
+message waits in the queue. Those
+waiting start oldest first as room frees
+(a box sleeps, fails or is archived, or
+at the idle check).
+  end note
   state "creating" as creating
   creating : bootBy
   note right of creating
@@ -452,7 +471,13 @@ A box couldn't be started or brought
 back. The thread and its last save are
 kept, and no key works for it.
   end note
-  [*] --> creating : START (owner) / start
+  [*] --> creating : START (owner) [1. hasToken] / start
+  [*] --> needsToken : START (owner) [else] / awaitToken
+  needsToken --> waitingForRoom : TOKEN_SET (server) / awaitRoom
+  needsToken --> expired : ARCHIVE (owner) / archiveUnstarted
+  waitingForRoom --> creating : ROOM (server) [1. hasToken] / tokenSet
+  waitingForRoom --> needsToken : ROOM (server) [else] / awaitToken
+  waitingForRoom --> expired : ARCHIVE (owner) / archiveUnstarted
   creating --> starting : CREATED(providerBoxId, attempt?) (server) [newBox] / created
   creating --> awake : READY (runner) / ready
   creating --> failed : FAILED(error, attempt?) (server) [unexchanged] / fail
@@ -541,7 +566,19 @@ kept, and no key works for it.
 
 How a row is born:
 
-- `START (owner)` → `creating`. A thread starts on a virtual runner: the service asks the provider for its first box, with a boot token and nothing reusable in its environment.
+- `START (owner)` [1. hasToken] → `creating`. A thread starts on a virtual runner: the service asks the provider for its first box, with a boot token and nothing reusable in its environment.
+- `START (owner)` [else] → `needsToken`. A thread starts on a virtual runner with a login that has no cloud token, or only a refused one: nothing is asked of the provider until Mike sets one, from the card in the thread.
+
+From `needsToken`:
+
+- `TOKEN_SET (server)` → `waitingForRoom`. Mike set a token for the login: it joins its virtual runner's queue for room, in the order the threads started, so it never passes one that was waiting before it (boxes.ts wakeWaiting starts it at once if there's room).
+- `ARCHIVE (owner)` → `expired`. Mike archives the thread before it ever ran: nothing was made or saved, so it ends.
+
+From `waitingForRoom`:
+
+- `ROOM (server)` [1. hasToken] → `creating`. There's room now, and its login's token is still good: the service asks the provider for the thread's first box.
+- `ROOM (server)` [else] → `needsToken`. There's room, but a box's turn was refused on its login's token meanwhile: it waits for a token again, using none of the room, rather than start a machine that would be refused too.
+- `ARCHIVE (owner)` → `expired`. Mike archives the thread before it ever ran: nothing was made or saved, so it ends.
 
 From `creating`:
 
@@ -673,3 +710,44 @@ From `failed`:
 - `CREATED(providerBoxId, attempt?) (server)` [notStale] stays put. The provider's id for a box that came too late: kept, so it's found and deleted.
 - `ARCHIVE (owner)` [1. holdsWork] → `shelved`. Mike archives the thread while a box of it may hold work newer than its save: that box is kept.
 - `ARCHIVE (owner)` [else] → `destroying`. Mike archives the thread: any box the provider still has is deleted.
+
+## cloudToken
+
+A Claude login's token for the boxes of virtual runners: set by Mike, dead once a box's turn on it is refused, and set again to bring the threads waiting on it back.
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  state "valid" as valid
+  note right of valid
+Boxes on the login are given this token
+when they start, and run Claude Code on
+it.
+  end note
+  state "dead" as dead
+  dead : at
+  note right of dead
+Claude refused it. New threads on the
+login wait for a new token, and the card
+in their thread asks Mike for one.
+  end note
+  [*] --> valid : SET (owner) / set
+  valid --> valid : SET (owner) / set
+  valid --> dead : REFUSED(setAt) (boxRunner) [sameToken] / refused
+  dead --> valid : SET (owner) / set
+  dead --> dead : REFUSED(setAt) (boxRunner)
+```
+
+How a row is born:
+
+- `SET (owner)` → `valid`. Mike sets the login's first cloud token: boxes waiting on the login start.
+
+From `valid`:
+
+- `SET (owner)` stays put. Mike sets a new token for the login: boxes starting from now get it, and any waiting on the login start.
+- `REFUSED(setAt) (boxRunner)` [sameToken] → `dead`. A box says Claude refused this token (revoked, or past its year): threads on the login show the token card until a new one is set.
+
+From `dead`:
+
+- `SET (owner)` → `valid`. Mike sets a new token: the boxes waiting on the login start, and boxes waiting after a refusal fetch it and carry on.
+- `REFUSED(setAt) (boxRunner)` stays put. Another box says the same: it stays dead.

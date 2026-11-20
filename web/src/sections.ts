@@ -73,6 +73,7 @@ export function urgency(r: ThreadRow): number {
   return broken ? 3 : 4;
 }
 
+const cardFirst = (a: ThreadRow, b: ThreadRow) => Number(needsAnswer(b)) - Number(needsAnswer(a));
 const newestFirst = (a: ThreadRow, b: ThreadRow) => b.lastActivityMs - a.lastActivityMs || a.threadId.localeCompare(b.threadId);
 
 // For each thread a schedule will message by itself, when the soonest is due.
@@ -111,8 +112,10 @@ export function build<T extends ThreadRow>(rows: T[], now: number, wakes: Map<st
   // Oldest star first, so they stay put while Mike goes back and forth.
   starred.sort((a, b) => a.starredAt!.localeCompare(b.starredAt!) || a.threadId.localeCompare(b.threadId));
   if (order === 'needsYou') inbox.sort((a, b) => urgency(a) - urgency(b) || newestFirst(a, b));
-  else if (order === 'newest') inbox.sort(newestFirst);
-  else inbox.sort((a, b) => newestFirst(b, a));
+  // A card waiting on Mike (ask_secret, a question, a permission) goes first
+  // in every order: it runs out, and oldest first had it at the bottom (19 Nov).
+  else if (order === 'newest') inbox.sort((a, b) => cardFirst(a, b) || newestFirst(a, b));
+  else inbox.sort((a, b) => cardFirst(a, b) || newestFirst(b, a));
   running.sort(newestFirst);
   return { starred, inbox, running, scheduled };
 }

@@ -83,6 +83,10 @@ When('I paste the picture into the composer', async function (this: ThreadbearWo
   await this.app.do({ cmd: 'paste-image', path: samplePicture });
 });
 
+When('I paste the picture into the composer {int} times', async function (this: ThreadbearWorld, times: number) {
+  for (let n = 0; n < times; n += 1) await this.app.do({ cmd: 'paste-image', path: samplePicture });
+});
+
 // A point in the thread's transcript on both apps' windows.
 When('I drop the picture on the transcript', async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'drop', path: samplePicture, x: 650, y: 300 });
@@ -190,3 +194,28 @@ Then('the composer holds the link to the thread {string}', async function (this:
   await this.until(`the link to "${title}" in the composer`, (d) => d.composer.text === `[${title}](thread:${t.id})`);
 });
 
+
+// Where a labelled control's middle is, from `label-point`.
+async function pointOf(world: ThreadbearWorld, label: string): Promise<{ x: number; y: number }> {
+  const reply = await world.app.do({ cmd: 'label-point', label });
+  const [, x, y] = reply.trim().split(/\s+/);
+  assert.ok(x && y, reply);
+  return { x: Number(x), y: Number(y) };
+}
+
+// Well above the box, over the page or the transcript, which takes the
+// keyboard from the box.
+When('I click away from the message box', async function (this: ThreadbearWorld) {
+  const box = await pointOf(this, 'Message');
+  await this.app.do({ cmd: 'click-at', x: box.x, y: box.y - 150 });
+});
+
+// Off the words: in the box's padding under Send, where only the box itself
+// is (ADEMark's click at 860,400 on 19 Nov). Not beside Send: in a narrow
+// window the chips give way until only the row's gaps are left between them,
+// and a thread's machine chip did that on GitHub's Mac (19 Nov). The padding
+// is 14 points whatever the width; Send is 28 tall, so 21 below its middle.
+When('I click the message box under its controls', async function (this: ThreadbearWorld) {
+  const send = await pointOf(this, 'Send');
+  await this.app.do({ cmd: 'click-at', x: send.x, y: send.y + 21 });
+});

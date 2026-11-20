@@ -139,7 +139,7 @@ export function isMoved(e: unknown): boolean {
 
 // Only installed on the draining server. Older releases refuse this method,
 // so the primary keeps their run due rather than steering into a busy turn.
-export function scheduledSendMethods(runner: Pick<Runner, 'sendScheduled' | 'findScheduledSend' | 'has' | 'mustGet' | 'unqueue' | 'draining' | 'clock'>) {
+export function scheduledSendMethods(runner: Pick<Runner, 'sendScheduled' | 'findScheduledSend' | 'dropScheduled' | 'has' | 'mustGet' | 'unqueue' | 'draining' | 'clock'>) {
   const deliver = (p: Record<string, unknown>) => {
     if (typeof p.threadId !== 'string' || typeof p.text !== 'string' || typeof p.scheduleId !== 'string') throw new RpcError(ErrorCode.badParams, 'threadId, text and scheduleId must be strings');
     if (p.run !== undefined && (typeof p.run !== 'string' || !p.run || p.run.length > 200)) throw new RpcError(ErrorCode.badParams, 'run must be a nonempty string of at most 200 characters');
@@ -162,6 +162,12 @@ export function scheduledSendMethods(runner: Pick<Runner, 'sendScheduled' | 'fin
     return sent;
   };
   return {
+    // A deleted schedule's messages queued here before the handover began.
+    'drain.dropScheduled': (p: Record<string, unknown>) => {
+      if (typeof p.threadId !== 'string' || typeof p.scheduleId !== 'string') throw new RpcError(ErrorCode.badParams, 'threadId and scheduleId must be strings');
+      if (!runner.has(p.threadId)) throw new RpcError(ErrorCode.moved, 'That thread has moved to the new runner.');
+      return { dropped: runner.dropScheduled(p.threadId, p.scheduleId) };
+    },
     'drain.sendScheduled': deliver,
     'drain.sendScheduledOnce': (p: Record<string, unknown>) => {
       if (typeof p.run !== 'string' || !p.run) throw new RpcError(ErrorCode.badParams, 'run is required');
@@ -183,6 +189,19 @@ export async function sendScheduled(runner: Pick<Runner, 'sendScheduled' | 'has'
     // An unkeyed fallback cannot recognize a delivery after a lost reply.
     // Keep this one-time handover wait instead of restoring that duplicate.
     if (e instanceof RpcError && e.code === ErrorCode.methodNotFound) throw new RpcError(ErrorCode.busy, 'The old runner cannot deliver scheduled messages yet; try again after its thread moves across.');
+    throw e;
+  }
+}
+
+// A deleted schedule's queued messages, wherever its thread is now: the
+// draining runner keeping it, or here once it has come across. An old
+// draining release without the method keeps its queue (protocol.md).
+export async function dropScheduled(runner: Pick<Runner, 'dropScheduled' | 'has'>, peers: Pick<Peers, 'call'>, threadId: string, scheduleId: string): Promise<number> {
+  try {
+    const r = await peers.call(threadId, 'drain.dropScheduled', { threadId, scheduleId }) as { dropped?: number };
+    return typeof r?.dropped === 'number' ? r.dropped : 0;
+  } catch (e) {
+    if (isMoved(e) && runner.has(threadId)) return runner.dropScheduled(threadId, scheduleId);
     throw e;
   }
 }
@@ -1042,6 +1061,12 @@ export function projectRouter(
     update: async (projectId, params) => {
       const l = primary();
       return l ? there(l, 'update', [projectId, params]) : local.update(projectId, params);
+    },
+    // An older primary has no editNotes, and refuses it rather than saving
+    // edits worked out here on notes it may have changed.
+    editNotes: async (projectId, edits, o) => {
+      const l = primary();
+      return l ? there(l, 'editNotes', [projectId, edits, o]) : local.editNotes(projectId, edits, o);
     },
     appendNote: async (projectId, text) => {
       const l = primary();

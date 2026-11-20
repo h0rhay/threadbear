@@ -13,6 +13,7 @@ import { git, gitLimits, land, type LandTarget } from '../../src/worktrees.ts';
 import { PATIENCE_MS } from './patience.ts';
 export { holdUntil } from './patience.ts';
 import { PatchTrust } from '../../src/patch-trust.ts';
+import { SHELL } from './platform.ts';
 
 // Commits need a name, and Alex's own git config (signing, hooks) mustn't
 // reach the temp repos. Each test file runs in its own process.
@@ -28,7 +29,7 @@ Object.assign(process.env, {
 export const TB = path.join(import.meta.dirname, '..', '..', 'bin', 'tb');
 
 export function sh(cwd: string, cmd: string): string {
-  return execFileSync('/bin/sh', ['-c', cmd], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  return execFileSync(SHELL[0], [SHELL[1], cmd], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
 export function write(dir: string, files: Record<string, string>): void {

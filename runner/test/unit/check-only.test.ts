@@ -37,7 +37,7 @@ function checkout(webTest = 'true') {
   put('runner/node_modules/.keep', '');
   put('runner/test/helpers/clean-env.ts', '');
   put('runner/test/unit/ok.test.ts', PASSES);
-  put('package.json', JSON.stringify({ scripts: { 'convex:typecheck': 'true', 'web:typecheck': 'true', 'web:test': webTest } }));
+  put('package.json', JSON.stringify({ scripts: { 'convex:typecheck': 'true', 'web:typecheck': 'true', 'web:test': webTest, lint: 'true', 'lint:files': 'true' } }));
   put('node_modules/.keep', '');
   put('app/Tools/ok.mjs', '');
   put('app/Tools/mock-runner/ok.mjs', '');
@@ -49,7 +49,9 @@ function checkout(webTest = 'true') {
   return { root, put };
 }
 
-function run(root: string, flags: string[], extra: NodeJS.ProcessEnv = {}, local = true) {
+// `typed` is a command line run by a shell from the checkout's top, as
+// someone would type it, with `flags` after it.
+function run(root: string, flags: string[], extra: NodeJS.ProcessEnv = {}, local = true, typed?: string) {
   const list = path.join(root, '.changed');
   fs.writeFileSync(list, 'runner/src/x.ts\n');
   const env: NodeJS.ProcessEnv = {
@@ -61,7 +63,10 @@ function run(root: string, flags: string[], extra: NodeJS.ProcessEnv = {}, local
   // to it as a subtest and exit 0 whatever failed.
   delete env.NODE_TEST_CONTEXT;
   Object.assign(env, extra);
-  const r = spawnSync('bash', [path.join(root, 'check.sh'), ...flags, ...(local ? ['--local'] : [])], { env, encoding: 'utf8', timeout: 120_000 });
+  const all = [...flags, ...(local ? ['--local'] : [])];
+  const r = typed
+    ? spawnSync('/bin/sh', ['-c', `${typed} ${all.join(' ')}`], { cwd: root, env, encoding: 'utf8', timeout: 120_000 })
+    : spawnSync('bash', [path.join(root, 'check.sh'), ...all], { env, encoding: 'utf8', timeout: 120_000 });
   return { status: r.status, out: (r.stdout ?? '') + (r.stderr ?? '') };
 }
 
@@ -113,6 +118,14 @@ test('a failed run ends with the --only that runs what failed again, and that ru
     assert.deepEqual([...(onlyRan(again.out) ?? [])], ['web tests', 'runner unit tests']);
     const logs = again.out.match(/^FAIL\s+runner unit tests.*?(\S+\.log)/m)?.[1];
     assert.ok(logs && !/ok\.test\.ts|✔ ok/.test(fs.readFileSync(logs, 'utf8')), 'only the named file ran');
+    // The hint is a whole command, run as printed from the checkout's top.
+    // It said just `--only "..."` beside tb land's "run tb land again", and
+    // an agent ran tb land --only, which tb refuses (19 Nov).
+    const said = r.out.match(/^To run only what failed again: (.+)$/m)?.[1];
+    assert.ok(said?.startsWith('./check.sh --only '), r.out);
+    const typed = run(c.root, ['--quick'], {}, true, said);
+    assert.equal(typed.status, 1, typed.out);
+    assert.deepEqual([...(onlyRan(typed.out) ?? [])], ['web tests', 'runner unit tests']);
   } finally {
     fs.rmSync(c.root, { recursive: true, force: true });
   }

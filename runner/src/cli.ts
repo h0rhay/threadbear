@@ -32,6 +32,9 @@ const OPTIONS = {
   model: { type: 'string' },
   effort: { type: 'string' },
   ask: { type: 'boolean' },
+  // tb checkup --post / --skip (checkup.ts).
+  post: { type: 'boolean' },
+  skip: { type: 'boolean' },
   auto: { type: 'boolean' },
   plan: { type: 'boolean' },
   full: { type: 'boolean' },
@@ -210,6 +213,7 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   models: ['json', 'remove', 'labels', 'field', 'system', 'cwd'],
   status: ['json'],
   updates: ['json'],
+  checkup: ['text', 'post', 'skip', 'json'],
   self: ['json'],
   restart: ['now', 'force', 'resume', 'no-resume', 'cancel', 'reason', 'thread', 'max-wait'],
   show: ['last', 'tools'],

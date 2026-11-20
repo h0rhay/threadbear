@@ -222,7 +222,9 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
   const messages = useMemo(() => rows.filter((m) => !isNote(m)), [rows]);
   if (!shown || !t) return <div className="pad muted">Loading…</div>;
 
-  const pictures = shown.images ?? [];
+  // A live page (API 95) runs only in the Mac and iPhone apps' sealed views:
+  // here it's its title, never an <img> or a link to its file.
+  const pictures = (shown.images ?? []).filter((p) => (p as { mediaType?: string }).mediaType !== 'text/html');
   const inText = new Map(pictures.filter((p) => p.src).map((p) => [p.src!, p.url]));
   const after = picturesByRow(messages, pictures);
   const linkTo = (id: string) => threadPath(inbox?.find((r) => r.threadId.startsWith(id))?.threadId ?? id);

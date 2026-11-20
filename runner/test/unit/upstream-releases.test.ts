@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FakeClock } from '../../src/clock.ts';
 import { type CiRun, bareRepoArgs, ciVerdict, earlierVerdict, HISTORY_PAGE, FETCH_INTERVAL_MS, FIRST_LOOK_MS, RETRY_AFTER_FAILURE_MS, SETTLE_MS, cleanNotes, parseImportant, parseNotes, repoKey, signersPath, splitSignedTag, tagFor } from '../../src/upstream.ts';
+import { nullLogger } from '../../src/log.ts';
+import { type GitOptions, gitAsync } from '../../src/upstream.ts';
 import { LATER, asGitHub, commit, fakeGpg, git, kept, key, release, signedTag, upstreamFor, waitFor, withVictimGpg, world } from '../helpers/upstream-harness.ts';
 
 test('repoKey: the same repo however its URL is written', () => {
@@ -219,7 +221,7 @@ test("release notes: Mike's runner writes them into the tag, and a fork reads ea
     publish: { publish: true, signingKey: w.mikeKey.priv }, runningMainSettled: () => true,
     writeNotes: async (commits: string) => { prompts.push(commits); if (reply === 'throw') throw new Error('no room'); return reply; },
     git: async (cwd: string, args: string[]) => {
-      if (args[0] === 'push' && args.some((a) => a.startsWith('refs/tags/')) && failPush) { failPush = false; throw new Error('push offline'); }
+      if (args[0] === 'push' && args.some((a) => a.includes('refs/tags/')) && failPush) { failPush = false; throw new Error('push offline'); }
       return git(cwd, ...args);
     },
   });
@@ -330,7 +332,9 @@ test("Mike's runner holds a release when a workflow that didn't run on the tip w
     ciHistory: async (_repo: string, file: string) => (askedFor.push(file), history),
   });
   assert.equal(await up.publishOnce(), undefined, "runner.yml's red run holds it");
-  assert.deepEqual(askedFor, ['.github/workflows/runner.yml'], 'only the workflow that sat the tip out');
+  // The tip's look asks only for the workflow that sat it out; the look
+  // back for an older green commit (none here) then reads each one's.
+  assert.deepEqual(askedFor[0], '.github/workflows/runner.yml', 'only the workflow that sat the tip out');
   assert.equal(up.status().held?.commit, tip);
   assert.equal(up.status().held!.why, `"Runner" didn't pass on ${broke.slice(0, 8)}, the last commit it ran on`);
   // Re-run green on that commit: the tip can go.
@@ -385,6 +389,49 @@ test("Mike's runner holds a release until GitHub's checks pass on that commit", 
   assert.equal(up.status().published?.tag, tag);
   assert.equal(notesCalls, 1);
   assert.match(git(w.mike, "cat-file", "tag", tag!), /What's new:\n- Checks keep releases buildable/);
+});
+
+test("a red tip doesn't hold the day's release: the newest commit green on everything goes out, never one inside a push", async () => {
+  const w = world();
+  asGitHub(w.mike, w.root);
+  fs.mkdirSync(path.join(w.mike, '.github', 'workflows'), { recursive: true });
+  commit(w.mike, '.github/workflows/build.yml', 'Build on GitHub');
+  const c0 = commit(w.mike, '.github/workflows/runner.yml', 'Runner tests on GitHub');
+  // Only build.yml's paths: runner.yml counts by its run on c0.
+  const g1 = commit(w.mike, 'README.md', 'Docs');
+  // Pushed with the tip, so nothing ran on it alone.
+  const inside = commit(w.mike, 'a.txt', 'Inside a push');
+  const tip = commit(w.mike, 'b.txt', 'Breaks Windows');
+  git(w.mike, 'push', '-q', 'origin', 'main');
+  const committed = Number(git(w.mike, 'log', '-1', '--format=%ct')) * 1000;
+  const clock = new FakeClock(committed + 2 * SETTLE_MS);
+  const ran = (wf: string, sha: string, conclusion: string): CiRun => ({ workflow: wf === 'build' ? '7' : '8', name: wf === 'build' ? 'Build' : 'Runner', status: 'completed', conclusion, attempt: 1, file: `.github/workflows/${wf}.yml`, sha });
+  let history: Record<string, CiRun[]> = {
+    '.github/workflows/build.yml': [ran('build', tip, 'success'), ran('build', g1, 'success'), ran('build', c0, 'success')],
+    '.github/workflows/runner.yml': [ran('runner', tip, 'failure'), ran('runner', c0, 'success')],
+  };
+  const make = () =>
+    upstreamFor(w.mike, w.home, clock, {
+      publish: { publish: true, signingKey: w.mikeKey.priv },
+      runningMainSettled: () => true,
+      ciRuns: async (_repo: string, sha: string) => [...history['.github/workflows/build.yml']!, ...history['.github/workflows/runner.yml']!].filter((r) => r.sha === sha),
+      ciHistory: async (_repo: string, file: string) => history[file] ?? [],
+    });
+  // Nothing green since the last push head either: held, saying why the tip is.
+  history = { ...history, '.github/workflows/runner.yml': [ran('runner', tip, 'failure'), ran('runner', c0, 'cancelled')] };
+  const held = make();
+  assert.equal(await held.publishOnce(), undefined);
+  assert.equal(held.status().held?.commit, tip);
+  assert.match(held.status().held!.why, /"Runner" didn't pass on it/);
+  // c0 green, g1 green by c0's runner run: g1 goes out, not the commit inside the push.
+  history = { ...history, '.github/workflows/runner.yml': [ran('runner', tip, 'failure'), ran('runner', c0, 'success')] };
+  const up = make();
+  const tag = await up.publishOnce();
+  assert.equal(tag, tagFor(new Date(clock.now())));
+  assert.equal(git(w.mike, 'rev-parse', `${tag}^{commit}`), g1);
+  assert.notEqual(git(w.mike, 'rev-parse', `${tag}^{commit}`), inside);
+  assert.equal(up.status().held, undefined);
+  assert.doesNotMatch(git(w.mike, 'cat-file', 'tag', tag!), /Breaks Windows|Inside a push/, "the tag's notes are its own commits'");
 });
 
 test("Mike's runner pushes a settled main GitHub doesn't have, then waits for its checks", async () => {
@@ -524,4 +571,146 @@ test('a release name that verified keeps its first tag even if a signed one repl
   const s = await up.check();
   assert.equal(kept(w.theirs, '2026-10-30'), first);
   assert.equal(s.release?.commit, first);
+});
+
+// 19 Nov 2026: the Secure Enclave handed back a signature with empty r and
+// s, git called the tag signed, and release/2026-11-19 went out verifying
+// nowhere. Mike's runner now checks its own tag as a fork would first.
+test("Mike's runner never pushes a release tag whose signature doesn't verify against release-signers", async () => {
+  // The corrupting signer is a shell script, which git on Windows doesn't run as one.
+  for (const how of process.platform === 'win32' ? (['unannounced'] as const) : (['corrupt', 'unannounced'] as const)) {
+    const w = world();
+    commit(w.mike, 'b.txt', 'Newer work');
+    git(w.mike, 'push', '-q', 'origin', 'main');
+    const committed = Number(git(w.mike, 'log', '-1', '--format=%ct')) * 1000;
+    let signingKey = w.mikeKey.priv;
+    if (how === 'corrupt') {
+      // A signer that says it signed but leaves a signature that's no good,
+      // as the provider did: ssh-keygen signs, then the blob is mangled.
+      const program = path.join(w.root, 'bad-signer');
+      fs.writeFileSync(program, `#!/bin/sh
+ssh-keygen "$@" || exit $?
+for last; do :; done
+case "$*" in *"-Y sign"*)
+  # The signature's own bytes sit at the end of the armor.
+  awk '{ l[NR] = $0 } END { for (i = 1; i <= NR; i++) { if (l[i + 2] ~ /^-----END/) l[i] = "AAAAAAAA" substr(l[i], 9); print l[i] } }' "$last.sig" > "$last.sig.tmp" && mv "$last.sig.tmp" "$last.sig" ;;
+esac
+`, { mode: 0o755 });
+      git(w.mike, 'config', 'gpg.ssh.program', program);
+    } else {
+      signingKey = key(w.root, 'not-announced').priv;
+    }
+    const logged: string[] = [];
+    const log = { ...nullLogger, warn: (m: string) => logged.push(m) };
+    const up = upstreamFor(w.mike, w.home, new FakeClock(committed + 2 * SETTLE_MS), { publish: { publish: true, signingKey }, runningMainSettled: () => true, log });
+    assert.equal(await up.publishOnce(), undefined, how);
+    const tag = tagFor(new Date(committed + 2 * SETTLE_MS));
+    assert.equal(git(w.mike, 'tag', '--list', tag), '', `${how}: the bad tag is deleted`);
+    assert.equal(git(w.mike, 'ls-remote', 'origin', `refs/tags/${tag}`), '', `${how}: and never pushed`);
+    assert.match(up.status().held?.why ?? '', how === 'corrupt' ? /signature didn't verify, so it wasn't pushed: ssh-keygen says it isn't good/ : /signature didn't verify, so it wasn't pushed: its key wasn't in scripts\/release-signers at release\/2026-10-01/, how);
+    assert.ok(logged.some((m) => /does not verify/.test(m)), how);
+  }
+});
+
+// A world ready to publish today's release: `files` committed on main and
+// pushed, the clock past the settle time.
+function readyToPublish(files: Record<string, string> = {}) {
+  const w = world();
+  for (const [f, text] of Object.entries(files)) {
+    fs.writeFileSync(path.join(w.mike, f), text);
+    git(w.mike, 'add', f);
+  }
+  const tip = commit(w.mike, 'b.txt', 'Newer work');
+  git(w.mike, 'push', '-q', 'origin', 'main');
+  const now = Number(git(w.mike, 'log', '-1', '--format=%ct')) * 1000 + 2 * SETTLE_MS;
+  const publisher = (signingKey: string, extra = {}) => upstreamFor(w.mike, w.home, new FakeClock(now), { publish: { publish: true, signingKey }, runningMainSettled: () => true, ...extra });
+  return { w, tip, now, publisher };
+}
+
+const pub = (k: { signers: string }) => fs.readFileSync(k.signers, 'utf8').trim().split(' ').slice(2, 4).join(' ');
+const signers = (...ks: { signers: string }[]) => ks.map((k) => fs.readFileSync(k.signers, 'utf8').trim().replace(/^\S+/, 'threadbear-releases')).join('\n') + '\n';
+
+// Codex's and Gemini's reviews of the check: revoked keys are the last
+// release's, so a key revoked there is refused, and one revoking itself
+// still goes out (forks take the revocation in, then don't offer it).
+test("the release check refuses a key the last release revoked, and lets a key revoke itself", async () => {
+  let r = readyToPublish();
+  release(r.w, 'release/2026-10-02', r.w.mikeKey.priv, { 'scripts/release-keys-revoked': `${pub(r.w.mikeKey)}\n` });
+  commit(r.w.mike, 'c.txt', 'After the revocation');
+  git(r.w.mike, 'push', '-q', 'origin', 'main');
+  const now = Number(git(r.w.mike, 'log', '-1', '--format=%ct')) * 1000 + 2 * SETTLE_MS;
+  const up = upstreamFor(r.w.mike, r.w.home, new FakeClock(now), { publish: { publish: true, signingKey: r.w.mikeKey.priv }, runningMainSettled: () => true });
+  assert.equal(await up.publishOnce(), undefined);
+  assert.match(up.status().held?.why ?? '', /isn't good for any key/);
+
+  r = readyToPublish({ 'scripts/release-keys-revoked': `${pub(r.w.mikeKey)}\n` });
+  const self = r.publisher(r.w.mikeKey.priv);
+  assert.ok(await self.publishOnce(), 'a release revoking its own key still goes out');
+});
+
+// A key in release-signers counts for forks only a week after a release
+// announced it (release-keys.ts): signing with it sooner is held.
+test("the release check holds a key forks haven't had a week to take in", async () => {
+  const r = readyToPublish();
+  const next = key(r.w.root, 'next-key');
+  const oldTag = (name: string, daysAgo: number) => {
+    const at = Math.floor((r.now - daysAgo * 24 * 60 * 60_000) / 1000);
+    const t = spawnSync('git', ['-C', r.w.mike, '-c', 'gpg.format=ssh', '-c', `user.signingkey=${r.w.mikeKey.priv}`, 'tag', '-s', '-m', name, name, 'HEAD'], { env: { ...process.env, GIT_COMMITTER_DATE: `${at} +0000` } });
+    assert.equal(t.status, 0, String(t.stderr));
+    git(r.w.mike, 'push', '-q', 'origin', `refs/tags/${name}`);
+  };
+  oldTag('release/2026-09-01', 10); // its release-signers has only Mike's key
+  fs.writeFileSync(path.join(r.w.mike, 'scripts', 'release-signers'), signers(r.w.mikeKey, next));
+  git(r.w.mike, 'add', 'scripts/release-signers');
+  const tip = commit(r.w.mike, 'd.txt', 'Announce the next key');
+  git(r.w.mike, 'push', '-q', 'origin', 'main');
+  const now = Number(git(r.w.mike, 'log', '-1', '--format=%ct')) * 1000 + 2 * SETTLE_MS;
+  const publisher = (k: string) => upstreamFor(r.w.mike, r.w.home, new FakeClock(now), { publish: { publish: true, signingKey: k }, runningMainSettled: () => true });
+  const early = publisher(next.priv);
+  assert.equal(await early.publishOnce(), undefined);
+  assert.match(early.status().held?.why ?? '', /wasn't in scripts\/release-signers at release\/2026-09-01, so forks don't take it yet/);
+  // A release with it in, more than eight days old: now it counts.
+  git(r.w.mike, 'push', '-q', 'origin', ':refs/tags/release/2026-09-01');
+  git(r.w.mike, 'tag', '-d', 'release/2026-09-01');
+  oldTag('release/2026-09-02', 9);
+  const tag = await publisher(next.priv).publishOnce();
+  assert.ok(tag);
+  assert.equal(git(r.w.mike, 'rev-parse', `${tag}^{commit}`), tip);
+});
+
+// Gemini's and Codex's reviews: a tag made here and never pushed (its
+// delete failed, perhaps before a restart) passed for today's release on
+// the next look, and as the last release after that.
+test("a tag that never reached GitHub isn't a release: the next look deletes it and tries again", async () => {
+  const r = readyToPublish();
+  const stranger = key(r.w.root, 'stranger');
+  let failDelete = true;
+  const failing = { git: (cwd: string, args: string[], opts?: GitOptions) => (failDelete && args[0] === 'update-ref' && args[1] === '-d' ? Promise.reject(new Error('cannot lock ref')) : gitAsync(cwd, args, opts)) };
+  const up = r.publisher(stranger.priv, failing);
+  assert.equal(await up.publishOnce(), undefined);
+  const tag = tagFor(new Date(r.now));
+  const bad = git(r.w.mike, 'rev-parse', `refs/tags/${tag}`);
+  assert.match(up.status().held?.why ?? '', /couldn't be deleted yet/);
+  // A restarted runner, delete still failing: held, saying so, nothing pushed.
+  const again = r.publisher(stranger.priv, failing);
+  assert.equal(await again.publishOnce(), undefined);
+  assert.match(again.status().held?.why ?? '', new RegExp(`never pushed, and it can't be deleted \\(git tag -d ${tag}\\)`));
+  assert.equal(git(r.w.mike, 'ls-remote', 'origin', `refs/tags/${tag}`), '');
+  // Once it can be deleted, a good key's release goes out in its place.
+  failDelete = false;
+  const good = r.publisher(r.w.mikeKey.priv);
+  assert.equal(await good.publishOnce(), tag);
+  assert.notEqual(git(r.w.mike, 'rev-parse', `refs/tags/${tag}`), bad);
+  assert.ok(git(r.w.mike, 'ls-remote', 'origin', `refs/tags/${tag}`));
+});
+
+// Codex's third review: a pushed release/latest at main's tip passed for
+// the last release, though forks only take date-named ones.
+test('a release/ tag not named for a day is not the last release', async () => {
+  const r = readyToPublish();
+  signedTag(r.w.mike, 'release/latest', r.w.mikeKey.priv);
+  git(r.w.mike, 'push', '-q', 'origin', 'refs/tags/release/latest');
+  // A branch named like the old release can't hide it from the key check.
+  git(r.w.mike, 'branch', 'release/2026-10-01');
+  assert.equal(await r.publisher(r.w.mikeKey.priv).publishOnce(), tagFor(new Date(r.now)));
 });

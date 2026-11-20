@@ -35,7 +35,7 @@ after(() => {
   for (const d of made) fs.rmSync(d, { recursive: true, force: true });
 });
 function ownTmp(): string {
-  const d = fs.realpathSync(fs.mkdtempSync('/tmp/tb-allow-'));
+  const d = fs.realpathSync(fs.mkdtempSync(path.join(process.platform === 'win32' ? os.tmpdir() : '/tmp', 'tb-allow-')));
   made.push(d);
   return d;
 }

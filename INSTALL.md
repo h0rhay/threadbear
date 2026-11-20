@@ -10,8 +10,10 @@ can do yourself. `README.md` says what Threadbear is.
 Run these and fix what's missing before going on:
 
 - `sw_vers -productVersion` and `uname -m`: macOS on `arm64` (Apple silicon).
-- `xcodebuild -version`: Xcode 26 or newer. If it's missing or older, **Ask**
-  them to install Xcode from the App Store and open it once, then carry on.
+- `xcode-select -p`: Xcode's command line tools. If it fails, run
+  `xcode-select --install` and **Ask** them to click Install in the window
+  it opens, then carry on. Full Xcode isn't needed, and setup installs Rust
+  for the app if it isn't there.
 - `node -v`: 24 or newer. If not, install it with nvm
   (`nvm install 24 && nvm use 24`) or Homebrew (`brew install node@24`), and
   use that `node` for the rest.
@@ -155,7 +157,9 @@ do that. Tell them that prompt is Threadbear's, so they can answer it.
 Both happen in the app, in Settings (⌘,) › Phone & browser. **Ask** them to
 open it there:
 
-- "Show the code" shows a QR code to scan with the Threadbear iPhone app.
+- "Show the code" shows a QR code to scan with the Threadbear iPhone or
+  Android app. The Android one isn't on Google Play yet: docs/guide.md, "On
+  Android", says how to install it from GitHub.
 - "Open signed in" opens their Threadbear website in their browser, signed in.
 - The same tab lists what's paired, each with Revoke.
 
@@ -257,7 +261,7 @@ Threads that need those belong on the Mac.
 
 A Windows 10 or 11 PC can be a runner too, natively, with no WSL
 (docs/gpui-port/runner-windows-plan.md). It's new, so expect rough edges:
-patches run only when clicked, Codex isn't offered yet, and the Mac-only
+patches run only when clicked, and the Mac-only
 tools are off. Do this as the person who'll use it, in PowerShell, with no
 admin rights needed.
 

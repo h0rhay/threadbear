@@ -51,6 +51,19 @@ export function withStepping(text, names) {
   return text.replace(STEPPING_LINE, `export const STEPPING: readonly string[] = ${JSON.stringify(names)};`);
 }
 
+/**
+ * What machines:rearmFailed answered through `convex run`: the next page's
+ * cursor, or null after the last page (the CLI prints nothing for a null).
+ * Anything else throws rather than pass for done, or the deploy would stop
+ * delivering failed timers again with pages still to go (19 Nov 2026).
+ */
+export function rearmCursor(stdout) {
+  const out = String(stdout).trim();
+  const next = out ? lastJson(out) : null;
+  if (next === null || typeof next === 'string') return next;
+  throw new Error(`it answered something other than a cursor: ${out.slice(-200)}`);
+}
+
 /** The answer `npx convex run` printed: its last line of JSON, or the whole of it. */
 export function lastJson(text) {
   const lines = String(text).trim().split('\n').reverse();

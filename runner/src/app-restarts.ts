@@ -59,9 +59,10 @@ export function asksForAppRestart(asks: { action?: unknown; why?: unknown; where
 // The two questions asked of git, swappable in tests. `resolve` gives a
 // full commit id or undefined; `contains` says whether `commit` has
 // `ancestor` in its history, or undefined when git can't tell (a commit it
-// doesn't know, no repo), which counts as the old rule: any new build, or
-// 'busy' when git didn't answer in time, which keeps waiting: a slow disk
-// shouldn't bring back the false news this is here to stop. `tree` gives
+// doesn't know, no repo), or 'busy' when git didn't answer in time. Neither
+// wakes the thread: an unconfirmed build is the false news this is here to
+// stop (Codex's and Gemini's review, 19 Nov). The watch still ends after a
+// day at most, like any other. `tree` gives
 // the trees of `dirs` at `commit`, joined with + as the apps' builds do
 // (app/build-app.sh, desktop/scripts/make-bundle.sh).
 export type RestartGit = {
@@ -104,8 +105,12 @@ export const realGit: RestartGit = {
 };
 
 // `away`: whether a draining runner still has the thread (handover.ts's
-// Peers), so it isn't here yet but will be.
-type Deps = { runner: Pick<Runner, 'get' | 'note' | 'send' | 'has'>; home: string; clock: Clock; log: Logger; away?: (threadId: string) => boolean; git?: RestartGit };
+// Peers), so it isn't here yet but will be. `appRepo`: the Threadbear
+// checkout the apps are built from (release.ts's ownCheckout). A thread
+// asking from another folder (~/dev/me/misc) named a Threadbear commit
+// its own folder doesn't have, and the wait fell back to any new build,
+// telling it the app had restarted onto one without it (42071b05, 19 Nov).
+type Deps = { runner: Pick<Runner, 'get' | 'note' | 'send' | 'has'>; home: string; clock: Clock; log: Logger; away?: (threadId: string) => boolean; git?: RestartGit; appRepo?: string };
 
 const appName = (app: AppKind) => (app === 'desktop' ? 'Threadbear GPUI app' : 'Threadbear app');
 
@@ -123,9 +128,17 @@ export class AppRestarts {
   // `commit`: what the new build must contain, by default main's HEAD in
   // the thread's folder (a thread's worktree shares its refs).
   watch(threadId: string, text?: string, commit?: string): { build?: AppBuild; running?: string; waitingFor?: string } {
-    const want = this.wanted(threadId, commit);
     const state = this.read();
     state.watching = state.watching.filter((w) => w.threadId !== threadId);
+    let want: Watch['want'];
+    try {
+      want = this.wanted(threadId, commit);
+    } catch (e) {
+      // Asking again replaces the request, even one that can't be armed:
+      // else an earlier commit's wait stays set behind the refusal.
+      this.write(state);
+      throw e;
+    }
     state.watching.push({
       threadId,
       ...(text?.trim() ? { text: text.trim() } : {}),
@@ -140,17 +153,34 @@ export class AppRestarts {
     return { ...(build ? { build } : {}), ...(running ? { running } : {}), ...(want ? { waitingFor: want.short } : {}) };
   }
 
+  // Main's HEAD is looked for in the apps' own checkout first, then the
+  // thread's folder (a dev runner, or one with no checkout to hand). A named
+  // commit is looked for the other way round, so `HEAD` from a thread's
+  // worktree is its own, not the main checkout's (Gemini's review). A named
+  // commit found in neither is refused rather than waiting for any build.
   private wanted(threadId: string, commit?: string): Watch['want'] {
     const git = this.deps.git ?? realGit;
-    let repo: string | undefined;
+    let cwd: string | undefined;
     try {
-      repo = this.deps.runner.get(threadId).cwd;
+      cwd = this.deps.runner.get(threadId).cwd;
     } catch {
+      cwd = undefined;
+    }
+    const named = commit?.trim();
+    const repos = [...new Set((named ? [cwd, this.deps.appRepo] : [this.deps.appRepo, cwd]).filter((r): r is string => !!r))];
+    let repo: string | undefined;
+    let full: string | undefined;
+    for (const r of repos) {
+      full = named ? git.resolve(r, named) : (git.resolve(r, 'refs/heads/main') ?? git.resolve(r, 'refs/heads/master'));
+      if (full) {
+        repo = r;
+        break;
+      }
+    }
+    if (!full || !repo) {
+      if (named) throw new Error(`Can't find commit ${named} in ${repos.join(' or ') || 'any repo'}, so can't tell which build has it. Name a commit in the Threadbear repo the app is built from, or leave commit out to wait for its main.`);
       return undefined;
     }
-    if (!repo) return undefined;
-    const full = commit?.trim() ? git.resolve(repo, commit.trim()) : (git.resolve(repo, 'refs/heads/main') ?? git.resolve(repo, 'refs/heads/master'));
-    if (!full) return undefined;
     const trees: Partial<Record<AppKind, string>> = {};
     for (const app of ['mac', 'desktop'] as const) {
       const t = git.tree?.(repo, full, APP_DIRS[app]);
@@ -175,9 +205,15 @@ export class AppRestarts {
     const asked = new Map<string, boolean | 'busy' | undefined>();
     const has = (want: NonNullable<Watch['want']>) => {
       if (want.trees?.[app] === build.tree) return true;
-      // By commit alone: a thread's worktrees share one repo's objects.
-      const key = want.commit;
-      if (!asked.has(key)) asked.set(key, git.contains(want.repo, want.commit, build.commit));
+      const key = `${want.repo}\0${want.commit}`;
+      if (!asked.has(key)) {
+        let answer = git.contains(want.repo, want.commit, build.commit);
+        // The thread's folder may not know the build (a fork's own
+        // checkout, a worktree since removed): the apps' checkout may.
+        const { appRepo } = this.deps;
+        if (answer === undefined && appRepo && appRepo !== want.repo) answer = git.contains(appRepo, want.commit, build.commit);
+        asked.set(key, answer);
+      }
       return asked.get(key);
     };
     for (const watch of state.watching) {
@@ -196,9 +232,10 @@ export class AppRestarts {
       if (!counts) kept.push(w);
       // Git too slow to say: unchanged, so the next hello asks again.
       else if (w.want && has(w.want) === 'busy') kept.push(w);
-      // A new build, but one without the commit it's waiting for: keep
-      // waiting, from this build, so a reconnect on it isn't news again.
-      else if (w.want && has(w.want) === false) {
+      // A new build, but one without the commit it's waiting for, or one
+      // git can't place: keep waiting, from this build, so a reconnect on
+      // it isn't news again.
+      else if (w.want && has(w.want) !== true) {
         const moved = app === 'desktop' ? { fromDesktopTree: build.tree, fromDesktopShort: build.short } : { fromTree: build.tree, fromShort: build.short };
         kept.push({ ...w, ...moved });
         if (runner.has(w.threadId)) older.push(w);
@@ -214,7 +251,8 @@ export class AppRestarts {
     this.write(state);
     for (const w of older) {
       try {
-        runner.note(w.threadId, `${appName(app)} restarted onto ${build.short}, which doesn't have ${w.want!.short} yet. Still waiting.`);
+        const why = has(w.want!) === false ? `which doesn't have ${w.want!.short} yet` : `and git can't tell whether that has ${w.want!.short}`;
+        runner.note(w.threadId, `${appName(app)} restarted onto ${build.short}, ${why}. Still waiting.`);
       } catch (e) {
         log.warn('could not note an older app build', { threadId: w.threadId, error: String(e) });
       }
@@ -249,7 +287,7 @@ export class AppRestarts {
       runner.note(w.threadId, note);
       if (why) return;
       const head = `The ${appName(app)} has restarted onto ${build.short} (${build.commit}), as you asked to hear.`;
-      runner.send(w.threadId, w.text ? `${head}\n\n${w.text}` : `${head} Check your change in the running app.`, [], { origin: 'runner' });
+      runner.send(w.threadId, w.text ? `${head}\n\n${w.text}` : `${head} Check your change in the running app.`, [], { origin: 'runner', wakeReason: `The ${appName(app)} restarted onto ${build.short}` });
       log.info('told a thread the app restarted', { threadId: w.threadId, build: build.short, app });
     } catch (e) {
       log.warn('could not tell a thread the app restarted', { threadId: w.threadId, error: String(e) });

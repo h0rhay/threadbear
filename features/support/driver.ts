@@ -189,7 +189,8 @@ export type Rect = { x: number; y: number; width: number; height: number };
 export type Flight = { to: 'archive' | 'hibernate'; thread?: string | null; start: Rect; end?: { x: number; y: number } | null; onHeading: boolean; landed: boolean; landedBox?: Rect | null };
 
 /** `dot` is the accent dot (something only you can do), `quietDot` the grey one. */
-export type RailButton = { title: string; badge?: number | null; dot?: boolean; quietDot?: boolean; active: boolean };
+/** `nextVersion` (Updates only): what its icon shows of the next version, a turning ring while it's on its way and green once it's ready. */
+export type RailButton = { title: string; badge?: number | null; dot?: boolean; quietDot?: boolean; nextVersion?: 'none' | 'coming' | 'ready'; active: boolean };
 
 /** One of the activity bar's panels: whether it's on show, and what it says. */
 export type PanelLines = { shown: boolean; lines: string[] };

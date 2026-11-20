@@ -44,6 +44,11 @@ export const newThreadsPart = {
     // Projects it starts in (New Thread on a project's page), joined
     // before its first turn, so that turn already has the project's brief.
     projectIds?: string[];
+    // Box mode's one thread, made under the id the backend gave it (boxThread).
+    id?: string;
+    // The CLI the app had started ahead of it (threads.warm,
+    // runner/warm-start.ts): the thread is made under its id.
+    warmId?: string;
   }): { thread: ThreadSummary; turnId: string } {
     if (!params.text && !params.images?.length) throw new RpcError(ErrorCode.badParams, 'text or images required');
     checkImages(params.images ?? []);
@@ -54,7 +59,16 @@ export const newThreadsPart = {
       // Every one checked before the thread exists: a bad id makes nothing.
       for (const p of projectIds) projects.get(p);
     }
-    const { st, notes, loginNote } = this.makeThread(params);
+    const spare = params.id === undefined && !projectIds.length ? this.claimSpare(params.warmId) : undefined;
+    let made;
+    try {
+      made = this.makeThread(params, spare ? { id: spare.id, sessionId: spare.sessionId } : undefined);
+    } catch (e) {
+      spare?.session.kill();
+      throw e;
+    }
+    const { st, notes, loginNote } = made;
+    if (spare) st.rt.spare = spare;
     if (projectIds.length) this.projects!.changeMembership(st.rec.id, { add: projectIds, by: 'mike' });
     const turnId = this.sendTo(st, params.text ?? '', params.images ?? [], { origin: params.origin, scheduleId: params.scheduleId });
     // Under the first turn, so they read as part of starting it.
@@ -172,8 +186,47 @@ export const newThreadsPart = {
     worktree?: boolean;
     startedBy?: ThreadStartedBy;
     detached?: boolean;
-  }): { st: ThreadState; notes: string[]; loginNote?: string } {
+    id?: string;
+  }, ids?: { id: string; sessionId: string }): { st: ThreadState; notes: string[]; loginNote?: string } {
     this.checkAccepting();
+    const { rec, account, poolId, notes, loginNote } = this.draftRecord(params, ids);
+    this.store.create(rec);
+    const st: ThreadState = { rec, rt: newRuntime(this.clock.now()) };
+    this.threads.set(rec.id, st);
+    // What Mike picked last is what the next thread starts on, so a
+    // schedule's own login or pool (a 9:00 standup's) doesn't move it.
+    if (params.origin === 'schedule') {
+      /* keep the last pick */
+    } else if (!poolId) this.rememberAccount(account.id);
+    else if (params.poolId !== undefined) this.rememberPool(poolId);
+    return { st, notes, loginNote };
+  },
+
+  // A new thread's record as create works it out, without making the
+  // thread: makeThread's, and a CLI started ahead of one
+  // (runner/warm-start.ts), under the ids given.
+  draftRecord(this: Runner, params: {
+    text: string;
+    cwd?: string;
+    accountId?: string;
+    poolId?: string;
+    model?: string;
+    effort?: EffortLevel;
+    permissionMode?: PermissionMode;
+    title?: string;
+    origin?: MessageOrigin;
+    scheduleId?: string;
+    worktree?: boolean;
+    startedBy?: ThreadStartedBy;
+    detached?: boolean;
+    id?: string;
+  }, ids?: { id: string; sessionId: string }): { rec: ThreadRecord; account: Account; poolId?: string; notes: string[]; loginNote?: string } {
+    // A box runs one thread (docs/virtual-runners.md, decision 1): only that
+    // one, once, under its own id. Anything else asks the main Mac
+    // (create_thread from a box files a request, as from any runner key).
+    if (this.boxThread !== undefined) {
+      if (params.id !== this.boxThread || this.threads.has(this.boxThread)) throw new RpcError(ErrorCode.badParams, "This runner is a box for one thread, so it can't start another here.");
+    } else if (params.id !== undefined) throw new RpcError(ErrorCode.badParams, 'Only a box names the id of a new thread.');
     // New threads belong on the new release.
     if (this.draining) throw new RpcError(ErrorCode.busy, 'This runner is handing over to a new one; start the thread there.');
     // A blank folder means the default, not the runner's own folder.
@@ -209,7 +262,7 @@ export const newThreadsPart = {
     const retired = this.retiredSandbox(cwd);
     if (retired) throw new RpcError(ErrorCode.badParams, retired);
     const now = this.isoNow();
-    const id = crypto.randomUUID();
+    const id = params.id ?? ids?.id ?? crypto.randomUUID();
     const rec: ThreadRecord = {
       id,
       title: params.title?.trim() ? cutSafely(params.title.trim(), 200) : titleFrom(params.text),
@@ -227,7 +280,7 @@ export const newThreadsPart = {
       preview: '',
       lastSeq: 0,
       lastSeenSeq: 0,
-      nativeSessionId: crypto.randomUUID(),
+      nativeSessionId: ids?.sessionId ?? crypto.randomUUID(),
       sessionUsed: false,
       lastTurnCompletedSeq: 0,
       queue: [],
@@ -250,16 +303,7 @@ export const newThreadsPart = {
       // Only means something for a thread another thread started.
       if (params.detached && startedBy.kind === 'thread' && startedBy.threadId) rec.detached = true;
     }
-    this.store.create(rec);
-    const st: ThreadState = { rec, rt: newRuntime(this.clock.now()) };
-    this.threads.set(id, st);
-    // What Mike picked last is what the next thread starts on, so a
-    // schedule's own login or pool (a 9:00 standup's) doesn't move it.
-    if (params.origin === 'schedule') {
-      /* keep the last pick */
-    } else if (!poolId) this.rememberAccount(accountId);
-    else if (params.poolId !== undefined) this.rememberPool(poolId);
-    return { st, notes: checked.notes, loginNote };
+    return { rec, account, ...(poolId ? { poolId } : {}), notes: checked.notes, loginNote };
   },
 
   // An account whose CLI this runner can't drive (a Codex login found

@@ -393,14 +393,14 @@ impl ThreadPane {
         let name = kind.label();
         let chip = match kind {
             // Another Mac's picture: its path names a file on that Mac, and
-            // read here it's whatever this Mac has at that path, so it opens
-            // no card and no viewer (Codex's review of the drags, 12 Nov). The
-            // picture itself is in the tile over the words, which the runner
-            // sends (remote_pictures.rs); the chip says where it is.
-            ChipKind::Picture(_) if origin != Origin::ThisMac => {
-                let runner = self.summary.runner_id.clone().unwrap_or_default();
-                let mac = self.composer.read(cx).app.upgrade().map_or_else(|| "another Mac".to_owned(), |app| app.read(cx).runner_name_of(&runner));
-                chip.cursor_default().tip(format!("This picture is on {mac}: it shows above"))
+            // read here it's whatever this Mac has at that path (Codex's review
+            // of the drags, 12 Nov), so it opens no card. The viewer asks that
+            // Mac for it through the runner, as the tile over the words does
+            // (remote_pictures.rs), so a click opens that (Mike, 18 Nov).
+            ChipKind::Picture(index) if origin != Origin::ThisMac => {
+                let runner = self.summary.runner_id.clone();
+                let images = images.to_vec();
+                chip.tip(crate::viewer::TILE_TIP).on_click(move |_, window, cx| crate::viewer::open_from_tile(&images, index, runner.as_deref(), window, cx))
             }
             ChipKind::Picture(index) => {
                 let picture = images.get(index);
@@ -409,7 +409,7 @@ impl ThreadPane {
                 let hover_key = key.clone();
                 chip.on_hover(move |on, window, cx| hover(&hover_key, *on, QUICK, window, cx))
                     // The in-app viewer, as a click on the picture over the words does.
-                    .on_click(move |_, window, cx| crate::viewer::open_from_tile(&images, index, window, cx))
+                    .on_click(move |_, window, cx| crate::viewer::open_from_tile(&images, index, None, window, cx))
                     .children(shown)
             }
             ChipKind::Card { title, url } => {
@@ -781,13 +781,26 @@ impl ThreadPane {
 
     /// A reply's markdown with a live mark's link before each link to a
     /// thread the app has (threadbear_core::link_marks, thread_link_marks.rs).
-    pub(crate) fn with_link_marks(&self, text: String, cx: &App) -> String {
+    /// With the inlinePrs experiment, a PR's state mark before each link to
+    /// a PR too (pr_view.rs's `PrMarks`), its state asked of the runner the
+    /// first time.
+    pub(crate) fn with_link_marks(&self, text: String, cx: &mut App) -> String {
         let Some(app) = self.composer.read(cx).app.upgrade() else { return text };
         let threads = &app.read(cx).threads;
-        match threadbear_core::link_marks::with_marks(&text, &|id| threadbear_core::link_marks::resolve_in(id, threads.keys())) {
+        let text = match threadbear_core::link_marks::with_marks(&text, &|id| threadbear_core::link_marks::resolve_in(id, threads.keys())) {
             std::borrow::Cow::Owned(marked) => marked,
             std::borrow::Cow::Borrowed(_) => text,
+        };
+        if !crate::pr_view::on(app.read(cx)) {
+            return text;
         }
+        let prs = threadbear_core::pull_requests::pr_links(&text);
+        if prs.is_empty() {
+            return text;
+        }
+        let side = app.read(cx).side.clone();
+        side.update(cx, |side, cx| side.ask_pr_states(&prs, cx));
+        threadbear_core::pull_requests::with_pr_marks(&text).into_owned()
     }
 
     /// `agentMessageText`'s first line: where the message came from, small

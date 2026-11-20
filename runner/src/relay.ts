@@ -688,6 +688,11 @@ export class Relay {
     return { watching: [...this.watches.values()].filter((w) => w.unsub.length).length, held, reads: this.reads, bytes: this.bytes };
   }
 
+  /** A thread started from here elsewhere (a virtual runner's, virtual-runners.ts), openable before the sidebar's list has its row. */
+  noteMade(row: RemoteThread): void {
+    this.made.set(row.threadId, row);
+  }
+
   private find(threadId: string): RemoteThread | undefined {
     const listed = this.deps.remote().threads.find((t) => t.threadId === threadId);
     if (listed) {
@@ -1880,6 +1885,17 @@ export class Relay {
 
   async previewMove(runnerId: string, params: { info: unknown; cwd?: string; accountId?: string }): Promise<unknown> {
     const done = await this.command(runnerId, undefined, 'call', { method: 'moves.preview', params }, { done: true, ms: CALL_MS });
+    return done.result;
+  }
+
+  /**
+   * accounts.yearToken for one of another runner's logins (year-token-maker.ts
+   * there): a `call` the backend lets only the owner key queue. Its answer is
+   * a state and the claude.ai page, never a token.
+   */
+  async yearToken(runnerId: string, params: { accountId: string; code?: string; check?: boolean; cancel?: boolean }): Promise<unknown> {
+    const p = { accountId: params.accountId, ...(params.code !== undefined ? { code: params.code } : {}), ...(params.check ? { check: true } : {}), ...(params.cancel ? { cancel: true } : {}) };
+    const done = await this.command(runnerId, undefined, 'call', { method: 'accounts.yearToken', params: p }, { done: true, ms: CALL_MS });
     return done.result;
   }
 

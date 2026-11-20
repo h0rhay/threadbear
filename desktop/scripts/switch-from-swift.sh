@@ -20,6 +20,11 @@
 #    stage-update.sh: the same build the installed app's updates use, so its
 #    clone and target folder are already warm for the first update. Built on
 #    an update build host if runner.json names one, else here.
+#    An app already installed from an older main gets main's build staged
+#    beside it instead (where its own updates go, swapped in when it next
+#    starts), so setup run again after a pull leaves it current rather than
+#    the app building it in the background minutes later (Tinker Desk's
+#    second account, 19 Nov 2026).
 # 3. Moved into ~/Applications/Threadbear GPUI.app, and threadbear:// links
 #    pointed at it (thread-links.sh).
 # 4. Opened. It brings over the Swift app's settings, drafts and files by
@@ -137,7 +142,40 @@ installed() {
   done
 }
 
-if ! installed; then
+# main's desktop/ tree when the installed app was built from another one
+# (its build.json's appTree, as app_update.rs compares them), else nothing:
+# up to date, or a bundle with no build.json to tell by.
+behind_main() {
+  local built main
+  built="$(/usr/bin/python3 -I -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("appTree") or "")
+except Exception: print("")' "$TARGET/Contents/Resources/build.json" 2>/dev/null)" || built=""
+  main="$(git -C "$CHECKOUT" rev-parse -q --verify 'refs/heads/main:desktop' 2>/dev/null)" || main=""
+  [[ -n "$built" && -n "$main" && "$built" != "$main" ]] && echo "$main"
+  return 0
+}
+
+if installed; then
+  if [[ -n "$(behind_main)" ]]; then
+    elsewhere="$(builds_elsewhere)"
+    echo "STEP Building main's version of the app, which it swaps in when it next starts"
+    # Not fatal: the app is installed, and its own updates try again. Room
+    # for it is checked as for a first build (Codex's review), in a subshell
+    # so its exit only skips the build.
+    code=0
+    if ( room_for_it ); then
+      from_main stage-update.sh
+      "$work/stage-update.sh" "$CHECKOUT" --next "$HOME/Applications/.Threadbear GPUI.app.next" || code=$?
+    else
+      code=6
+    fi
+    case "$code" in
+      0) echo "Staged main's build beside $TARGET" ;;
+      3) echo "The app is already building main's version itself." ;;
+      *) echo "Main's version of the app didn't build (exit $code); the app tries again by itself." >&2 ;;
+    esac
+  fi
+else
   elsewhere="$(builds_elsewhere)"
   room_for_it
   # Rust only for a build here: another Mac builds it, or none does (exit 5).

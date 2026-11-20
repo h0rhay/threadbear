@@ -279,46 +279,63 @@ class AppModel(context: Context, private val scope: CoroutineScope) {
 
     // Push
 
-    /** The Firebase token the backend has for this phone, once registered (for Notify me). */
+    /** The push address (Firebase token or UnifiedPush endpoint) the backend has for this phone, once registered (for Notify me). */
     private val _pushToken = MutableStateFlow<String?>(null)
     val pushToken: StateFlow<String?> = _pushToken
 
     /**
-     * Hands the backend this phone's Firebase token and push key, as the
+     * Hands the backend this phone's push address and push key, as the
      * iPhone's didRegister: on each connect, after pairing, when the
-     * permission's given, and when Firebase makes a new token. Not while
+     * permission's given, and when the transport has a new address
+     * ([fresh]: a new Firebase token, a new UnifiedPush endpoint). Not while
      * notifications aren't allowed (nothing would show), nor for a backend
-     * that sends none (self-hosted). Quiet on failure: the next launch tries again.
+     * that sends none (self-hosted), nor a Web Push address for a backend
+     * before API 93. Quiet on failure: the next launch tries again.
      */
-    fun registerPush(newToken: String? = null) {
+    fun registerPush(fresh: PushAddress? = null) {
         val b = _backend.value ?: return
-        if (!Push.available || !Push.permitted(appContext)) return
+        if (!Push.available(appContext) || !Push.permitted(appContext)) return
         // Already registered this run: the resume check costs nothing then.
-        if (newToken == null && _pushToken.value != null) return
-        if (_identity.value?.sendsNotifications == false) return
+        if (fresh == null && _pushToken.value != null) return
+        if (!Push.sentBy(_identity.value)) return
+        val api = apiVersion
+        if (fresh?.platform == PushAddress.WEB_PUSH && api < BackendApi.WEB_PUSH) return
+        val cacheKey = _pairing.value?.deploymentUrl ?: return
         val epoch = pairingEpoch
         scope.launch {
-            // One at a time with forgetting an old pairing's token (pairingChanged),
-            // so a quick re-pair can't register the token being deleted, and work
+            // One at a time with forgetting an old pairing's address (pairingChanged),
+            // so a quick re-pair can't register the address being forgotten, and work
             // for a pairing that's since changed is dropped, not finished.
             pushLock.withLock {
                 if (epoch != pairingEpoch) return@withLock
-                val token = newToken ?: Push.token() ?: return@withLock
+                val address = fresh ?: Push.transport.address(appContext, b, api, cacheKey) ?: return@withLock
                 val key = PushKeyStore(appContext).loadOrCreate()?.let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
                 try {
-                    b.registerDevice(token, "production", "android", key)
+                    b.registerDevice(address.token, "production", address.platform, key, address.webPush)
                     if (epoch == pairingEpoch) {
-                        _pushToken.value = token
+                        _pushToken.value = address.token
                         // Settings' Notify me picker shows once there's a token.
-                        shell.pushToken.value = token
+                        shell.pushToken.value = address.token
                         // As the iPhone: the phone's own choice goes with each
                         // registration (a backend before the setting notifies every time).
-                        if (apiVersion >= com.mikerosoft.threadbear.kit.BackendApi.NOTIFICATION_SETTING) {
-                            runCatching { b.setNotifications(token, shell.notifyMode.value) }
+                        if (apiVersion >= BackendApi.NOTIFICATION_SETTING) {
+                            runCatching { b.setNotifications(address.token, shell.notifyMode.value) }
                         }
                     }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (_: Exception) {
                 }
+            }
+        }
+    }
+
+    /** The distributor dropped this phone's endpoint: registered afresh on the next resume. */
+    fun pushUnregistered() {
+        scope.launch {
+            pushLock.withLock {
+                _pushToken.value = null
+                shell.pushToken.value = null
             }
         }
     }
@@ -347,9 +364,9 @@ class AppModel(context: Context, private val scope: CoroutineScope) {
     /**
      * The pairing changed (unpaired, or paired with something else): what's
      * queued for the old one is dropped, and with [forget] the old backend
-     * loses this phone (Firebase deletes the token, so its next send comes
-     * back UNREGISTERED and it drops the device) and the push key is made
-     * anew, so the old backend's sealed notifications can't be opened.
+     * loses this phone (Push.forget: the transport forgets its address) and
+     * the push key is made anew, so the old backend's sealed notifications
+     * can't be opened.
      */
     private fun pairingChanged(forget: Boolean) {
         // Another server (or none): its notifications come down and any being

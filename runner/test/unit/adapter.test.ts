@@ -528,6 +528,22 @@ test('a card closed unanswered is a plain denial saying so; only Stop interrupts
   }
 });
 
+// A deny of a card the card reviewer left for Mike says both that he said no
+// and why he was asked (Gemini review, 20 Nov 2026).
+test('a denial keeps saying the user said no when the reviewer\'s reason comes with it', async () => {
+  for (const [answer, want] of [
+    [{ decision: 'deny', reviewer: 'Because X.' }, /^The user denied this\. Ask them how to proceed\. Because X\.$/],
+    [{ decision: 'deny', message: 'Not now', reviewer: 'Because X.' }, /^Not now Because X\.$/],
+    [{ decision: 'deny' }, /^The user denied this\. Ask them how to proceed\.$/],
+  ] as const) {
+    const { state } = start([], {}, {}, async () => answer);
+    const res = await state.options.canUseTool('Write', { file_path: '/tmp/x.txt', content: 'hi' }, { signal: new AbortController().signal, toolUseID: 'toolu_sub', agentID: 'agent-1' });
+    assert.equal(res.behavior, 'deny');
+    assert.match(res.message, want);
+    state.close!();
+  }
+});
+
 // In "Ask before edits" end_turn stopped for an Allow card, so every turn
 // waited on Mike with no reply written yet (6 Nov 2026, thread c3e52aa6).
 test('the threadbear tools that only read or end the turn never ask, in any mode; the rest still do', async () => {

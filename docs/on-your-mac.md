@@ -57,7 +57,7 @@ File references are where to look.
   app (or run `desktop/scripts/install-app.sh`). The new app keeps its window and panel layout in `desktop-settings.json` and
   `gpui-prefs.json` in the data folder (with the local pages you chose
   Run them for, a digest of each), what a click on a link in a reply
-  does (its menu's Default) in `desktop-links.json` there, the side pane's
+  does (its menu's Default) and the kinds of file you said always open in their app in `desktop-links.json` there, the side pane's
   folded headings in `desktop-highlights.json`, and how it shows files and
   folders (Preview or Markdown, list or icons, the sort, hidden files) in
   `desktop-files.json`, the section and file or folder each thread's pane
@@ -131,7 +131,15 @@ File references are where to look.
   process group does on a Mac. Each start, before it writes its key there, that
   helper sets `secrets\`'s access list to you and SYSTEM only, inheriting
   nothing from `%LOCALAPPDATA%`, with everything already in it following, in
-  place of the Mac's `chmod 700` (`runner/src/win-acl.ts`).
+  place of the Mac's `chmod 700` (`runner/src/win-acl.ts`). The same
+  helper reads how long since the keyboard or mouse was last used
+  (`GetLastInputInfo`) and the battery (`GetSystemPowerStatus`), and keeps
+  the computer from sleeping by itself while threads work
+  (`SetThreadExecutionState`), in place of `ioreg`, `pmset` and
+  `caffeinate` below. Pictures (a big pasted photo shrunk for the model, a
+  HEIC paste, a phone still, a project icon) are converted by a hidden
+  `powershell.exe` started for each, running `runner/src/win-image.ps1`
+  with Windows' own imaging, in place of `sips`; SVG isn't drawn there.
 - **A one-shot update job:** when the runner's LaunchAgent or
   Threadbear Runner.app is behind main (or you press Update it in the
   Updates panel after one failed), the runner
@@ -173,12 +181,14 @@ File references are where to look.
 - **Files:** the data folder `~/Library/Application Support/Threadbear`
   (threads, settings, `secrets/`, runner releases, the pinned release key
   `upstream-signers`, the Mac app's `app-drafts.json` and the GPUI app's
-  `desktop-drafts.json`, what's typed but not sent in each message box, so
+  `desktop-drafts.json`, what's typed but not sent in each message box and card's Something else box, so
   a quit or relaunch doesn't lose it, and
   `sync-sent.json`, hashes of what's already in your
   Convex mirror so a restart sends only what changed, and
   `shared-pools.json`, the last pools your Convex backend had, which every
   runner shares, so one starts with them while the backend can't be reached,
+  `profiles/`, the last ten CPU profiles of the runner, made only when
+  you run `tb profile` (code names and timings, no thread text),
   and `shortcuts.json`, the keyboard shortcuts you've changed in Settings >
   Keyboard, which the app reads and writes and never sends anywhere,
   `inbox-guess.jsonl`, only with the `inboxGuess` experiment on (off by
@@ -227,6 +237,11 @@ File references are where to look.
   `%LOCALAPPDATA%\Threadbear\opened` and `~/.cache/threadbear/opened`
   (private, read-only copies of documents and programs you open from a thread, so the app that opens one gets the file the open gate
   checked; cleared after a day when another is opened);
+  `~/Library/Caches/Threadbear/prs`, and `~/.cache/threadbear/prs` on Linux
+  (with the inlinePrs experiment on: the last 200 GitHub pull requests the
+  app read through gh, each as one JSON file with its description,
+  comments, checks and diff, so one opened again shows at once while it's
+  read again);
   `~/Library/Caches/Threadbear/rich` (pictures of the ```` ```mermaid ```` and
   ```` ```html ```` blocks in replies, and each one's page for the side pane,
   newest 900 files kept). They're drawn on this Mac in web views that load
@@ -327,7 +342,28 @@ File references are where to look.
   runner watches each Claude login's folder for that one file, so the row
   changes as soon as it's made, and reads it and gives the token to that login's Claude Code as
   `CLAUDE_CODE_OAUTH_TOKEN`, and to nothing else. Delete the file to go back
-  to the login's normal sign-in.
+  to the login's normal sign-in. For a login on another of your machines
+  (`runner/src/year-token-maker.ts`), only when you ask from the Runners
+  panel on your main Mac: that machine's runner runs `claude setup-token`
+  itself, under a small Python helper (`python3`) in a pseudo-terminal, and
+  sends back through your Convex backend only the claude.ai page to approve
+  it on and whether it worked. The code you paste goes the other way and is
+  dropped from the backend once used. The helper writes the same file there;
+  the token never leaves that machine. The one other place a year-long
+  token can go is your own Convex backend, if you pick Use this Mac's token
+  on a cloud token card (below).
+- **A cloud token for virtual runners, if you make one** (the
+  `virtualRunners` experiment, off unless you turn it on;
+  `runner/src/virtual-runners.ts`, `runner/src/cloud-token-helper.py`): Make
+  one on the card in a thread on a virtual runner has the runner run `claude
+  setup-token` for that login with no window, through a small Python helper
+  (`python3`, in a pseudo-terminal), which opens claude.ai in your browser to
+  approve. The CLI gets its code back on a localhost callback, and the helper
+  hands the token it printed to the runner, which sends it, over HTTPS, only
+  to your Convex backend's `boxes:setCloudToken`, which keeps it sealed. It's
+  never written to disk here or logged; the helper is stopped after 10
+  minutes. Paste a token, or Use this Mac's token (that login's year-long
+  token, above), send it the same way.
 - **A pinned file being shown** (`desktop/gpui/src/highlights.rs`): if its
   Highlights request fails, the app retries after 1 second, then 2, then 4,
   up to 5 seconds between tries while you're looking at that thread. It
@@ -382,7 +418,10 @@ File references are where to look.
   agent reads the output, fixes the cause, lands the fix on your `main`,
   watches the next build and archives itself once it goes through, so you
   only hear about it when it needs you (including a step its mode asks
-  you about). A later failure goes to the same thread.
+  you about). A later failure goes to the same thread. On a machine that
+  follows GitHub's main (below), it starts none: its heartbeat says which
+  commit failed and the error's last lines, and your main Mac starts that
+  thread itself, in its own checkout, once it finds the commit on its main.
   `followMain: false` turns this off with the rest.
   The GPUI app, once installed with `desktop/scripts/install-app.sh`,
   follows the `main` of the checkout it was installed from in the same way
@@ -508,6 +547,10 @@ File references are where to look.
   tells your deployment it is online once a minute. Before the first
   successful heartbeat, a failed request is retried after 1 second,
   doubling up to a minute. Key refusals and rate limits wait a minute.
+  After the Mac wakes from sleep (the clock jumps more than 15 seconds
+  between the runner's 2-second ticks, `runner/src/clock-jump.ts`), it
+  opens a new connection to the deployment and heartbeats straight away,
+  at most once in 30 seconds.
 - **Schedule checks** (`runner/src/schedule-check.ts`): a schedule's
   check command, if it has one, runs in
   `/bin/sh` before each run, as you, for at most a minute (or up to five,
@@ -548,6 +591,14 @@ File references are where to look.
   `"releases": { "bringIn": 14 }` (or `"important"`, or `"off"`) in
   `runner.json`, changes it. It keeps what it last did in
   `runner/bring-in.json` in the data folder.
+  Once a release has landed, that thread offers a check-up for Mike
+  (`runner/src/checkup.ts`, `tb checkup`): a short report built from the
+  runner log's own error messages (only those in Mike's code are named),
+  the release tags and which of Mike's patches won't load. You see the
+  draft; only if you say Send does it go, through your `gh`, as a comment on
+  a public Discussion on `mikecann/threadbear`. It keeps the draft and what
+  it sent in `runner/checkup-draft.md` and `runner/checkup.json`.
+  `"releases": { "checkup": false }` turns it off.
 - **A login's week going unused** (`runner/src/spare-week.ts`): every half
   hour the runner works out, from the usage readings it already has, how
   much of each login's weekly limit will be left when it resets. When a
@@ -559,6 +610,17 @@ File references are where to look.
   turns it off. It keeps what it last said in `runner/spare-week.json` in
   the data folder. Find work for it in the Usage panel starts the same
   thread by hand.
+- **Your email, if you set it up** (`runner/src/mail-watch.ts`, the
+  experiment mailWatch, off unless you turn it on and give it a command):
+  every five minutes the main Mac's runner runs the command you put in
+  `runner.json`'s `mailWatch.command`, which prints your new emails. The
+  runner holds no mail login and reads no mailbox itself. Each new email's
+  sender, subject and first 1,500 characters go to the model, with the
+  titles and briefs of your recent and hibernating threads (never a private
+  folder's) and the files you list in `mailWatch.decisions`. It can wake a
+  thread, add an email to a thread's next turn, start a thread (to act on
+  an email, or the twice-daily list) and keeps `runner/mail-watch.json` in
+  the data folder (the ids it has seen and the list's emails).
 - **Your changes to the old Mac app** (`runner/src/swift-changes.ts`): a
   couple of minutes after the runner starts, then hourly, after each
   release check and when the new desktop app connects, it reads your
@@ -608,7 +670,9 @@ File references are where to look.
   `git clone` its repo from `origin` if this machine has no copy.
 - **Presence** (`runner/src/presence.ts`): reads how long the keyboard and
   mouse have been idle (`ioreg`), so your phone knows whether you're at
-  the Mac.
+  the Mac. A runner that signs releases with a Touch ID key also reads
+  whether the screen is locked (`ioreg`'s console session), as it can't
+  sign until you've unlocked it.
 - **Dialogs on the screen** (`runner/src/mac-screen.ts`): every 2 minutes it
   runs `osascript` to count the windows of macOS's UserNotificationCenter, so
   it can tell you when a dialog has been left waiting. It sees how many, not
@@ -711,15 +775,16 @@ File references are where to look.
 | Your other Macs, over ssh | yours | Only when you run `tb runner add <name> --ssh <host>` or `tb runner check --ssh <host>` on your first Mac: it reads that Mac's Threadbear `runner.json`, writes its id and the deployment's address there if it hasn't them, writes its new key into that Mac's `secrets/convex-key`, and looks whether that Mac has a deploy key, Convex panel keys or a Convex login (names only, never a key), through your own ssh setup with agent and port forwarding off (`runner/src/runner-keys.ts`). `tb runner audit` asks this Mac's runner for its threads' last seqs and your deployment for what the main key made. `tb runner rotate-owner` sets env vars on your deployment with your deploy key, and, if you give it a Convex team access token for that run (`CONVEX_TEAM_TOKEN`, never kept), asks api.convex.dev for the deployment's deploy keys (their names and dates) before it rotates. |
 | Your update build hosts, over ssh | yours | Only from the installed GPUI app, when `runner.json` has `updateBuildHosts` and main's `desktop/` has changed: a copy of your main's files to build it from, rsynced to `~/.cache/threadbear-check/gpui` on the first one that's a Mac and answers, and the two built binaries copied back (`desktop/scripts/stage-update.sh`) |
 | threadbear.mikecann.app | Mike (the What's new page) | Only in a fork, while one of Mike's releases is waiting: at each release check (every 6 hours) the runner reads `/changelog.json` (about 20 KB, 15-second timeout, nothing sent with it), and the GPUI app then downloads the pictures of the cards its Updates panel shows (at most 4 MB each, public addresses only), once each while it runs. Nothing from it is run or merged. |
-| GitHub | Mike's repo | Release tags fetched every 6 hours (15 minutes after a failed look); the fork at setup; from `tb land`, through your `gh`, a marked workflow's recent runs on main; with the `inlinePrs` experiment on (off by default), when you open a PR link in the desktop app, through your `gh`, that PR, its diff, its checks and its repo's merge settings, and the open or merged state of other PRs a thread links to; and only when you press its button, a merge, close, reopen, review or the comment you typed (`runner/src/github-pr.ts`) |
+| GitHub | Mike's repo | Release tags fetched every 6 hours (15 minutes after a failed look); the fork at setup; from `tb land`, through your `gh`, a marked workflow's recent runs on main; with the `inlinePrs` experiment on (off by default), when you open a PR link in the desktop app, through your `gh`, that PR, its diff, its checks and its repo's merge settings, and the open or merged state of other PRs a thread links to; a check-up comment on Mike's check-ups Discussion, through your `gh`, only after you say Send on its card (`runner/src/checkup.ts`); and only when you press its button, a merge, close, reopen, review or the comment you typed (`runner/src/github-pr.ts`) |
 | cef-builds.spotifycdn.com | Spotify (CEF's official builds) | The installed Mac runner, only while a web runtime is installed, reads `/index.json` once a day, a minute after starting if due, to warn when this release's CEF pin is over 14 days behind stable (or checks fail for 3 days). Dev runners/tests do not poll; `THREADBEAR_CLI_UPDATES=off` disables it too. It sends no user content and stores the check in `<home>/runner/web-runtime-check.json`. From the GPUI app, only when you press Install web runtime: one download of the pinned build (135 MB), which nothing is sent with. Threadbear will publish its own signed copy later. Chromium itself then goes online only for the pages the GPUI app's web panels show; its own background requests are off (`--disable-background-networking`), and an agent's html and diagrams reach nothing (`desktop/web/src/mac/sealed.rs`). |
 | downloads.claude.ai, registry.npmjs.org | Anthropic, npm | CLI version checks and installs; `npm ci` |
-| Anthropic, OpenAI | yours | Your threads, through the official CLIs on your own logins. With the `cardReviewer` experiment on (off by default), an approval card in a thread on Auto, with the thread's first and latest messages, goes to Opus through the same CLI so it can decide in your place. With the `inboxGuess` experiment on (off by default), when one of your own threads finishes with nothing for you, your last message to it and the agent's reply go to Haiku and to Opus through the same CLI, each to guess whether you needed to see it (not for a thread in a private folder). Unless you turn off Settings > General > Code review (`"labReview": false`), a thread's code change, with your message and the agent's reply, goes to your other provider's CLI as a review thread, as if you'd started one (or a fresh session of the same provider, with no other login). After a turn fails because the API couldn't be reached, the runner itself opens (and straight away closes) a connection to api.anthropic.com or chatgpt.com on port 443, at most once a minute, until one opens and the thread carries on. Nothing is sent over it (`runner/src/net-probe.ts`). |
+| Anthropic, OpenAI | yours | Your threads, through the official CLIs on your own logins. An approval card in a thread on Auto, with the thread's first and latest messages, goes to Opus through the same CLI so it can decide in your place. With the `inboxGuess` experiment on (off by default), when one of your own threads finishes with nothing for you, your last message to it and the agent's reply go to Haiku and to Opus through the same CLI, each to guess whether you needed to see it (not for a thread in a private folder). Unless you turn off Settings > General > Code review (`"labReview": false`), a thread's code change, with your message and the agent's reply, goes to your other provider's CLI as a review thread, as if you'd started one (or a fresh session of the same provider, with no other login). After a turn fails because the API couldn't be reached, the runner itself opens (and straight away closes) a connection to api.anthropic.com or chatgpt.com on port 443, at most once a minute, until one opens and the thread carries on. Nothing is sent over it (`runner/src/net-probe.ts`). |
 | OpenCode's Zen (opencode.ai), models.dev, and whichever providers you've logged it into | theirs | Only with a thread on OpenCode: that thread's prompts and tool output, through the official CLI, and small jobs' text when a pool of only OpenCode logins is picked for them in Settings |
 | Cursor (api2.cursor.sh) | theirs | Only with a thread on Cursor: the same, on your own login |
 | xAI (cli-chat-proxy.grok.com and Grok's other services) | theirs | Only with a thread on Grok: the same, on your own login, and small jobs' text when a pool of only Grok logins is picked for them in Settings. After a Grok turn fails because the API couldn't be reached, the runner opens (and closes) a connection to cli-chat-proxy.grok.com as it does for the others |
 | Fly.io (api.machines.dev) | yours, if you set it up | Never from the Mac: only from your Convex deployment, and only once you've made a virtual runner there (`boxes:setRunnerService`, docs/virtual-runners.md) and set `FLY_API_TOKEN` and `FLY_APP` on the deployment. It makes, pauses, resumes, lists and deletes a Fly Machine for each thread on a virtual runner (`convex/boxService.ts`, `convex/boxProviders/fly.ts`), and every 10 minutes lists them to delete any nobody wants. A machine's environment holds only your deployment's address and a single-use boot token that lapses in 10 minutes, and its tags name the box's rows. |
 | Mike's push relay | Mike's | Only when a paired iPhone or Android phone gets a notification (an Android phone's goes on to Google's Firebase Cloud Messaging, from the relay). It's sent from your Convex deployment, not the Mac. The text is encrypted for the phone; the relay sees the device token and thread id (`convex/push.ts`, `docs/push-relay.md`). The first time, your deployment registers with it, giving its own address; the relay keeps that address and checks it by posting a one-time code back to your deployment's `/relay/verify` (`convex/http.ts`). |
+| A UnifiedPush server (ntfy.sh or whichever distributor the phone uses) | the distributor's | Only with the Android app's F-Droid build paired: each notification is posted from your Convex deployment, not the Mac, to the https address the phone's distributor gave it, encrypted so the server sees neither the text nor the thread (`convex/push.ts` `sendWebPush`, `docs/push-relay.md`, "UnifiedPush"). Private and local addresses are refused. |
 | A Connectors gateway | whoever runs it | Only if one is set in `runner.json` or `~/.claude.json`. Its `/health` every few minutes (and once more at the end of a turn where a call to one of its services failed, to see if it needs signing in), and for a project with a Notion page, a Notion read or two every 5 minutes for its task board (`runner/src/notion-tasks.ts`), signed with the header the `headersHelper` command in that `connectors` entry prints, which it runs for each read |
 | Sentry | Mike's | Nothing from your copy. Only a copy whose `origin` is Mike's own repo reports errors or uploads the app's debug symbols (`runner/src/sentry.ts`, `app/Sources/Threadbear/CrashReporting.swift`, `app/build-app.sh`). The installed GPUI app of Mike's repo, on the real data folder, sends its panics, crashes and freezes of 15 seconds or more, each as one POST to Sentry's endpoint with the function names and nothing typed or opened (`desktop/core/src/crash_report.rs`, `desktop/gpui/src/crash_reporting.rs`); it uploads no symbols. The App Store iPhone app sends anonymous crash reports. |
 

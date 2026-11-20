@@ -233,11 +233,7 @@ pub fn plain_description(text: &str) -> String {
 
 /// A path to show: the home folder as ~.
 pub fn short_path(path: &str, home: &str) -> String {
-    if !home.is_empty() && (path == home || path.starts_with(&format!("{home}/"))) {
-        format!("~{}", &path[home.len()..])
-    } else {
-        path.to_owned()
-    }
+    crate::new_thread::abbreviate_home(path, home)
 }
 
 pub fn in_category(command: &SlashCommand, category: Category, recent: &[String]) -> bool {

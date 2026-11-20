@@ -174,6 +174,59 @@ test('an app already installed is left alone, with nothing built', mac, () => {
   assert.doesNotMatch(r.stdout, /STEP Building/);
 });
 
+// Setup run again after a pull: an installed app built from another
+// desktop/ tree gets main's staged beside it, where its own updates go
+// (Tinker Desk's second account, 19 Nov 2026: the app built it in the
+// background minutes after setup said all was done).
+function builtFrom(w: { home: string }, tree: string) {
+  const res = path.join(w.home, 'Applications', 'Threadbear GPUI.app', 'Contents', 'Resources');
+  fs.mkdirSync(res, { recursive: true });
+  fs.writeFileSync(path.join(res, 'build.json'), JSON.stringify({ appTree: tree }));
+}
+const mainTree = (w: { checkout: string }) => spawnSync('git', ['-C', w.checkout, 'rev-parse', 'refs/heads/main:desktop'], { encoding: 'utf8' }).stdout.trim();
+const next = (w: { home: string }) => path.join(w.home, 'Applications', '.Threadbear GPUI.app.next');
+
+test("an installed app behind main gets main's build staged for its next start", mac, () => {
+  const w = world();
+  assert.equal(run(w, 50 * GiB).status, 0);
+  builtFrom(w, 'an-older-tree');
+  const r = run(w, 50 * GiB);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /STEP Building main's version of the app/);
+  assert.equal(fs.existsSync(path.join(next(w), 'Contents', 'MacOS', 'threadbear-gpui')), true);
+});
+
+test('an installed app already on main builds nothing', mac, () => {
+  const w = world();
+  assert.equal(run(w, 50 * GiB).status, 0);
+  builtFrom(w, mainTree(w));
+  const r = run(w, 50 * GiB);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.doesNotMatch(r.stdout, /STEP Building/);
+  assert.equal(fs.existsSync(next(w)), false);
+});
+
+test("an installed app behind main isn't rebuilt on a disk without room, and setup goes on", mac, () => {
+  const w = world();
+  assert.equal(run(w, 50 * GiB).status, 0);
+  builtFrom(w, 'an-older-tree');
+  const r = run(w, 1);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stderr, /needs about .* GB free/);
+  assert.equal(fs.existsSync(next(w)), false);
+});
+
+test("main's build failing for an installed app doesn't fail setup: its own updates try again", mac, () => {
+  const w = world({ stageExit: 1 });
+  const macos = path.join(w.home, 'Applications', 'Threadbear GPUI.app', 'Contents', 'MacOS');
+  fs.mkdirSync(macos, { recursive: true });
+  for (const b of ['threadbear-gpui', 'threadbear-web-helper']) fs.writeFileSync(path.join(macos, b), '#!/bin/sh\n', { mode: 0o755 });
+  builtFrom(w, 'an-older-tree');
+  const r = run(w, 50 * GiB);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stderr, /tries again by itself/);
+});
+
 test("a build that couldn't run says what to do in this thread, not that an app will try later", mac, () => {
   const r = run(world({ stageExit: 4 }), 50 * GiB);
   assert.equal(r.status, 4, r.stdout + r.stderr);

@@ -375,7 +375,7 @@ test("the Machines page's queries answer only one of this deployment's tokens", 
     assert.equal(await call(s.ctx, viewer.row, { token, table: 'commands', id }), null);
   }
   const overview = await call(s.ctx, viewer.overview, { token: TOKEN });
-  assert.deepEqual(overview.machines.map((m: { name: string }) => m.name), ['command', 'move', 'request', 'clear', 'box']);
+  assert.deepEqual(overview.machines.map((m: { name: string }) => m.name), ['command', 'move', 'request', 'clear', 'box', 'cloudToken']);
   assert.equal((await call(s.ctx, viewer.counts, { token: TOKEN, machine: 'command' })).counts.taken, 1);
   const row = await call(s.ctx, viewer.row, { token: TOKEN, table: 'commands', id });
   assert.equal(row.summary.states.command.kind, 'taken');
@@ -392,10 +392,34 @@ test('timers that failed while the machine was off are delivered again after the
   const lease = s.pendingTimers().find((t) => t.args.id === id && t.args.event === 'LEASE_LAPSED')!;
   s.timerFailed(lease.id);
   assert.deepEqual((await call(s.ctx, machinesModule.failedTimers, {})).map((t: { event: string }) => t.event), ['LEASE_LAPSED']);
-  assert.equal(await call(s.ctx, machinesModule.rearmFailed, {}), 1);
+  assert.equal(await call(s.ctx, machinesModule.rearmFailed, {}), null);
   await fireTimers(s, Date.now() + sync.TAKEN_LEASE_MS + 1000);
   assert.equal(s.row(id).commandState.kind, 'lapsed');
   assert.deepEqual(await call(s.ctx, machinesModule.failedTimers, {}), []);
+});
+
+// 19 Nov 2026: production had more than 4,096 scheduled jobs in its week,
+// and reading them all in one mutation was over Convex's reads a function,
+// so the deploy couldn't deliver the failed timers again. A page a run.
+test('a failed timer behind more scheduled jobs than one function may read is still delivered again, a page a run', async () => {
+  const s = await setup();
+  const id = await s.send();
+  await call(s.ctx, sync.takeCommand, { key: MINI_KEY, commandId: id });
+  const lease = s.pendingTimers().find((t) => t.args.id === id && t.args.event === 'LEASE_LAPSED')!;
+  s.timerFailed(lease.id);
+  const ctx = s.ctx as { scheduler: { runAfter: (ms: number, fn: unknown, args: unknown) => Promise<string> } };
+  for (let i = 0; i < 5000; i++) s.timerRan(await ctx.scheduler.runAfter(0, 'sync:pruneOld', {}));
+  let cursor: string | null = null;
+  let runs = 0;
+  do {
+    s.resetReads();
+    cursor = await call(s.ctx, machinesModule.rearmFailed, { cursor });
+    assert.ok(s.reads() < 4096, `a run read ${s.reads()} rows`);
+    assert.ok(++runs < 50);
+  } while (cursor !== null);
+  assert.ok(runs > 1);
+  await fireTimers(s, Date.now() + sync.TAKEN_LEASE_MS + 1000);
+  assert.equal(s.row(id).commandState.kind, 'lapsed');
 });
 
 // While the deploy's stepping stone has the request machine off, the main

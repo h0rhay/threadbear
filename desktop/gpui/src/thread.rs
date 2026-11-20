@@ -351,6 +351,13 @@ pub(crate) fn held_drafts(thread_id: &str) -> Vec<crate::composer::RestoreDraft>
         .collect()
 }
 
+/// A message of the thread's on its way to the runner and not answered yet:
+/// a refusal would put its words back in a box a restart had already saved.
+pub(crate) fn sending_now(thread_id: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    OUTBOX_DRAFTS.with(|d| d.borrow().values().any(|(t, _, held)| t == thread_id && !held.load(Ordering::SeqCst)))
+}
+
 /// How a send got on, as the connection's task reports it.
 enum SendStep {
     Progress(Progress),
@@ -409,6 +416,9 @@ pub struct ThreadPane {
     stale: bool,
     /// The zoom when it was kept (`set_kept`).
     kept_zoom: Option<u64>,
+    /// Its last messages' PRs are still to be read ahead, waiting for the
+    /// reply streaming in to be whole (`preload_recent_prs`).
+    prs_to_preload: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -446,6 +456,7 @@ impl ThreadPane {
             timing: LoadTiming::default(),
             stale: false,
             kept_zoom: None,
+            prs_to_preload: false,
             entering: Default::default(),
             _subs: vec![scrolled],
         };
@@ -491,6 +502,7 @@ impl ThreadPane {
             timing: LoadTiming::default(),
             stale: false,
             kept_zoom: None,
+            prs_to_preload: false,
             entering: Default::default(),
             _subs: vec![],
         };
@@ -768,6 +780,7 @@ impl ThreadPane {
                     this.scroller.update(cx, |s, cx| s.reset(this.feed.model().rows().len(), cx));
                     this.restore_memory(memory, cx);
                     this.mark_seen();
+                    this.prs_to_preload = !this.preload_recent_prs(cx);
                     // Paging older rows in is driven by the view reaching the
                     // top, and a first page shorter than the view can't.
                     this.load_older_if_near_top(cx);
@@ -790,6 +803,9 @@ impl ThreadPane {
             let sub = call(client, "threads.subscribe", params).await;
             this.update(cx, |this, cx| match sub.ok().and_then(|v| EventsPage::decode(&v)) {
                 Some(page) => {
+                    // Read and subscribed again: up to date, whatever an
+                    // earlier try left (`shows_old_turn`).
+                    this.stale = false;
                     let action = this.feed.finish_subscribe(page.events, &page.in_progress);
                     this.handle(action, cx);
                 }
@@ -834,6 +850,18 @@ impl ThreadPane {
         trim
     }
 
+    /// Its transcript is from before the connection last went, and the
+    /// thread's summary says the turn it shows running has ended: what it
+    /// shows is old, so its working line says it's catching up rather than
+    /// counting on. A kept thread opened while the runner was restarting
+    /// still showed "Bear with me" ticking from a transcript 30 minutes old,
+    /// a turn that had ended 2 minutes before, while the sidebar rightly had
+    /// it in the Inbox (19 Nov).
+    /// Catching up counts too: what it shows is old till that lands.
+    pub(crate) fn shows_old_turn(&self) -> bool {
+        (self.stale || self.feed.is_catching_up()) && !self.summary.busy()
+    }
+
     /// The connection's back while this pane is kept and not shown: it
     /// catches up when it's next shown, rather than every kept thread asking
     /// at once while a restarted runner is busiest.
@@ -859,6 +887,56 @@ impl ThreadPane {
         self.mark_seen();
         // What's on its way to it as the outbox has it now.
         self.show_outbox(cx);
+        if self.loaded {
+            self.prs_to_preload = !self.preload_recent_prs(cx);
+        }
+    }
+
+    /// With the inlinePrs experiment, reads ahead the PRs its last few
+    /// messages link to, as the thread shows and as a turn ends: those are
+    /// the ones likely to be clicked, and a read takes a second or more
+    /// (Mike, 19 Nov). Each is read once while the app runs, from the
+    /// cache's copy if an earlier run kept one (pr_view.rs `preload_pr`).
+    /// A reply still streaming in could hold half a link, so nothing is
+    /// read while one is (false: `apply` tries again until it's whole).
+    /// After the update it's
+    /// called in: showing a kept pane again is inside the app's own, and
+    /// reading the app there panics.
+    fn preload_recent_prs(&self, cx: &mut Context<Self>) -> bool {
+        use threadbear_core::pull_requests as prs;
+        if self.subagent_id.is_some() {
+            return true;
+        }
+        let recent: Vec<(&str, bool)> = self
+            .feed
+            .model()
+            .rows()
+            .iter()
+            .rev()
+            .filter_map(|row| match &row.content {
+                RowContent::Assistant(item) => Some((item.text.as_str(), item.is_streaming)),
+                RowContent::User(message) => Some((message.text.as_str(), false)),
+                _ => None,
+            })
+            .take(prs::RECENT_MESSAGES)
+            .collect();
+        if recent.iter().any(|(_, streaming)| *streaming) {
+            return false;
+        }
+        let urls = prs::recent_pr_links(recent.into_iter().map(|(text, _)| text), prs::RECENT_PRS);
+        if urls.is_empty() {
+            return true;
+        }
+        let app = self.app.clone();
+        cx.defer(move |cx| {
+            let Some(app) = app.upgrade() else { return };
+            if !crate::pr_view::on(app.read(cx)) {
+                return;
+            }
+            let side = app.read(cx).side.clone();
+            side.update(cx, |side, cx| urls.iter().for_each(|url| side.preload_pr(url, cx)));
+        });
+        true
     }
 
     /// What happened while it wasn't subscribed, from the last seq it has
@@ -896,6 +974,7 @@ impl ThreadPane {
             let sub = call(client, "threads.subscribe", params).await;
             this.update(cx, |this, cx| match sub.ok().and_then(|v| EventsPage::decode(&v)) {
                 Some(page) => {
+                    this.stale = false;
                     crate::reply_buttons::fold(&page.events, &this.summary.id);
                     let action = this.feed.finish_subscribe(page.events, &page.in_progress);
                     this.handle(action, cx);
@@ -1083,6 +1162,13 @@ impl ThreadPane {
         if change.is_empty() {
             return;
         }
+        // A turn's footer: it's over, its reply whole. The runner's word
+        // that it's idle can come before the reply's row, so not that.
+        // Only the thread on show: a kept one's turns end unwatched.
+        let turn_ended = self.kept_zoom.is_none() && change.inserted.iter().any(|&i| matches!(self.feed.model().rows().get(i).map(|r| &r.content), Some(RowContent::Footer(_))));
+        if self.prs_to_preload || turn_ended {
+            self.prs_to_preload = !self.preload_recent_prs(cx);
+        }
         // Kept and not shown (`set_kept`): a busy thread's events don't
         // pile up in it while nobody's looking.
         if self.kept_zoom.is_some() && self.trim_kept(cx) {
@@ -1255,6 +1341,15 @@ impl ThreadPane {
             }
             // Gone or taken: no longer one to keep through a quit.
             OUTBOX_DRAFTS.with(|d| d.borrow_mut().remove(&pending_id));
+            // Already shown in the transcript, as the runner echoed it: it
+            // went, whatever became of the answer (a stalled runner's that
+            // came too late, a lookup that failed after it, a connection
+            // that closed after it arrived).
+            let shown = !outbox(&thread_id).iter().any(|m| m.id == pending_id);
+            if shown && res.as_ref().is_err_and(|e| matches!(e.code, threadbear_client::runner::TIMED_OUT | threadbear_client::runner::CLOSED)) {
+                SENT_AT.with(|s| s.borrow_mut().remove(&pending_id));
+                return;
+            }
             if let Err(e) = res {
                 SENT_AT.with(|s| s.borrow_mut().remove(&pending_id));
                 // Off the end of the transcript and back in the box, and the
@@ -1815,6 +1910,12 @@ impl ThreadPane {
                 if matches!(row.content, RowContent::Group(_) | RowContent::Tool(_) | RowContent::Reasoning(_)) || row.kind() == threadbear_core::reducer::RowKind::Diff {
                     out["expanded"] = json!(self.row_open(row));
                 }
+                // A review folds only with answered findings to tuck away.
+                if let RowContent::LabReview(review) = &row.content {
+                    if review.folds() {
+                        out["expanded"] = json!(self.row_open(row));
+                    }
+                }
                 #[cfg(feature = "automation")]
                 if let RowContent::Assistant(item) = &row.content {
                     if let Some(labels) = crate::reply_buttons::dump_labels(&item.text, &self.summary.id) {
@@ -1834,6 +1935,13 @@ impl ThreadPane {
                     if let Some(app) = self.composer.read(cx).app.upgrade() {
                         if let Some(marks) = crate::thread_link_marks::dump(&item.text, app.read(cx)) {
                             out["linkMarks"] = json!(marks);
+                        }
+                        // And the state marks before its links to PRs (pr_view.rs).
+                        if let Some(marks) = crate::pr_view::dump_marks(&item.text, app.read(cx), cx) {
+                            out["prMarks"] = json!(marks);
+                        }
+                        if let Some(read) = crate::pr_view::dump_read(&item.text, app.read(cx), cx) {
+                            out["prsRead"] = json!(read);
                         }
                     }
                 }

@@ -124,6 +124,20 @@ Then("the transcript's review line says {string}", async function (this: Threadb
   await this.until(`a review line saying "${words}"`, (d) => d.transcript.rows.some((r) => r.kind === 'labReview' && r.text.includes(words)));
 });
 
+// It folds like the line of work: its answered findings hidden till opened.
+Then("the transcript's review line is folded", async function (this: ThreadbearWorld) {
+  await this.until('a folded review line', (d) => d.transcript.rows.some((r) => r.kind === 'labReview' && r.expanded === false));
+});
+
+When("I open the transcript's review line", async function (this: ThreadbearWorld) {
+  const row = await this.until('a review line', (d) => d.transcript.rows.find((r) => r.kind === 'labReview'));
+  await this.app.do({ cmd: 'expand', row: row.id });
+});
+
+Then("the transcript's review line is open", async function (this: ThreadbearWorld) {
+  await this.until('an open review line', (d) => d.transcript.rows.some((r) => r.kind === 'labReview' && r.expanded === true));
+});
+
 Then("the card doesn't show {string}", async function (this: ThreadbearWorld, words: string) {
   const d = await this.app.dump();
   if (cardLines(d).some((l) => l.includes(words))) throw new Error(`The card shows "${words}": ${JSON.stringify(cardLines(d))}`);
@@ -216,7 +230,7 @@ Then('the done card lists nothing as still open', async function (this: Threadbe
 });
 
 // The done card's Archive menu (the inboxGuess experiment): "Didn't need
-// this" or "Glad I saw this", each of which archives with that answer.
+// this", "Glad I saw this" or "Not sure", each of which archives with that answer.
 Then('the Archive menu offers {string}', async function (this: ThreadbearWorld, list: string) {
   const result = String(await this.app.do({ cmd: 'menu-popover' }));
   assert.match(result, /shown true/, `no menu showing: ${result}`);

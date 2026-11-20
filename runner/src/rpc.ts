@@ -1,4 +1,5 @@
 // WebSocket JSON-RPC 2.0 server at ws://127.0.0.1:<port>/rpc.
+import type { YearTokenParams } from './year-token-maker.ts';
 import { EXPERIMENTS, experimentOn } from './experiments.ts';
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -16,7 +17,7 @@ import type { CallerGate } from './rpc-gate.ts';
 import type { PeerSocket } from './peer.ts';
 import { cutSafely } from './safe-cut.ts';
 import { wellFormedJson } from './well-formed-json.ts';
-import { fetchPr, forgetStates, parsePrUrl, prAct, prStates, type PrAction, type PrRef } from './github-pr.ts';
+import { fetchPr, fetchPrFiles, forgetStates, parsePrUrl, prAct, prStates, type PrAction, type PrRef } from './github-pr.ts';
 
 type Conn = {
   id: number;
@@ -102,6 +103,7 @@ export const THREAD_METHODS = new Set([
   'plans.approve',
   'secrets.answer',
   'panels.render',
+  'panels.toggle',
   'panels.convexKey',
   'panels.convexDeployments',
   'panels.convexLogin',
@@ -135,6 +137,8 @@ export type RelayHandler = {
   /** A picture pasted into one of another runner's messages, from the backend's file storage (relay.ts readFile); any other path is refused. */
   readFile?(runnerId: string, path: string, maxBytes?: number): Promise<unknown>;
   logins(runnerId: string): Promise<unknown>;
+  /** accounts.yearToken for one of another runner's logins, through an allow-listed `call`. */
+  yearToken?(runnerId: string, params: { accountId: string } & YearTokenParams): Promise<unknown>;
 };
 
 export type RpcServerOptions = {
@@ -158,6 +162,8 @@ export type RpcServerOptions = {
   // Other runners' threads, through the backend (relay.ts). Without it, or
   // for a thread it doesn't own, they're unknown here as before.
   relay?: RelayHandler;
+  // threads.create with a serviceId: a thread on a virtual runner (virtual-runners.ts).
+  virtualStart?: (params: Record<string, unknown>) => Promise<unknown>;
   // Whether this runner knows of a move under way for another runner's
   // thread (main.ts remoteMoving). A relayed send or edit that doesn't say
   // which runner it's shown on is refused meanwhile (mustReachShown).
@@ -414,6 +420,9 @@ export class RpcServer {
       conn.authTimer?.clear();
       conn.queue.length = 0;
       this.conns.delete(conn);
+      // The app gone (quit, or reconnecting): the CLI it had started ahead
+      // of a new thread isn't left running.
+      if (conn.authed) this.opts.runner.dropSpare?.('app disconnected', conn.id);
       if (conn.authed && (conn.client === 'threadbear-mac' || conn.client === 'threadbear-desktop')) this.opts.appSeen?.();
     });
     // A protocol error (a frame over the limit, bad UTF-8): ws closes with
@@ -689,6 +698,12 @@ export class RpcServer {
         return remote.search(query, limit ?? 50).then((more) => ({ threads: mergeSummaries(local, more).slice(0, limit ?? 50) }));
       }
       case 'threads.create': {
+        // On a virtual runner (docs/protocol.md, Virtual runners, "Starting from the Mac").
+        if (p.serviceId !== undefined) {
+          if (typeof p.serviceId !== 'string' || !p.serviceId) throw bad('serviceId must be a virtual runner\'s id');
+          if (!this.opts.virtualStart) throw bad("This runner can't start threads on a virtual runner.");
+          return this.opts.virtualStart(p);
+        }
         // On another runner (docs/protocol.md, "Other runners' threads through the backend").
         if (typeof p.runnerId === 'string' && this.opts.relay) {
           return this.opts.relay.create(p.runnerId, p).then((res) => {
@@ -718,8 +733,28 @@ export class RpcServer {
           // Not to nest under the thread in startedBy (Nested threads).
           ...(p.detached === true ? { detached: true } : {}),
           ...optProjectIds(p),
+          // A CLI this connection had started ahead of it (threads.warm).
+          ...(typeof p.warmId === 'string' ? { warmId: p.warmId } : {}),
         });
         return { thread: res.thread, turnId: res.turnId };
+      }
+      // A CLI started ahead of the new thread the app is writing
+      // (docs/protocol.md, "Warm start"; runner/warm-start.ts).
+      case 'threads.warm': {
+        if (p.cancel === true) {
+          r.dropSpare('page left', conn.id);
+          return {};
+        }
+        return r.warm({
+          cwd: optString(p, 'cwd'),
+          accountId: optString(p, 'accountId'),
+          poolId: optString(p, 'poolId'),
+          model: optString(p, 'model'),
+          effort: optEffort(p),
+          permissionMode: optMode(p),
+          ...(p.worktree === false ? { worktree: false } : {}),
+          ...optProjectIds(p),
+        }, conn.id);
       }
       case 'threads.samples':
         return r.samples({ cwd: reqString(p, 'cwd'), remove: p.remove === true });
@@ -925,6 +960,9 @@ export class RpcServer {
         return r.importMedia(reqString(p, 'path'));
       case 'panels.render':
         return r.renderPanel(reqString(p, 'threadId'), reqString(p, 'panelId'));
+      case 'panels.toggle':
+        if (typeof p.on !== 'boolean') throw bad('on must be true or false');
+        return r.togglePanel(reqString(p, 'threadId'), reqString(p, 'panelId'), reqString(p, 'toggleId'), p.on);
       case 'panels.convexKey':
         return r.convexPanelKey(reqString(p, 'threadId'), reqString(p, 'panelId'), p.renew === true, optString(p, 'deployment'));
       case 'panels.convexLogin':
@@ -951,10 +989,26 @@ export class RpcServer {
       // The app's, after its Sign in… (never a thread's: the gate refuses it).
       case 'accounts.recheck':
         return r.recheckAccounts(optString(p, 'accountId'));
+      // Year-long token… for a login on this runner or, with runnerId,
+      // another's through Convex (year-token-maker.ts). The app's, never a
+      // thread's (the gate refuses it): it changes what a login runs as.
+      case 'accounts.yearToken': {
+        const accountId = reqString(p, 'accountId');
+        const step = yearTokenParams(p);
+        // runnerId only for another runner's login, as for threads.create.
+        const other = optString(p, 'runnerId');
+        if (other) {
+          if (!this.opts.relay?.yearToken) throw new RpcError(ErrorCode.other, "This Mac's runner can't reach other runners through Convex.");
+          return this.opts.relay.yearToken(other, { accountId, ...step });
+        }
+        return r.yearToken(accountId, step);
+      }
       // A GitHub PR for the app's PR tab (github-pr.ts). Mike's clicks only:
       // not in rpc-gate's reads, so a thread's key can't merge or comment.
       case 'github.pr':
-        return ghCall(() => fetchPr(reqPrRef(p)));
+        return ghCall(() => fetchPr(reqPrRef(p), undefined, { files: p.files !== false }));
+      case 'github.prFiles':
+        return ghCall(() => fetchPrFiles(reqPrRef(p)));
       case 'github.prStates': {
         if (!Array.isArray(p.urls) || p.urls.some((u) => typeof u !== 'string')) throw bad('urls must be an array of strings');
         return ghCall(async () => ({ states: await prStates(p.urls as string[]) }));
@@ -1049,6 +1103,17 @@ function reqString(p: Record<string, unknown>, k: string): string {
   const v = p[k];
   if (typeof v !== 'string') throw bad(`${k} must be a string`);
   return v;
+}
+
+// accounts.yearToken's step: a code, a check, a cancel, or none (a start).
+function yearTokenParams(p: Record<string, unknown>): YearTokenParams {
+  if (p.code !== undefined && typeof p.code !== 'string') throw new RpcError(ErrorCode.badParams, 'code must be a string');
+  if (typeof p.code === 'string' && p.code.length > 1100) throw new RpcError(ErrorCode.badParams, 'code is too long');
+  return {
+    ...(typeof p.code === 'string' ? { code: p.code } : {}),
+    ...(p.check === true ? { check: true } : {}),
+    ...(p.cancel === true ? { cancel: true } : {}),
+  };
 }
 
 function optString(p: Record<string, unknown>, k: string): string | undefined {

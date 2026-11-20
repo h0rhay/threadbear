@@ -102,7 +102,7 @@ function bigBmp(file: string): void {
   fs.writeFileSync(file, Buffer.concat([head, crypto.randomBytes(size)]));
 }
 
-test('a still too big for the phone goes as a shrunk JPEG beside it', { skip: process.platform !== 'darwin' && 'needs sips' }, async () => {
+test('a still too big for the phone goes as a shrunk JPEG beside it', { skip: !['darwin', 'win32'].includes(process.platform) && 'needs sips, or Windows\' own imaging' }, async () => {
   const media = fs.mkdtempSync(path.join(os.tmpdir(), 'phone-reviews-'));
   try {
     const dir = path.join(media, 'reviews', review.id);

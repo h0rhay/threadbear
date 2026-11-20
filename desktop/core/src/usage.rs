@@ -1362,6 +1362,18 @@ pub const SIGN_IN_WARN_MS: i64 = 3 * DAY;
 /// a token login is this after it was made (year-token.ts).
 pub const YEAR_MS: i64 = 365 * DAY;
 
+/// "Year-long token until 17 Nov 2027" for a login on one, None otherwise:
+/// its Usage row and, for another runner's, the Runners panel.
+pub fn year_token_words<Tz: TimeZone>(account: &Account, zone: &Tz) -> Option<String> {
+    account.year_token.as_ref().map(|t| match t.made_at.as_deref().and_then(parse_ms) {
+        Some(made) => match local(made + YEAR_MS, zone) {
+            Some(d) => format!("Year-long token until {} {} {}", d.day(), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.month0() as usize], d.year()),
+            None => "Year-long token".to_owned(),
+        },
+        None => "Year-long token".to_owned(),
+    })
+}
+
 /// When a login's sign-in ends, while that's within SIGN_IN_WARN_MS and it
 /// isn't already signed out.
 pub fn sign_in_ends(account: &Account, now: i64) -> Option<i64> {
@@ -1504,13 +1516,7 @@ fn login_row<Tz: TimeZone>(account: &Account, provider_name: &str, notice: Optio
         status,
         sign_in_ends: sign_in_ends(account, now).map(|at| if account.year_token.is_some() { sign_in_ends_words(at, now, zone).replacen("Sign-in", "Token", 1) } else { sign_in_ends_words(at, now, zone) }),
         can_token: account.provider_id() == "claude" && !account.plan_ended && (account.id == "claude-main" || !account.config_dir.trim().is_empty()),
-        year_token: account.year_token.as_ref().map(|t| match t.made_at.as_deref().and_then(parse_ms) {
-            Some(made) => match local(made + YEAR_MS, zone) {
-                Some(d) => format!("Year-long token until {} {} {}", d.day(), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.month0() as usize], d.year()),
-                None => "Year-long token".to_owned(),
-            },
-            None => "Year-long token".to_owned(),
-        }),
+        year_token: year_token_words(account, zone),
         provider: account.provider.clone(),
         ring: ring(&meters),
         headline: headline(status, &meters),

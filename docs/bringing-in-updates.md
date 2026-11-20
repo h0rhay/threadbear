@@ -146,3 +146,29 @@ its scopes lack `workflow`, ask them to run `gh auth refresh -h github.com
 -s workflow` in a Terminal (or push over SSH, where scopes don't apply).
 If `origin` isn't on GitHub, or they'd rather keep main to this Mac, leave
 it.
+
+## 7. Offer Mike a check-up
+
+Once it's landed (or once they've said not to land it), run `tb checkup`,
+with `--text "..."` for one or two plain sentences of your own on what went
+wrong, if anything: a clash with their changes and how it settled, a check
+that failed, a patch you had to fix. Leave out anything about their own
+work (project names, what their changes are for, file paths of theirs). It
+drafts a short report for Mike from facts the code picks: which release
+came in and how far behind main was, how often each of Threadbear's own
+runner errors came up since the last check-up, whether the runner's build
+of main is failing, and which of Mike's patches won't load. It names only
+what's in Mike's code; anything of theirs is just a count, and the draft is
+scrubbed of secrets and their home folder.
+
+Put the draft in your reply as it is, and ask with a card whether to send
+it: it goes as a comment on a public Discussion on Mike's GitHub repo,
+under their own GitHub login, so Mike can see what's going wrong in other
+people's copies and fix it. Answers: Send (`tb checkup --post`), Skip
+(`tb checkup --skip`), and Never ask (set `"releases": { "checkup": false }`
+in `runner.json`, then `tb checkup --skip`). If they want it worded
+differently, run `tb checkup` again with a new `--text` and show it again:
+`--post` sends exactly the last draft they saw. If `--post` says gh isn't
+signed in, give them the draft to paste and the link it prints. If it says
+Mike hasn't opened the Discussion yet, or `tb checkup` says check-ups are
+off here, skip this section and say nothing about it.

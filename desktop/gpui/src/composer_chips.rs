@@ -309,7 +309,10 @@ impl Composer {
             // This Mac: "+", then the machine chip on a new thread.
             (None, _) => {
                 row = row.child(div().flex_none().ml(px(-7.)).child(self.render_plus(&data, window, cx)));
-                let others = self.app.upgrade().is_some_and(|a| !a.read(cx).remote.runners.is_empty());
+                let others = self.app.upgrade().is_some_and(|a| {
+                    let remote = &a.read(cx).remote;
+                    !remote.runners.is_empty() || !remote.services().is_empty()
+                });
                 if data.is_new && others {
                     row = row.child(self.render_runs_on_chip(cx));
                 } else if others {
@@ -429,7 +432,7 @@ impl Composer {
         // here (relay.ts refuses it): a pick would only fail.
         if let (false, Some(away)) = (data.is_new, data.away.as_ref()) {
             let tip = format!("{help}. Its access can only be changed in the Threadbear app on {}", away.name);
-            return ChipTrigger { busy: false, badge: None, id: "composer-permission-chip".into(), kind: TriggerKind::Chip, title: title.into(), icon: Some(if mode == "full" { crate::icons::symbol("lock.open") } else { Icon::from(icon) }), tip: tip.into(), selected: false }.into_any_element();
+            return ChipTrigger { busy: false, badge: None, id: "composer-permission-chip".into(), kind: TriggerKind::Label, title: title.into(), icon: Some(if mode == "full" { crate::icons::symbol("lock.open") } else { Icon::from(icon) }), tip: tip.into(), selected: false }.into_any_element();
         }
         style::menu::popover(Popover::new("composer-permission"), cx)
             // Its chip's title may shrink to fit a narrow box.
@@ -553,7 +556,11 @@ impl Composer {
                 let tip = if t.remote.runners.iter().any(|r| r.id == runner && !r.online) { format!("Runs on {name}, offline") } else { format!("Runs on {name}") };
                 (t.runner_icon_symbol(Some(&runner)), tip)
             }
-            None => (self.app.upgrade().map_or("desktopcomputer", |a| a.read(cx).self_runner_symbol()), "Runs on this Mac".to_owned()),
+            None => match self.app.upgrade().and_then(|a| a.read(cx).new_thread.picks.service.clone().map(|s| a.read(cx).service_name_of(&s))) {
+                // A virtual runner: a machine of its own for this thread.
+                Some(name) => (crate::icons::VIRTUAL_RUNNER, format!("Runs on {name}, a machine of its own")),
+                None => (self.app.upgrade().map_or("desktopcomputer", |a| a.read(cx).self_runner_symbol()), "Runs on this Mac".to_owned()),
+            },
         };
         let app = self.app.clone();
         h_flex()
@@ -648,6 +655,9 @@ const PINNED_COLUMN: &str = "@pinned";
 /// colours (ComposerChip).
 enum TriggerKind {
     Chip,
+    /// A chip with no menu behind it (another runner's thread's access):
+    /// its words and tip, but no chevron, hover or pointer promising one.
+    Label,
     Plus,
     Ring(ContextMeter),
 }
@@ -690,7 +700,8 @@ impl RenderOnce for ChipTrigger {
         // A chip spinning on a change says what it's waiting for; "+" keeps
         // its own tip, as the Swift PlusButton does.
         let tip: SharedString = if busy && matches!(self.kind, TriggerKind::Chip) { "Moving this thread".into() } else { tip };
-        let base = div().id(self.id).flex().items_center().when(!busy, |d| d.cursor_pointer()).test_support().role(Role::Button).aria_label(label).tip(tip.clone());
+        let menu = !matches!(self.kind, TriggerKind::Label);
+        let base = div().id(self.id).flex().items_center().when(!busy && menu, |d| d.cursor_pointer()).test_support().role(Role::Button).aria_label(label).tip(tip.clone());
         let spinner = |side: f32| crate::spinner::Spinner::new().color(style::secondary_text(cx)).with_size(px(side));
         match self.kind {
             TriggerKind::Plus => base
@@ -704,13 +715,13 @@ impl RenderOnce for ChipTrigger {
                 .when(busy, |d| d.child(spinner(12.)))
                 .into_any_element(),
             TriggerKind::Ring(meter) => base.justify_center().size(px(26.)).rounded_full().hover(|s| s.bg(style::hover_fill(cx))).child(context_ring(meter, cx)).into_any_element(),
-            TriggerKind::Chip => base
+            TriggerKind::Chip | TriggerKind::Label => base
                 .min_w_0()
                 .h(px(26.))
                 .px(px(7.))
                 .gap(px(4.))
                 .rounded(px(7.))
-                .when(!busy, |d| d.hover(|s| s.bg(style::chip_hover_fill(cx))))
+                .when(!busy && menu, |d| d.hover(|s| s.bg(style::chip_hover_fill(cx))))
                 .when(busy, |s| s.child(div().flex_none().child(spinner(size::CHIP))))
                 .when_some(self.icon.filter(|_| !busy), |s, icon| s.child(div().flex_none().flex().child(icon.with_size(px(size::CHIP - 1.)).text_color(style::faint_icon(cx)))))
                 // Its title is what gives way, ending "…", as a SwiftUI
@@ -720,7 +731,7 @@ impl RenderOnce for ChipTrigger {
                     let color = if badge.is_stop() { cx.theme().danger } else { style::needs_you(cx) };
                     s.child(div().flex_none().text_size(px(size::CHIP)).text_color(color).whitespace_nowrap().child(badge_words(&badge)))
                 })
-                .when(!self.title.is_empty(), |s| s.child(div().flex_none().flex().child(Icon::from(IconName::ChevronDown).with_size(px(9.)).text_color(style::faint_icon(cx)))))
+                .when(menu && !self.title.is_empty(), |s| s.child(div().flex_none().flex().child(Icon::from(IconName::ChevronDown).with_size(px(9.)).text_color(style::faint_icon(cx)))))
                 .into_any_element(),
         }
     }
@@ -792,10 +803,7 @@ fn permission_icon(mode: &str) -> IconName {
 }
 
 fn abbreviate_home(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => format!("~{}", &path[home.len()..]),
-        _ => path.to_owned(),
-    }
+    threadbear_core::new_thread::abbreviate_home(path, &crate::files::home_dir())
 }
 
 /// A row in one of the chips' menus: an icon, a title, a line under it and a
@@ -1144,7 +1152,7 @@ impl Composer {
     /// new-thread page, the pool a new thread starts in.
     fn unpin_pool(&self, data: &ChipData, cx: &App) -> Option<String> {
         let thread = data.summary.as_ref()?;
-        let home = std::env::var("HOME").unwrap_or_default();
+        let home = crate::files::home_dir();
         let last = self.app.upgrade().and_then(|a| a.read(cx).new_thread.prefs.remembered.last_pool.clone());
         threadbear_core::login_picker::unpin_target(&data.logins.pools, &thread.account_id, &thread.cwd, &home, last.as_deref())
     }

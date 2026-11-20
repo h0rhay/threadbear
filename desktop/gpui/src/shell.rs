@@ -827,7 +827,11 @@ impl Threadbear {
         if let Some(t) = self.threads.get(id) {
             let section = if t.is_archived() {
                 Some("archived")
-            } else if t.snoozed(crate::now_ms()) && !t.is_starred() {
+            } else if t.is_starred() {
+                None
+            } else if t.snoozed(crate::now_ms()) && t.waiting_on_work() {
+                Some("running")
+            } else if t.snoozed(crate::now_ms()) {
                 Some("hibernating")
             } else {
                 None
@@ -1504,6 +1508,8 @@ impl Threadbear {
 
     pub(crate) fn render_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         self.sync_window_title(window);
+        // The Updates icon's ring turns in that layer too (rails.rs).
+        crate::spinner::view_drawing(window);
         // The layer the sidebar's arcs turn in (spinner.rs), which looks at
         // the dock to see when the Threads panel isn't in front.
         let (dock, dock_view) = (self.dock.clone(), self.dock_view.clone());

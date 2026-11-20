@@ -74,8 +74,9 @@ test('the inbox sorts by what needs Mike, newest or oldest', () => {
   const fresh = row({ lastActivityMs: NOW - 1000 });
   const all = [old, failedRead, unread, asked, fresh];
   assert.deepEqual(ids(build(all, NOW, none, 'needsYou').inbox), ids([asked, unread, failedRead, fresh, old]));
-  assert.deepEqual(ids(build(all, NOW, none, 'newest').inbox), ids([fresh, asked, unread, failedRead, old]));
-  assert.deepEqual(ids(build(all, NOW, none, 'oldest').inbox), ids([old, failedRead, unread, asked, fresh]));
+  // A card waiting on Mike goes first in every order: it runs out (19 Nov).
+  assert.deepEqual(ids(build(all, NOW, none, 'newest').inbox), ids([asked, fresh, unread, failedRead, old]));
+  assert.deepEqual(ids(build(all, NOW, none, 'oldest').inbox), ids([asked, old, failedRead, unread, fresh]));
 });
 
 test('urgency: a failure that wants Mike outranks a plain one', () => {

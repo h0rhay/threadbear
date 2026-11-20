@@ -123,7 +123,7 @@ const ONLINE_MS = 3 * 60_000;
 // offered in runners.list: an old install, or a test's.
 const FORGET_MS = 30 * 86_400_000;
 
-export type ScheduleRunner = Pick<Runner, 'create' | 'send' | 'sendScheduled' | 'get' | 'list' | 'hello' | 'onNotification' | 'publish' | 'patchTrust'> & { cfg?: Pick<Runner['cfg'], 'defaults'> };
+export type ScheduleRunner = Pick<Runner, 'create' | 'send' | 'sendScheduled' | 'dropScheduled' | 'get' | 'list' | 'hello' | 'onNotification' | 'publish' | 'patchTrust'> & { cfg?: Pick<Runner['cfg'], 'defaults'> };
 
 export type CreateScheduleParams = {
   // A card's approval of `check` (patch-trust.ts, approveCheck). Not from a client.
@@ -223,6 +223,15 @@ export class Scheduler {
   private elsewhere: (threadId: string) => boolean;
   private folderElsewhere?: (threadId: string) => string | undefined;
   private sendElsewhere?: (threadId: string, text: string, scheduleId: string, run: string, since: number, preserve?: boolean) => Promise<{ turnId: string }>;
+  private dropElsewhere?: (threadId: string, scheduleId: string) => Promise<number>;
+  // The ids in the backend's last snapshot: only a row it has shown and then
+  // left out was deleted. One this runner has just saved may not be in the
+  // next snapshot yet.
+  private shown = new Set<string>();
+  // Schedules deleted while this runner ran: here, or gone from the
+  // backend's rows after it had shown them. The runner drops any of their
+  // messages still queued before a turn starts (Runner.scheduleDeleted).
+  private deleted = new Set<string>();
   // Schedule checks (schedule-check.ts).
   private home: string;
   private check: (p: { command: string; cwd: string; home: string; scheduleId: string; timeoutMs?: number }) => Promise<CheckResult>;
@@ -271,10 +280,16 @@ export class Scheduler {
     elsewhere?: (threadId: string) => boolean;
     folderElsewhere?: (threadId: string) => string | undefined;
     sendElsewhere?: (threadId: string, text: string, scheduleId: string, run: string, since: number, preserve?: boolean) => Promise<{ turnId: string }>;
+    dropElsewhere?: (threadId: string, scheduleId: string) => Promise<number>;
     self?: SelfRunner;
     syncOn?: boolean;
     runCheck?: (p: { command: string; cwd: string; home: string; scheduleId: string; timeoutMs?: number }) => Promise<CheckResult>;
+    // Box mode (box-mode.ts): this runner keeps no schedules at all. Every
+    // way in that would make, change or run one throws this, and nothing
+    // here ever arms a timer, runs a check or touches schedules.json.
+    refuse?: string;
   }) {
+    this.refuse = deps.refuse;
     this.runner = deps.runner;
     this.home = deps.home;
     this.check = deps.runCheck ?? runCheck;
@@ -283,6 +298,7 @@ export class Scheduler {
     this.elsewhere = deps.elsewhere ?? (() => false);
     this.folderElsewhere = deps.folderElsewhere;
     this.sendElsewhere = deps.sendElsewhere;
+    this.dropElsewhere = deps.dropElsewhere;
     this.file = path.join(deps.home, 'schedules.json');
     this.runsDir = path.join(deps.home, 'schedule-runs');
     this.clock = deps.clock;
@@ -290,7 +306,15 @@ export class Scheduler {
     this.zone = deps.zone ?? localZone;
   }
 
+  private readonly refuse?: string;
+
+  // Box mode: every way to make, change or run a schedule says why not.
+  private refused(): void {
+    if (this.refuse) throw new RpcError(ErrorCode.badParams, this.refuse);
+  }
+
   start(): void {
+    if (this.refuse) return;
     const saved = readJsonSync<{ version?: number; schedules?: ScheduleRecord[] }>(this.file);
     if (!saved && fs.existsSync(this.file)) this.log.error('schedules.json could not be read; starting with none', { file: this.file });
     // Version 2 is the backend's copy. With sync on it stays one (nothing is
@@ -306,6 +330,9 @@ export class Scheduler {
         delete s.runRequestedAt;
       }
       this.items.set(s.id, s);
+      // The backend's copy from last time: one missing from its first
+      // snapshot now was deleted while this runner was away.
+      if (copy && this.syncOn) this.shown.add(s.id);
     }
     // A thread's schedules go with it.
     this.unlisten = this.runner.onNotification((n) => {
@@ -376,7 +403,7 @@ export class Scheduler {
   // logged and tried again on the next heartbeat; meanwhile a runner still
   // on its own file keeps sending from it.
   async attach(backend: ScheduleBackend): Promise<void> {
-    if (this.backend || this.attaching || this.stopped) return;
+    if (this.refuse || this.backend || this.attaching || this.stopped) return;
     this.attaching = true;
     try {
       if (this.mode === 'local') await this.moveUp(backend);
@@ -468,6 +495,18 @@ export class Scheduler {
       this.items.set(rec.id, rec);
       if (!this.names.has(rec.runnerId)) this.namesDue = true;
     }
+    // Deleted elsewhere (the phone, the website, another Mac): its
+    // messages still waiting for a busy thread here go too. A one-off is
+    // finished as soon as its message is queued, so only one pruned a week
+    // after that is left alone.
+    const now = this.clock.now();
+    for (const was of before.values()) {
+      if (this.shown.has(was.id) && !this.items.has(was.id) && !(was.finishedAt && now - Date.parse(was.finishedAt) > KEEP_FINISHED_MS)) {
+        this.deleted.add(was.id);
+        this.dropQueued(was);
+      }
+    }
+    this.shown = new Set(rows.map((r) => r.id));
     this.overlayUnrecorded();
     if (this.namesDue) void this.refreshNames();
     this.changed();
@@ -631,6 +670,7 @@ export class Scheduler {
   // ------------------------------------------------------------ mutations
 
   async create(p: CreateScheduleParams): Promise<Schedule> {
+    this.refused();
     const text = p.text?.trim();
     if (!text) throw bad('text is required');
     if ((p.cron === undefined) === (p.at === undefined)) throw bad('Give either at (once) or cron (repeating).');
@@ -689,6 +729,7 @@ export class Scheduler {
   private updating: Promise<unknown> = Promise.resolve();
 
   update(p: UpdateScheduleParams): Promise<Schedule> {
+    if (this.refuse) return Promise.reject(new RpcError(ErrorCode.badParams, this.refuse));
     const run = this.updating.then(() => this.updateNow(p));
     this.updating = run.catch(() => undefined);
     return run;
@@ -775,6 +816,7 @@ export class Scheduler {
   }
 
   async delete(scheduleId: string): Promise<Record<string, never>> {
+    this.refused();
     const rec = this.mustGet(scheduleId);
     if (this.mode === 'backend') {
       try {
@@ -786,13 +828,37 @@ export class Scheduler {
     }
     this.items.delete(rec.id);
     this.dropKept(rec.id);
+    this.deleted.add(rec.id);
+    this.dropQueued(rec);
     this.changed();
     return {};
+  }
+
+  wasDeleted(scheduleId: string): boolean {
+    return this.deleted.has(scheduleId);
+  }
+
+  // A deleted schedule's messages still waiting behind a busy turn go
+  // with it, rather than arriving after delete_schedule said Deleted.
+  private dropQueued(rec: ScheduleRecord): void {
+    const threadId = rec.threadId;
+    if (!threadId) return;
+    const failed = (e: unknown) => this.log.warn("could not drop a deleted schedule's queued messages", { scheduleId: rec.id, threadId, error: String(e) });
+    if (this.elsewhere(threadId)) {
+      void this.dropElsewhere?.(threadId, rec.id).catch(failed);
+      return;
+    }
+    try {
+      this.runner.dropScheduled(threadId, rec.id);
+    } catch (e) {
+      failed(e);
+    }
   }
 
   // Runs it now, as if it were due. A repeating one keeps its next time.
   // Another runner's is asked for through the backend, and runs there.
   async runNow(scheduleId: string): Promise<{ schedule: Schedule; threadId?: string; turnId?: string; queued?: boolean }> {
+    this.refused();
     if (this.runningNow.has(scheduleId)) throw new RpcError(ErrorCode.busy, 'This schedule is already being run; try again in a moment.');
     this.runningNow.add(scheduleId);
     try {
@@ -1053,6 +1119,7 @@ export class Scheduler {
   // ------------------------------------------------------------------ runs
 
   private tick(): void {
+    if (this.refuse) return;
     if (this.mode === 'backend') {
       void this.backendTick();
       return;
@@ -1115,6 +1182,7 @@ export class Scheduler {
   // schedules.run requests other runners left for ours. Nothing is sent
   // until the backend is attached.
   private async backendTick(): Promise<void> {
+    if (this.refuse) return;
     this.timer?.cancel();
     this.timer = undefined;
     if (this.stopped) return;
@@ -1422,15 +1490,17 @@ export class Scheduler {
   // that's gone counts, as the check would run somewhere else (runCheck).
   private heldCheck(command: string, cwd: string, id: string): { skip: string } | Carried | undefined {
     let hash: string;
+    let why: string | undefined;
     try {
       const v = this.runner.patchTrust.checkApproved(command, cwd);
       if (v.approved && fs.existsSync(cwd)) return undefined;
       hash = v.hash;
+      why = v.why;
     } catch (e) {
       hash = `unreadable: ${String(e)}`;
     }
-    if (heldToldAbout(this.home, id) === hash) return { skip: HELD_SKIP };
-    return { extra: HELD_EXTRA, held: hash };
+    if (heldToldAbout(this.home, id) === hash) return { skip: why ?? HELD_SKIP };
+    return { extra: why ? `\n\nIts check wasn't run: ${why}` : HELD_EXTRA, held: hash };
   }
 
   // Run now doesn't run the check, but sends what it kept and no thread

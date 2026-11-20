@@ -13,14 +13,14 @@ import { nextHealth } from './pushHealth';
 // with no tokenId (from before 5 Nov 2026), is skipped here.
 export const targets = internalQuery({
   args: {},
-  returns: v.array(v.object({ apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), notify: v.union(v.literal('away'), v.literal('always'), v.literal('off')), pushKey: v.optional(v.string()), platform: v.optional(v.literal('android')) })),
+  returns: v.array(v.object({ apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), notify: v.union(v.literal('away'), v.literal('always'), v.literal('off')), pushKey: v.optional(v.string()), platform: v.optional(v.union(v.literal('android'), v.literal('webpush'))), webPush: v.optional(v.object({ p256dh: v.string(), auth: v.string() })) })),
   handler: async (ctx) => {
     const now = Date.now();
     const tokens = await ctx.db.query('tokens').collect();
     const out = [];
     for await (const d of ctx.db.query('devices')) {
       if (!hasLiveToken(d, tokens, now)) continue;
-      out.push({ apnsToken: d.apnsToken, environment: d.environment, notify: d.notify ?? ('away' as const), ...(d.pushKey ? { pushKey: d.pushKey } : {}), ...(d.platform ? { platform: d.platform } : {}) });
+      out.push({ apnsToken: d.apnsToken, environment: d.environment, notify: d.notify ?? ('away' as const), ...(d.pushKey ? { pushKey: d.pushKey } : {}), ...(d.platform ? { platform: d.platform } : {}), ...(d.webPush ? { webPush: d.webPush } : {}) });
     }
     return out;
   },
@@ -187,5 +187,28 @@ export const list = internalQuery({
     const out = [];
     for await (const d of ctx.db.query('devices')) out.push({ platform: d.platform ?? 'apple', environment: d.environment, tokenName: d.tokenName, updatedAt: new Date(d.updatedAt).toISOString(), tokenTail: d.apnsToken.slice(-6), notify: d.notify ?? 'away' });
     return out;
+  },
+});
+
+// This deployment's VAPID key (API 93, webPush.ts): the one that's there, or
+// `candidate` (made by the caller, as a mutation can't make keys) when there's
+// none yet. Two callers racing both get whichever was saved first.
+export const vapidKey = internalQuery({
+  args: {},
+  returns: v.union(v.null(), v.object({ x: v.string(), y: v.string(), d: v.string() })),
+  handler: async (ctx) => {
+    const row = await ctx.db.query('webPushVapid').first();
+    return row ? { x: row.x, y: row.y, d: row.d } : null;
+  },
+});
+
+export const putVapidKey = internalMutation({
+  args: { x: v.string(), y: v.string(), d: v.string() },
+  returns: v.object({ x: v.string(), y: v.string(), d: v.string() }),
+  handler: async (ctx, candidate) => {
+    const row = await ctx.db.query('webPushVapid').first();
+    if (row) return { x: row.x, y: row.y, d: row.d };
+    await ctx.db.insert('webPushVapid', { ...candidate, createdAt: Date.now() });
+    return candidate;
   },
 });

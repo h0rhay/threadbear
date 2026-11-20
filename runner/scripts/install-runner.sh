@@ -52,6 +52,9 @@
 #   --force        replace the running copy even if threads are busy
 #   --allow-branch install from a HEAD that isn't main's tip (its launch.mjs
 #                  and release)
+#   --skip-checks  build the release without its typecheck and unit tests,
+#                  for a commit that's already been checked (setup passes
+#                  it for Mike's code as it is in his repo)
 #   --home DIR     data dir (default ~/Library/Application Support/Threadbear)
 #   --label LABEL  launchd label (default com.mikerosoft.threadbear.runner)
 #   --port N       port to listen on (default: the one in runner.json, else
@@ -96,6 +99,7 @@ FROM_SOURCE=0
 STAGE=0
 FORCE=0
 ALLOW_BRANCH=0
+SKIP_CHECKS=0
 HOME_GIVEN=0
 MODE="install"
 ARGS=("$@")
@@ -108,6 +112,7 @@ while [ $# -gt 0 ]; do
     --stage) STAGE=1 ;;
     --force) FORCE=1 ;;
     --allow-branch) ALLOW_BRANCH=1 ;;
+    --skip-checks) SKIP_CHECKS=1 ;;
     --home) DATA_HOME="${2:?--home needs a folder}"; HOME_GIVEN=1; shift ;;
     --label) LABEL="${2:?--label needs a launchd label}"; shift ;;
     --port) PORT="${2:?--port needs a number}"; shift ;;
@@ -666,9 +671,10 @@ else
     echo "Keeping release $OLD_CURRENT, which was built from HEAD."
   else
     [ -z "$OLD_CURRENT" ] || echo "Release $OLD_CURRENT wasn't built from HEAD, so building one that is."
-    BRANCH_ARG=()
-    [ "$ALLOW_BRANCH" = 0 ] || BRANCH_ARG=(--allow-branch)
-    if ! deploy --no-restart ${BRANCH_ARG[@]+"${BRANCH_ARG[@]}"}; then
+    DEPLOY_ARGS=()
+    [ "$ALLOW_BRANCH" = 0 ] || DEPLOY_ARGS=(--allow-branch)
+    [ "$SKIP_CHECKS" = 0 ] || DEPLOY_ARGS+=(--skip-checks)
+    if ! deploy --no-restart ${DEPLOY_ARGS[@]+"${DEPLOY_ARGS[@]}"}; then
       rm -f "$NEW_LAUNCH"
       exit 1
     fi

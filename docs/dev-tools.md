@@ -255,7 +255,7 @@ the data dir (`<home>`, normally `~/Library/Application Support/Threadbear`):
   adds the runner's real-model e2e (cheapest model, temp dirs); `--shots`
   runs `app/Tools/screenshots.sh`. `--only "step;step=files"` runs just
   those steps (and, for the runner's unit tests, those files); a failed
-  run ends with the `--only` that runs what failed again, which `tb land`
+  run ends with the `./check.sh --only` that runs what failed again, which `tb land`
   uses to find the landing that broke a group
   (docs/thread-worktrees.md, "Finding who broke a group"). One line per step, nonzero exit if
   anything failed, on the Node `runner/scripts/find-node.sh` picks.
@@ -323,7 +323,9 @@ driving it from a script") and in AGENTS.md ("Seeing and driving the app").
   from `runner.notice` and `runner.status`; while the runner is down it
   says "The runner is restarting. Reconnecting…" with a spinner and the
   app retries every half second. A `user.message` with `origin: "runner"`
-  is a centred note, "Sent by the runner after it restarted" over its text.
+  is a centred note over its text, saying why from its `wakeReason` ("Sent
+  by the runner: moved to another login"; the Swift app and a restart or
+  missing reason say "Sent by the runner after it restarted").
   The mock has `runner.status`, `mock.restartPending` and `mock.restart`,
   and `Tools/screenshots.sh --only 11` shoots all three states.
 - A thread whose turn ended with background sub-agents or shell jobs
@@ -434,7 +436,10 @@ rollback covers a release that doesn't come up.
   the runner's typecheck and unit tests run and not skipped), the build
   runs `deploy.mjs --skip-checks` (`landChecked` in `runner/src/update.ts`;
   the runner's log says `checksLeftOut`). The snapshot, the smoke test and
-  the crash rollback are as before. On 13 Nov each landing that changed the
+  the crash rollback are as before. Someone else's copy that pulled Mike's
+  main as it is has no such line, so there the proof is his main having
+  the commit, fetched fresh from whichever remote is his (`onMikesMain`; a
+  fork's runner ran the whole suite for each update before, 19 Nov). On 13 Nov each landing that changed the
   runner had the same tests run twice on the check hosts, five minutes
   apart (a build's `check.sh --runner` is those two steps and nothing
   more): about two hours a day of the hosts. The checks still run for a
@@ -491,9 +496,26 @@ rollback covers a release that doesn't come up.
   setting it needs no restart. A commit made only on that machine, or
   uncommitted changes git won't overwrite, are left alone and said; the
   runner keeps updating from GitHub either way. `tb land` refuses in the
-  followed repo, and a fix-update thread hands its fix to the main Mac
+  followed repo, and the fix for a failed update is made on the main Mac
   (Mike, 9 Nov: hand-made pull jobs on bruce and the Pixel failed quietly
   for days behind one commit a fix-update thread had made on their main).
+  From backend API 91 the machine starts no thread for it: its heartbeat
+  carries `updateFailed` (the commit, the error's last 2 KB, the log's
+  path), and the main Mac's runner, reading the other runners every 2
+  minutes, starts the fix thread in its own checkout (`RemoteUpdateFixer`
+  in `runner/src/fix-update.ts`): once per runner and commit, whatever kind
+  it says, at most one thread or message per runner every 10 minutes, and
+  only for a commit on its own main or GitHub's. A report the main Mac
+  hasn't fixed in 12 hours (its runner older than the backend, say) is
+  handed over from the machine as before.
+  Before, that machine's thread asked the main Mac for one, and a runner
+  key's ask is a Start it card (Mike, 19 Nov: "why do we have to treat
+  different runners differently?"). The brief names the machine by its
+  runner id; its name, error and log path are quoted as its words, never
+  instructions (Codex's review found the path and name outside the quote
+  at first). To see more, the thread starts one on that
+  machine, which the main Mac does without asking. Against an older
+  backend the machine still hands the fix over itself.
   `followProblem` in `runner.status`'s `update` says what's wrong: a local
   main that can't follow, GitHub out of reach for over an hour, or something
   that runs on GitHub's main and not here for over six hours. It goes up

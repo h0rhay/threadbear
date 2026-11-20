@@ -281,6 +281,14 @@ older thread's pictures stay on the Mac and the phone says so. They're
 deleted with the thread. Mike's attachments and tools' screenshots stay on
 the Mac unless the thread is shared (`shareImages`), as they're many and big.
 
+Since API 95, with the livePages experiment on, a page an agent shows in its
+reply (`![title](/path/page.html)`, one self-contained HTML file, checked
+to be markup) goes too: its row's `mediaType` is `text/html`, but the file
+is stored as `application/octet-stream`, so its storage URL opened in a
+browser downloads it rather than running it on the deployment's origin.
+`phoneImage` carries `mediaType`, and the apps run a page only in their
+sealed views (docs/live-pages-design). A pinned page stays on the Mac.
+
 They go as the file is, so a GIF keeps its frames; the phone's 1400 pixel limit
 is only on what it decodes for the column. MP4 and MOV files an agent writes
 the same way or pins go through the same rows (`.mp4`, `.m4v`, `.mov`, under
@@ -491,6 +499,10 @@ all meet. So:
 - Since API 67 `sync:heartbeat` takes `followProblem`, a runner's word that it
   can't follow GitHub's main (docs/dev-tools.md); the main key reads it from
   `sync:otherRunnersList`.
+- Since API 91 it also takes `updateFailed`, a following runner's failed
+  update to main (cut to fit from a runner key, dropped from a box's), which
+  the main key reads the same way and fixes on the main Mac
+  (docs/dev-tools.md).
 - `convex/version.ts` has `API_VERSION`, returned by `sync:heartbeat` and
   `phone:me`. Bump it when a client starts relying on something new, along
   with `BACKEND_API_VERSION` in `runner/src/sync.ts` (a unit test keeps them
@@ -706,7 +718,14 @@ phone names must be one that has heartbeated (or `"any"`), else
   `platform: "android"` (API 66) says it is instead the phone's Firebase token
   (letters, digits and `_ - :`); the row keeps the name and gets a `platform`,
   and its pushes go through the relay to Firebase, even from a backend with its
-  own Apple key. An iPhone sends no platform. A phone token
+  own Apple key. `platform: "webpush"` (API 93, the Android app's F-Droid
+  build) says `apnsToken` is a UnifiedPush endpoint, a public https address
+  (no credentials, localhost or private ranges: `convex/webPushEndpoint.ts`),
+  with `webPush: { p256dh, auth }` its keys in base64url; this deployment
+  posts its pushes there itself, no relay (docs/push-relay.md, "UnifiedPush").
+  The phone first gets the deployment's VAPID public key from the action
+  `phone:webPushKey({ token })` → `{ vapid }`, made once and kept in
+  `webPushVapid`. An iPhone sends no platform. A phone token
   keeps at most 5 registrations; a new one past that replaces its oldest.
   Revoking a token takes effect in that one small write (its phones get no
   more pushes at once, `devices:targets`); their rows are deleted after, 100

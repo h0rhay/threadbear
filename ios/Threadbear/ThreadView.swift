@@ -1217,7 +1217,9 @@ struct MarkdownText: View {
         case let .table(header, alignments, rows):
             MarkdownTable(header: header, alignments: alignments, rows: rows)
         case let .image(alt, src):
-            if let image = pictures.image(src: src, seq: seq), let url = URL(string: image.url) {
+            if let image = pictures.image(src: src, seq: seq), image.isPage, let url = URL(string: image.url) {
+                LivePageCard(url: url, title: alt)
+            } else if let image = pictures.image(src: src, seq: seq), let url = URL(string: image.url) {
                 ReplyPicture(url: url, alt: alt, width: image.width, height: image.height)
             } else if let url = ThreadPictures.webLink(src) {
                 // Never fetched here: a link, like any other in the reply

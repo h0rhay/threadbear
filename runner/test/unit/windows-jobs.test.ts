@@ -8,22 +8,35 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { nullLogger } from '../../src/log.ts';
-import { ProcessRegistry, helperJobs, newJobName, pidExists, processInfo, type JobControl } from '../../src/proc.ts';
+import { ProcessRegistry, approxStartTime, helperJobs, newJobName, pidExists, processInfo, type JobControl } from '../../src/proc.ts';
 import { tmpDir } from '../helpers/fakes.ts';
 import { onlyOnWindows } from '../helpers/platform.ts';
 import { PATIENCE_MS } from '../helpers/patience.ts';
 
+// The start of a live process as the helper answers it: a FILETIME on
+// Windows; on a Mac, where ps gives a date, any number (the start can't be
+// compared there). PowerShell's probe fails now and then on a loaded CI
+// machine, and an answer of '1' then looked like a reused pid, so the job
+// was let go of and the test failed (GitHub's Windows, 18 Nov). It's asked
+// again, and if it still can't say, the time now stands in: add() falls
+// back to the same estimate when its own probe fails.
+function startNow(pid: number): string {
+  for (let i = 0; i < 3; i++) {
+    const l = processInfo(pid)?.lstart ?? '';
+    if (/^\d+$/.test(l)) return l;
+    if (l && process.platform !== 'win32') return '1';
+  }
+  return process.platform === 'win32' ? approxStartTime(Date.now()).slice(1) : '1';
+}
+
 // A stand-in for the helper. assign answers the start of the process it
-// was given, as the helper does (a FILETIME on Windows; on a Mac, where ps
-// gives a date, any number: the start can't be compared there), or `start`.
+// was given, as the helper does (startNow), or `start`.
 function recorder(start?: (pid: number) => string) {
   const calls: string[] = [];
   const jobs: JobControl = {
     assign: async (pid, name) => {
       calls.push(`assign ${pid} ${name}`);
-      if (start) return start(pid);
-      const l = processInfo(pid)?.lstart ?? '';
-      return /^\d+$/.test(l) ? l : '1';
+      return start ? start(pid) : startNow(pid);
     },
     end: async (name) => void calls.push(`end ${name}`),
     forget: async (name) => void calls.push(`forget ${name}`),
@@ -61,7 +74,7 @@ test('a CLI goes in a job of its own as it starts, and the job ends when the CLI
     const [, pid, name] = calls[0]!.split(' ');
     assert.equal(Number(pid), cli.pid);
     assert.match(name!, JOB);
-    await tick();
+    await until(() => !(reg as unknown as { assigning: Set<unknown> }).assigning.size);
     const saved = JSON.parse(fs.readFileSync(path.join(dir, 'children.json'), 'utf8')) as { job?: string }[];
     assert.equal(saved[0]!.job, name, 'kept once the helper says it was the CLI, so the next runner can end it');
     reg.remove(cli.pid!);
@@ -122,10 +135,10 @@ test('a CLI that exits before the helper has answered has its job ended once it 
   const cli = sleeper();
   try {
     reg.add(cli.pid!, 'claude', 'th1');
-    const l = processInfo(cli.pid!)?.lstart ?? '';
+    const l = startNow(cli.pid!);
     reg.remove(cli.pid!);
-    answer(/^\d+$/.test(l) ? l : '1');
-    await tick();
+    answer(l);
+    await until(() => calls.length > 0);
     assert.equal(calls.length, 1);
   } finally {
     cli.kill();
@@ -166,14 +179,22 @@ test('on Windows what a CLI left running ends with its job, even with its parent
   const reg = new ProcessRegistry(dir, nullLogger);
   assert.equal(reg.jobs, helperJobs);
   const marker = path.join(dir, 'left.pid');
+  const go = path.join(dir, 'go');
   // A "CLI" that starts a long-running process, writes its pid, and exits
   // straight away: the process is an orphan, as a nohup'd tool command is.
-  // A second after it starts, as a real CLI takes a while before its first tool command.
-  const left = `setTimeout(() => { const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { detached: true, stdio: 'ignore', windowsHide: true }); require('fs').writeFileSync(${JSON.stringify(marker)}, String(c.pid)); c.unref(); process.exit(0); }, 1000);`;
+  // Once it's in its job, as a real CLI takes a while before its first tool
+  // command. It waited a fixed second before, and on a loaded CI machine the
+  // helper hadn't answered by then, so nothing held the orphan (18 Nov).
+  const left = `const t = setInterval(() => { if (!require('fs').existsSync(${JSON.stringify(go)})) return; clearInterval(t); const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 600000)'], { detached: true, stdio: 'ignore', windowsHide: true }); require('fs').writeFileSync(${JSON.stringify(marker)}, String(c.pid)); c.unref(); process.exit(0); }, 50);`;
   // The runner starts its helper as it starts.
   await (await import('../../src/win32-helper.ts')).win32Helper().ask('ping');
   const cli = spawn(process.execPath, ['-e', left], { stdio: 'ignore', windowsHide: true });
   reg.add(cli.pid!, process.execPath, 'th1');
+  const assigning = (reg as unknown as { assigning: Set<unknown> }).assigning;
+  for (const deadline = Date.now() + PATIENCE_MS / 2; assigning.size && Date.now() < deadline; ) await tick();
+  assert.equal(assigning.size, 0, 'the helper answered');
+  assert.ok((reg as unknown as { entries: Map<number, { job?: string }> }).entries.get(cli.pid!)?.job, 'in a job of its own');
+  fs.writeFileSync(go, '');
   const exited = new Promise((r) => cli.once('exit', r));
   await exited;
   const orphan = Number(fs.readFileSync(marker, 'utf8'));
@@ -211,11 +232,64 @@ test("the helper is told the latest start the CLI can have, and an answer after 
     reg.add(cli.pid!, 'claude', 'th1');
     const now = (BigInt(Date.now()) + 11_644_473_600_000n) * 10_000n;
     assert.ok(/^\d+$/.test(seen[0]!) && BigInt(seen[0]!) >= now - 10_000_000n && BigInt(seen[0]!) <= now + 10_000_000n, 'about now, as a FILETIME');
-    await tick();
+    await until(() => calls.length > 0);
     assert.match(calls[0] ?? '', /^forget /);
     reg.remove(cli.pid!);
     await tick();
     assert.ok(!calls.some((c) => c.startsWith('end')));
+  } finally {
+    cli.kill();
+  }
+});
+
+// Windows stamped CLIs up to 1.2 ms after node's Date.now() from just after
+// they were spawned, and their jobs were refused (19 Nov).
+test("a CLI stamped a little after node's now is still the CLI: Windows' clock isn't node's", async () => {
+  let notAfter = '';
+  let created = '';
+  const calls: string[] = [];
+  const reg = new ProcessRegistry(tmpDir(), nullLogger);
+  reg.jobs = {
+    assign: async (_pid, _name, n) => {
+      notAfter = n;
+      // 2 ms after node's now as the runner asks.
+      created = ((BigInt(Date.now()) + 2n + 11_644_473_600_000n) * 10_000n).toString();
+      return created;
+    },
+    end: async (n) => void calls.push(`end ${n}`),
+    forget: async (n) => void calls.push(`forget ${n}`),
+  };
+  const cli = sleeper();
+  try {
+    reg.add(cli.pid!, 'claude', 'th1');
+    (reg as unknown as { entries: Map<number, { lstart?: string }> }).entries.get(cli.pid!)!.lstart = created;
+    assert.ok(BigInt(created) <= BigInt(notAfter), 'the helper takes it too');
+    await tick();
+    reg.remove(cli.pid!);
+    await until(() => calls.length > 0);
+    assert.match(calls[0] ?? '', /^end /);
+  } finally {
+    cli.kill();
+  }
+});
+
+// The slack mustn't let in a process that got the CLI's pid: the runner only
+// lets go of the pid once its event loop has run, so add() holds it until
+// notAfter has passed (Codex's review, 19 Nov).
+test('add() returns only once notAfter has passed, so the pid can only be reused after it', async () => {
+  let notAfter = '';
+  const reg = new ProcessRegistry(tmpDir(), nullLogger);
+  reg.jobs = {
+    assign: async (_pid, _name, n) => ((notAfter = n), '1'),
+    end: async () => {},
+    forget: async () => {},
+  };
+  const cli = sleeper();
+  try {
+    reg.add(cli.pid!, 'claude', 'th1');
+    const back = (BigInt(Date.now()) + 11_644_473_600_000n) * 10_000n;
+    assert.ok(back > BigInt(notAfter), `returned at ${back}, notAfter ${notAfter}`);
+    reg.remove(cli.pid!);
   } finally {
     cli.kill();
   }

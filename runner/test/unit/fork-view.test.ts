@@ -67,6 +67,8 @@ const MIKE_MEANT = [
   /only Mike can fix/,
   /Made in Busselton by Mike/,
   /upstream remote \(Mike's repo\)/,
+  // The check-ups a fork offers to send him (checkup.ts).
+  /\bcheck-ups?\b/,
 ];
 
 function sourceFiles(dir: string, ext: string[]): string[] {

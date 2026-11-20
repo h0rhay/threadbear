@@ -212,7 +212,9 @@ export type ToolApprovalRequest = {
 // queued: Mike's answers to the queued calls, answered in the same click.
 // noApp: no card was put up, as only an app of this runner's own could allow
 // it and it has none (app-seen.ts); `message` says what to do instead.
-export type ToolApprovalAnswer = { decision: 'allow' | 'allowAlways' | 'deny' | 'expired'; message?: string; mode?: PermissionMode; stopped?: boolean; queued?: QueuedAnswers; noApp?: true };
+// `reviewer`: on a deny of a card the card reviewer left for Mike, why it did
+// (runner/card-review.ts), for the agent alongside the denial.
+export type ToolApprovalAnswer = { decision: 'allow' | 'allowAlways' | 'deny' | 'expired'; message?: string; reviewer?: string; mode?: PermissionMode; stopped?: boolean; queued?: QueuedAnswers; noApp?: true };
 
 export type QuestionRequest = {
   toolUseId?: string;

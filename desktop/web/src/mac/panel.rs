@@ -190,6 +190,8 @@ impl PanelPage {
                     super::sealed::NoMenu::new(),
                     super::sealed::NoDownloads::new(),
                     super::preview::NoDrops::new(),
+                    super::sealed::NoDialogs::new(),
+                    super::sealed::NoFilePicker::new(),
                 );
                 (settings, client)
             }
@@ -539,6 +541,8 @@ wrap_client! {
         menu: ContextMenuHandler,
         downloads: DownloadHandler,
         drags: DragHandler,
+        dialogs: JsdialogHandler,
+        files: DialogHandler,
     }
 
     impl Client {
@@ -562,6 +566,12 @@ wrap_client! {
         }
         fn drag_handler(&self) -> Option<DragHandler> {
             Some(self.drags.clone())
+        }
+        fn jsdialog_handler(&self) -> Option<JsdialogHandler> {
+            Some(self.dialogs.clone())
+        }
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(self.files.clone())
         }
     }
 }

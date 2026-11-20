@@ -9,10 +9,16 @@ import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpDir } from '../helpers/fakes.ts';
 import { holdUntil } from '../helpers/patience.ts';
+import { SHELL } from '../helpers/platform.ts';
 
 const SCRIPT = path.join(import.meta.dirname, '..', '..', '..', 'scripts', 'sync-main.sh');
-const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' };
-const sh = (cwd: string, cmd: string) => execFileSync('/bin/sh', ['-c', cmd], { cwd, env, encoding: 'utf8' }).trim();
+// Not the outer run's THREADBEAR_SYNC_LOCKED: when this suite runs as
+// sync-main.sh's own check, that's set (the outer run holds the real lock),
+// and the script under test then took it that it held this repo's lock too
+// and never waited, failing the lock tests in every such sync (David, 19 Nov).
+const { THREADBEAR_SYNC_LOCKED: _outer, ...outside } = process.env;
+const env = { ...outside, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@t' };
+const sh = (cwd: string, cmd: string) => execFileSync(SHELL[0], [SHELL[1], cmd], { cwd, env, encoding: 'utf8' }).trim();
 
 function repos() {
   const root = fs.realpathSync(tmpDir('sync-main-'));

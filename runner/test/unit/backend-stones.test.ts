@@ -15,7 +15,7 @@ import { tmpDir } from '../helpers/fakes.ts';
 import { load } from '../helpers/convex-memory.ts';
 
 // Plain .mjs (Node built-ins only, as deploy-backend.mjs), loaded as deploy-steps' tests load theirs.
-const { backfillsAt, lastJson, withStepping } = await import(pathToFileURL(path.join(import.meta.dirname, '..', '..', 'scripts', 'backend-stones.mjs')).href);
+const { backfillsAt, lastJson, rearmCursor, withStepping } = await import(pathToFileURL(path.join(import.meta.dirname, '..', '..', 'scripts', 'backend-stones.mjs')).href);
 const ROOT = path.join(import.meta.dirname, '..', '..', '..');
 
 function repo() {
@@ -71,6 +71,16 @@ test("convex run's answer is read from its last line of JSON", () => {
   assert.deepEqual(lastJson('Running migrations:run...\n{"done":true}\n'), { done: true });
   assert.equal(lastJson('true'), true);
   assert.equal(lastJson('no answer'), undefined);
+});
+
+// convex run prints a string as one quoted line and nothing for null; a
+// reply it can't read isn't the last page.
+test("rearmFailed's answer is the next page's cursor, or null after the last", () => {
+  assert.equal(rearmCursor('"073ab9d7"\n'), '073ab9d7');
+  assert.equal(rearmCursor(''), null);
+  assert.equal(rearmCursor('null\n'), null);
+  assert.throws(() => rearmCursor('3\n'), /other than a cursor/);
+  assert.throws(() => rearmCursor('Something went wrong'), /other than a cursor/);
 });
 
 // The schema and machines as the stepping stone deploys them: the field

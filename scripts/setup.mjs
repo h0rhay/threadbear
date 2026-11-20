@@ -5,7 +5,7 @@
 //
 //   ./threadbear setup [--dry-run] [--yes] [--team SLUG] [--project NAME]
 //                      [--region REGION] [--cwd DIR] [--name NAME]
-//                      [--home DIR] [--skip-install] [--existing]
+//                      [--home DIR] [--skip-install] [--run-checks] [--existing]
 //                      [--self-hosted [--local | --tailnet |
 //                                      --url URL --site-url URL]]
 //
@@ -56,7 +56,11 @@
 //   8. the runner (its LaunchAgent, with Threadbear Runner.app as the
 //      program, so macOS's privacy prompts name it) and the Mac app (the
 //      GPUI one in desktop/, with Rust if there's none), built, installed
-//      and opened
+//      and opened. The runner's typecheck and unit tests (up to an hour)
+//      only run when this is code Mike's repo doesn't have, or with
+//      --run-checks (scripts/checked-upstream.mjs). An app already
+//      installed from an older main gets main's build staged for its next
+//      start (switch-from-swift.sh)
 //   9. where to pair your iPhone and sign a browser in (the app's Settings)
 //
 // Node built-ins only, so it runs before the repo's packages are installed.
@@ -66,6 +70,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { checkedUpstream, repoKey } from './checked-upstream.mjs';
 import { isJoining, joinSteps, runnerKeyPlan } from './runner-key-plan.mjs';
 import { ADMIN_URL, backendContainer, DATA_VOLUME, mustSeeTailnetOff, offTailnetStep, oldAddressStep, origins, OWN_ADDRESSES_FILE, ownAddresses, PORTS, reachOf, selfHostedPlan, servedOn, tailnetPendingFiles } from './self-hosted-plan.mjs';
 import { ConvexAdminError, convexEnv, readConvexAdmin, SELF_HOSTED_ENV_FILE } from '../runner/src/convex-admin.ts';
@@ -97,6 +102,7 @@ const { values: v } = parseArgs({
     name: { type: 'string' },
     home: { type: 'string' },
     'skip-install': { type: 'boolean' },
+    'run-checks': { type: 'boolean' },
     existing: { type: 'boolean' },
     'self-hosted': { type: 'boolean' },
     local: { type: 'boolean' },
@@ -265,7 +271,6 @@ function desktopSession() {
 
 // Mike's repo, which everyone else's copy follows for his releases.
 const MIKES_REPO = 'https://github.com/mikecann/threadbear.git';
-const repoKey = (url) => url.trim().replace(/^git@([^:]+):/, '$1/').replace(/^[a-z+]+:\/\/(?:[^@/]+@)?/, '').replace(/\.git\/?$/, '').replace(/\/$/, '').toLowerCase();
 
 function remoteUrl(name) {
   const r = run('git', ['remote', 'get-url', name]);
@@ -1002,7 +1007,12 @@ function install() {
   if (!desktopSession()) throw new Fail("Nobody is logged in to this Mac's desktop, and macOS only starts the runner (a login agent) for someone who is. Log in, in person or with Screen Sharing, then run setup again.");
   const env = { ...process.env, THREADBEAR_NODE: process.execPath };
   const homeArgs = path.resolve(home) === DEFAULT_HOME ? [] : ['--home', home];
-  runOrFail('Installing the runner', 'bash', [path.join(repo, 'runner', 'scripts', 'install-runner.sh'), ...homeArgs], { env });
+  const checked = v['run-checks'] ? { checked: false, why: '--run-checks' } : checkedUpstream({ repo, mikesRepo: MIKES_REPO });
+  // Only said for a release it builds: one already built from HEAD is kept as it is.
+  if (checked.checked) note(`A new release leaves out the runner's unit tests: this is Mike's code as his main on ${checked.remote} has it, and they passed there (--run-checks runs them anyway)`);
+  else note(`A new release runs the runner's unit tests first (${checked.why}); they can take up to an hour`);
+  const skipChecks = checked.checked ? ['--skip-checks'] : [];
+  runOrFail('Installing the runner', 'bash', [path.join(repo, 'runner', 'scripts', 'install-runner.sh'), ...homeArgs, ...skipChecks], { env });
   // A Mac joining a Threadbear you already use: you know your way round,
   // so the app's setup cards stay away (Help > Set Up Threadbear and Take
   // the Tour still have them). Written before the app first opens, which

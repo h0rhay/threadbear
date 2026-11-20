@@ -15,11 +15,13 @@ export type LabLedger = LabReviewLedger & { delivered?: number; answered?: numbe
 // A reviewer's verdict: its findings, none when nothing holds up.
 export type ReviewVerdict = { findings: Pick<ReviewFinding, 'severity' | 'claim' | 'where' | 'case'>[] };
 
-export type QueuedSend = { beforeMessage?: true; retryAfterInterrupt?: true; preserveSchedule?: boolean; scheduledSince?: number; turnId: string; text: string; images: ImageRef[]; origin?: MessageOrigin; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number };
+export type QueuedSend = { beforeMessage?: true; retryAfterInterrupt?: true; preserveSchedule?: boolean; scheduledSince?: number; turnId: string; text: string; images: ImageRef[]; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number };
 
 // What thread.json holds: the public summary fields plus a few internal ones.
 // A report held for a thread from one it started (runner/nested.ts).
 export type HeldReport = { from: string; text: string; at: string };
+// An email kept for a thread's next turn (runner/mail.ts).
+export type HeldMail = { text: string; at: string };
 export type PressNote = { id: string; line: string; told?: { seq: number; inFlight?: boolean } };
 
 // A thread's press notes as read from disk, where another runner may have
@@ -55,7 +57,7 @@ export function cleanPresses(raw: unknown): PressNote[] | undefined {
 // summary and the start loop walk these for every thread: `presses: {}`,
 // then `queue: {}`, stopped the runner at every start (security review and
 // Muse's review of the fix, 11 Nov 2026, finding 96). True if it changed.
-const OBJECT_LISTS = ['heldReports', 'waitingOn', 'reviews', 'buttons', 'subagents', 'projects', 'rewinds', 'queue', 'messageRecoveries'];
+const OBJECT_LISTS = ['heldReports', 'heldMail', 'waitingOn', 'reviews', 'buttons', 'subagents', 'projects', 'rewinds', 'queue', 'messageRecoveries'];
 const STRING_LISTS = ['reviewDeliveries', 'allowRules', 'pendingApprovals', 'projectsLeft', 'projectsTold'];
 const NUMBER_LISTS = ['interruptedMessages'];
 const OBJECTS = ['needs', 'looseEnds', 'stoppedWork', 'stoppedMidTurn', 'highlights', 'worktree', 'handoff', 'moved', 'startedBy', 'labReview', 'labReviewOwed', 'reviewVerdict', 'finished'];
@@ -69,6 +71,7 @@ const NESTED: [string, string, 'object' | 'string' | 'number'][] = [
   ['highlights', 'edited', 'string'],
   ['highlights', 'removed', 'string'],
   ['labReview', 'findings', 'object'],
+  ['labReview', 'panel', 'object'],
   ['reviewVerdict', 'findings', 'object'],
 ];
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -143,6 +146,13 @@ export type ThreadRecord = {
   // (Runner.onNetworkLost). `since` is when the line first went, `tries`
   // the carry-ons sent since. Kept here so the wait survives a restart.
   waitingForNetwork?: { since: string; tries: number };
+  // Box mode: a turn was refused with the box's cloud token (errorKind auth):
+  // the thread waits, turns held, until the backend has a newer token for
+  // its login (Runner.holdForToken, box-token.ts). Kept across restarts.
+  // `refusedSetAt`: which token was refused (box.json's tokenSetAt then);
+  // `reported`: the backend has heard (boxes:tokenRefused), so a restart
+  // before it did says it again, with that version, never a newer one's.
+  waitingForToken?: { since: string; turnId: string; refusedSetAt?: number; reported?: boolean };
   // The runner's own carry-on after that, so if it can't get through
   // either the thread waits again, counting on from the same outage.
   netCarryOn?: { turnId: string; since: string; tries: number };
@@ -192,7 +202,11 @@ export type ThreadRecord = {
   // `review`: the thread is a review of this one's change (runner/lab-review.ts).
   // `by`: the waiting thread's access when it said to wait (hibernation.ts,
   // mayHear): what it asked to hear isn't passed on once it has more.
-  waitingOn?: { threadId: string; title: string; until?: string; review?: true; by?: { mode: PermissionMode }; done?: { at: string; how: 'finished' | 'met' | 'archived' | 'deleted'; reply?: string; why?: string } }[];
+  waitingOn?: { threadId: string; title: string; until?: string; review?: true; by?: { mode: PermissionMode }; done?: { at: string; how: 'finished' | 'met' | 'archived' | 'deleted'; reply?: string; why?: string; verdict?: ReviewVerdict; edited?: string[] } }[];
+  // Hibernating until Mike's app restarts onto what its turn landed
+  // (wait_for_app_restart), not for him: sent as awaitingAppRestart, so the
+  // app keeps it under Running. Cleared with the rest of a wait.
+  hibernatedForApp?: true;
   // Its last finished turn (nothing needed, nothing left running) and that
   // turn's reply, for threads waiting on it, including on a runner it
   // moves to (runner/hibernation.ts, reconcileWaits). Cleared by any new
@@ -239,6 +253,8 @@ export type ThreadRecord = {
   // Reports the threads it started sent it with send_message, kept until
   // none of them is working (runner/nested.ts).
   heldReports?: HeldReport[];
+  // Emails about its work, kept for its agent's next turn (runner/mail.ts).
+  heldMail?: HeldMail[];
   starredAt?: string; // Mike starred it: the Starred section, oldest star first
   preview: string;
   lastSeq: number;

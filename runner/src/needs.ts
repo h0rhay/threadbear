@@ -3,7 +3,7 @@
 // section his own instructions ask every agent to end with. No model call:
 // the agent that did the work is the one that knows.
 
-import type { Ask, AskLink, NeedsWho, PersistedEvent } from './protocol.ts';
+import { sentByAgent, type Ask, type AskLink, type NeedsWho, type PersistedEvent } from './protocol.ts';
 import { hasLineBreak, replaceLinks } from './linear-text.ts';
 import { cutSafely, safeEnd } from './safe-cut.ts';
 
@@ -531,22 +531,31 @@ const END_TURN_SNOOZE =
 // 2 Nov 2026). The button stays for what's left after a real try.
 export const TRY_IT_FIRST =
   'Before you give the user a step, try it yourself with the tools you have, including any that drive their browser, apps or phone, and if it works there is no ask. ' +
-  'Hand it over only when it really needs them (a payment, something physical, an approval that is theirs to give) or after a real attempt, and say in your reply what you tried and what stopped it. ' +
-  'A password, key or code is no reason to stop: ask for it with ask_secret and carry on. ' +
+  'Hand it over only when it really needs them (a payment, something physical, a change to their credentials (~/.aws, ~/.ssh, Keychain, tokens), an approval that is theirs to give) or after a real attempt, and say in your reply what you tried and what stopped it. ' +
+  'Get a key yourself when you can (one shown on a page in a signed-in browser), and use a password you set up yourself; ask with ask_secret only for one only they know, and carry on. ' +
   'If there is still something you could try, offer "Can you do it?" next to Done and say what in its answer: it lets them send the step back to you, and is no reason to skip trying. ';
 
-// What end_turn says, once a turn, to a card offering to take a step back. The
+// What end_turn says, once a turn, to a card handing the user a step. The
 // wording alone didn't get steps tried: in replays of real turns agents still
-// offered the button with no try at the step, and this note brought a real try
-// every time (6 of 6). It came up once in 15 runs on a sign-in or payment card,
-// and forced onto those, agents sent the card again unchanged, paying nothing
-// and signing in to nothing (~/dev/me/misc/end-turn-eval/try-first). Whether
-// a turn tried can't be read from its tool calls, as nearly all of them were
-// busy with something else (29 Oct to 1 Nov 2026), so it asks the agent, and an
-// agent that did try or can't only spends one more call.
-export const TRY_FIRST_NUDGE = 'Not ended: this card offers to have you do a step yourself.';
+// offered "Can you do it?" with no try at the step, and this note brought a
+// real try every time (6 of 6). Forced onto a sign-in or payment card, agents
+// sent the card again unchanged, paying nothing and signing in to nothing
+// (~/dev/me/misc/end-turn-eval/try-first). Whether a turn tried can't be read
+// from its tool calls, as nearly all of them were busy with something else (29
+// Oct to 1 Nov 2026), so it asks the agent, and an agent that did try or can't
+// only spends one more call.
+// Until 20 Nov it came only to a card offering "Can you do it?", which an agent
+// that doesn't think it can do the step never offers: on 19 Nov Mike was handed
+// System Settings switches on a Mac the agent had Screen Sharing on, a long
+// password it had made for him to type, and a removable-volume prompt, each
+// with "Done" and "Stuck" (0b6b183c, 854d950f), and five times told it to do
+// them itself. So it comes to any card that hands over a step (handsOverAStep).
+// Credentials count as needing the user: on 18 Nov this note, on a "Do it for
+// me / I'll do it" card about ~/.aws/config, got an agent to rewrite it
+// unasked (David Clark's fork, 32cda3c2d).
+export const TRY_FIRST_NUDGE = 'Not ended: this card hands the user a step to do.';
 export function tryFirstNudge(): string {
-  return `${TRY_FIRST_NUDGE} If you could try that step and haven't, try it now, then call end_turn again with whatever is left. If you already tried, or it really needs the user (a password or code, a payment, something physical, an approval that is theirs to give), call end_turn again as you were, and say in your reply what you tried or why it needs them: this note comes once a turn.`;
+  return `${TRY_FIRST_NUDGE} If you could do it yourself and haven't tried, try it now with the tools you have (a setting or dialog on a Mac you can reach with ComputerCub or Screen Sharing, a key shown on a page in a signed-in browser, a password you set for a test account, which you can type yourself), then call end_turn again with whatever is left. If you already tried, it really needs the user (a password or code only they know, a payment, something physical, a change to their credentials (~/.aws, ~/.ssh, Keychain, tokens), an approval that is theirs to give), or it's a choice rather than a step, call end_turn again as you were, and say in your reply what you tried or why it needs them: this note comes once a turn.`;
 }
 
 // An ask about another thread with no answers and no link: "Pick a
@@ -576,6 +585,110 @@ export function deadEndNudged(events: PersistedEvent[]): boolean {
 const TAKES_IT_BACK = /\b(?:can|could|would) you\b.*\b(?:do|try|handle|run)\b|\byou do it\b|\bdo (?:it|them|this|that) for me\b|\btry it yourself\b/i;
 export function offersToTakeItBack(asks: Ask[]): boolean {
   return asks.some((a) => a.options?.some((o) => TAKES_IT_BACK.test(o)));
+}
+
+// A card that hands the user a step, rather than asking them to choose: one
+// offering to take it back, one with an answer saying it's done ("Done",
+// "Unlocked", "Switched back", "Signed in"), or one whose ask opens with an
+// instruction ("Turn on...", "On Tinker Desk, allow...", "In the tab I
+// brought forward, set up prepay..."), as every card Mike was handed a step
+// on did on 19 Nov. A question about what to do ("Should I...?", "How should
+// we...?", "Can I log you out tonight?") is a choice, and a card that opens a
+// review (show_options) is a pick: neither is held up, and nor is an
+// instruction asked as a question ("Install the new Tandem now?"), which asks
+// leave to do it. An ask to delete, remove, buy or pay is never held up, so
+// the note never presses an agent towards one; nor do labels that are as
+// often a choice ("Fixed price", "Signed URL", "Enabled") count as saying
+// it's done. Codex and Gemini found those in two rounds of review (20 Nov).
+// The whole answer is the done phrase, maybe with "it" or a few words after a
+// comma ("Done, picked"), so "Installed apps" or "I've changed my mind" isn't.
+const SAYS_DONE = /^(?:done|all (?:done|set)|did (?:it|that)|i did|it's (?:done|on|in)|i(?: have|'ve) (?:\w+ed|done|set|put|got|made|run)|finished|unlocked|switched|signed in|logged in|turned(?: (?:it|them))? (?:on|off)|added|allowed|granted|installed|pasted|typed|entered|reconnected|plugged in|restarted|rebooted|clicked|copied)(?: (?:it|them|that|this|both|all|now|in|on|off|up|back|over))*(?:\s*[-–—(,.!:;].*| to .*)?$/i;
+const STEP_VERB = 'add|allow|click|connect|copy|create|drag|enable|enter|give|grant|install|log ?in(?:to)?|log (?:out|on(?:to)?)|move|open|paste|plug|press|put|reconnect|restart|reboot|run|set|sign ?in(?:to)?|sign (?:up|out)|switch|tap|tick|turn|type|unlock|unplug';
+// The instruction, maybe after "Please" or "Can you" and clauses saying where
+// ("On Tinker Desk, in System Settings, ").
+const ASKED_TO = '(?:can|could|would) you (?:please )?';
+const STARTS_WITH_A_STEP = new RegExp(`^(?:please,? |${ASKED_TO})?(?:(?:on|in|at|from|over|using|with) [^,?]{1,120}, ){0,2}(?:please,? |${ASKED_TO})?(?:${STEP_VERB})\\b`, 'i');
+// Deleting, paying and the like are never pressed on an agent, whatever the card.
+const NOT_TO_PRESS = /\b(?:delet(?:e|es|ed|ing|ion)|remov(?:e|es|ed|ing)|erase|wipe|uninstall|destroy|pay|paid|paying|payment|prepay|buy|purchase|checkout|subscribe|refund|(?:place|make) (?:an |the )?order|order (?:it|them|one|the|a|some)|cancel (?:the |my |your |this )?(?:subscription|plan|order|account|membership)|close (?:the |your |my )?account)\b/i;
+// Curly apostrophes as typed on a phone or by some models, markdown links as
+// their words, and bold or italics, so they don't hide the words.
+const plain = (s: string) => s.replace(/[‘’]/g, "'").replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[*_`]/g, '').trim();
+export function handsOverAStep(asks: Ask[]): boolean {
+  // An ask that opens a review is a pick; the card's other asks still count.
+  const steps = asks.filter((a) => !a.links?.some((l) => l.url.startsWith('review:')) && !NOT_TO_PRESS.test(plain([a.action, a.why, ...(a.optionNotes ?? [])].join(' '))));
+  return offersToTakeItBack(steps) || steps.some((a) => [...(a.options ?? []), ...(a.reply ? [a.reply] : [])].some((o) => SAYS_DONE.test(plain(o))) || givesAnInstruction(plain(a.action)));
+}
+// An instruction, and not a question: one ending "?" asks leave or is a
+// choice ("Install the new Tandem now?", "Open PRs #38 and #41 both touch
+// auth. Which first?"); "Can you ...?" is the user being asked to do it.
+function givesAnInstruction(action: string): boolean {
+  const first = action.split(/(?<=[.?!])\s/)[0];
+  if ((first.endsWith('?') || action.endsWith('?')) && !/\b(?:can|could|would) you /i.test(first)) return false;
+  return STARTS_WITH_A_STEP.test(action);
+}
+
+// What end_turn says, once a turn, to a Done card in a thread Mike started
+// that's part of a project still going. On 20 Nov 2026 the calendar site's
+// thread said Done twice in a row (after building the look Mike picked, then
+// after fixing its review), with its own project's state saying "Next is
+// Peter's review of the live site", and with three follow-ups and a question
+// from earlier cards never answered (Peter's missing photos, the email to
+// him, Google's sign-in screen). Mike nearly archived it. Done reads as safe
+// to archive, so the note shows the project's state and those earlier items,
+// and leaves it to the agent which still matter: Mike didn't want old
+// questions carried forward by rule, as some no longer apply.
+export const PROJECT_STEP_NUDGE = "Not ended: this card says Done, and this thread is part of a project that isn't finished.";
+const MAX_STATE_CHARS = 400;
+const MAX_OPEN_ITEMS = 6;
+export function projectStepNudge(projects: { title: string; state: string }[], open: string[]): string {
+  const cut = (t: string) => (t.length > MAX_STATE_CHARS ? `${t.slice(0, MAX_STATE_CHARS).replace(/\s+\S*$/, '')}…` : t);
+  const which = projects.map((p) => `"${p.title}"${p.state.trim() ? ` (its state: "${cut(p.state.trim().replace(/\s+/g, ' '))}")` : ''}`).join(' and ');
+  const earlier = open.length
+    ? ` Earlier in this thread you asked or suggested these, and no answer to them came back: ${open.map((o) => `"${o}"`).join('; ')}. Keep any that still matter, as an ask or in next, and leave out ones that were settled another way or no longer apply.`
+    : '';
+  return `${PROJECT_STEP_NUDGE} It's in ${which}. Done means the user can archive the thread: the whole job, not this step. If the next step is theirs (looking at what you made, sending it to someone, a decision), put it on the card as an ask with needs "you". If it's yours to do later, book it with schedule_message, which runs you then.${earlier} If this thread's part really is finished, call end_turn again as you were: this note comes once a turn.`;
+}
+export function projectStepNudged(events: PersistedEvent[]): boolean {
+  return nudgedSince(events, PROJECT_STEP_NUDGE);
+}
+
+// The asks and follow-ups (next) on this thread's earlier cards that no
+// message from Mike answered since, oldest first, at most six: the last
+// few, as older ones are likelier settled. A card is what its turn ended
+// with (turn.completed), so one an interrupted or reopened turn replaced,
+// which Mike never saw, isn't here, and the turn still running has none
+// yet. An ask counts as answered by a card answer naming it or a message
+// quoting it, a follow-up by a message with its words (ticking one sends
+// them) or, for an ask linking a show_options review, his pick in it,
+// however late: one sent into the running turn too. Only Mike's
+// messages answer (fromMike: not the runner's, a schedule's or another
+// agent's), and what an edit cut out (thread.rewound) never happened.
+// What `now` already lists is left out.
+const plainKey = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim();
+export function unansweredItems(events: PersistedEvent[], now: string[] = []): string[] {
+  const cuts = events.flatMap((e) => (e.type === 'thread.rewound' ? [{ from: e.fromSeq, to: e.toSeq }] : []));
+  // Each open item's words, and the show_options reviews its ask links to:
+  // picking in the review window answers it, with words of its own.
+  const open = new Map<string, { text: string; reviews: string[] }>();
+  for (const e of events) {
+    if (cuts.some((c) => e.seq >= c.from && e.seq <= c.to)) continue;
+    if (e.type === 'turn.completed') {
+      const items = e.needs === 'you' ? (e.asks ?? []).map((a) => ({ text: a.action, reviews: (a.links ?? []).flatMap((l) => (l.url.startsWith('review:') ? [l.url.slice('review:'.length)] : [])) })) : e.needs === 'nothing' ? (e.next ?? []).map((t) => ({ text: t, reviews: [] })) : [];
+      for (const item of items) {
+        open.delete(plainKey(item.text));
+        open.set(plainKey(item.text), item);
+      }
+    } else if (e.type === 'user.message' && (!e.origin || e.origin === 'phone') && !sentByAgent(e.text ?? '')) {
+      const said = plainKey(e.text ?? '');
+      const answered = new Set((e.answers ?? []).map((x) => plainKey(x.action)));
+      const review = e.reviewId;
+      for (const [k, item] of [...open]) {
+        if (answered.has(k) || (k && said.includes(k)) || (review && item.reviews.some((r) => r.length >= 8 && review.startsWith(r)))) open.delete(k);
+      }
+    }
+  }
+  for (const t of now) open.delete(plainKey(t));
+  return [...open.values()].map((i) => i.text).slice(-MAX_OPEN_ITEMS);
 }
 
 // Whether this turn has had the note (connectors.ts, nudgedThisTurn, is the same).
@@ -805,6 +918,23 @@ export function endTurnIsOneReply(result: { ok: boolean; text: string }): boolea
 // first loaded, and ToolSearch shows that one too (threadbear-mcp.ts, endTurn).
 // An agent on 1 Nov 2026 got a bare zod error and had to read the source
 // (thread 1b770c6a).
+// An ask's own fields written on end_turn itself, not inside asks. The
+// schema lets unknown keys through, so they were dropped without a word: on
+// 19 Nov a thread answering the reply-asks nudge sent { needs: "you", ask,
+// options } and its two questions came out as a "Needs you" with no card at
+// all (thread f0dd80e2). Refused, naming where they go.
+const ASK_FIELDS = ['ask', 'question', 'action', 'why', 'options', 'suggested'];
+export function strayAskFields(input: unknown): string[] {
+  if (!input || typeof input !== 'object') return [];
+  const o = input as Record<string, unknown>;
+  return ASK_FIELDS.filter((k) => o[k] !== undefined);
+}
+export function strayAskProblem(fields: string[], oneReply: boolean): string {
+  const named = fields.map((f) => `\`${f}\``).join(', ');
+  const inside = oneReply ? 'asks: [{ question, options: [{ label, does }] }]' : 'asks: [{ action, why, options: [...] }]';
+  return `${named} ${fields.length === 1 ? "isn't one of end_turn's own fields" : "aren't end_turn's own fields"}, so the card would have no ask. Each ask goes inside asks, one object per thing to answer: ${inside}.`;
+}
+
 export function endTurnMisfit(problem: string, oneReply: boolean): string {
   const shape = oneReply
     ? '{ headline?, needs?, asks?: { question, options?: { label, does? }[], suggested?, links? }[], next?, archive?, snooze?, waitFor? }, then write your reply after it, as ordinary text: that reply is the only text the user sees from the turn.'
@@ -907,7 +1037,7 @@ export function replyAsksNudge(sentence: string): string {
   const quoted = sentence.length > 160 ? `${sentence.slice(0, 160)}…` : sentence;
   return (
     `${REPLY_ASKS} ("${quoted}"), but your end_turn said nothing is needed, so the thread shows as done with no card to answer on. ` +
-    'If you need their answer before you can go on, call end_turn again now with needs "you" and that as its ask, with its likely answers as options (a go-ahead takes "Go" and "Not yet"). ' +
+    'If you need their answer before you can go on, call end_turn again now with needs "you" and that question in asks, one entry per question, each with its likely answers: asks: [{ question, options: [{ label }] }] (a go-ahead takes "Go" and "Not yet"). ' +
     "Your message above is the reply: don't write it again, and write nothing else. " +
     'If it needs no answer from them, stop here with no more text.'
   );

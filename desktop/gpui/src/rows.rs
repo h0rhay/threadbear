@@ -215,7 +215,7 @@ impl ThreadPane {
             RowContent::Background(status) => self.background_row(status, cx),
             RowContent::Gap(gap) => self.gap_row(&row, gap, cx),
             RowContent::Changes(changes) => self.changes_card(ix, &row, changes, cx),
-            RowContent::LabReview(review) => self.lab_review_row(&row, review, cx),
+            RowContent::LabReview(review) => self.lab_review_row(ix, &row, review, cx),
         };
         // A step a work link went to: an accent rail and tint for a moment
         // (`TranscriptController.light`). The right-click menu goes over
@@ -403,7 +403,7 @@ impl ThreadPane {
                 None => ("Sent by a schedule".to_owned(), message.text.clone()),
             }
         } else {
-            ("Sent by the runner after it restarted".to_owned(), message.text.clone())
+            (message.runner_header(), message.text.clone())
         };
         if message.is_from_schedule() {
             // Clock glyph in the text's place (`symbol("clock", ...)`).
@@ -485,8 +485,12 @@ impl ThreadPane {
             .plugin(chips)
             // The live mark before a link to another thread (`with_link_marks`).
             .plugin(crate::thread_link_marks::Marks)
+            // A PR's state before a link to it (pr_view.rs).
+            .plugin(crate::pr_view::PrMarks)
             // A closed ```mermaid or ```html fence as what it shows (rich_boxes.rs).
             .plugin(crate::rich_boxes::RichBoxes)
+            // A live page's card (live_pages.rs).
+            .plugin(crate::live_pages::Cards)
     }
 
     /// The reading column's text: markdown, selectable, links going where they
@@ -497,7 +501,9 @@ impl ThreadPane {
         // A link to a file that isn't here as its words (`dead_file_links`).
         // After `prepare`, which links paths in backticks: a dead one of those
         // goes back to plain code too.
-        let source = markdown::dead_file_links(&markdown::prepare(&markdown::pictures(&item.text, local), &self.summary.id), local).into_owned();
+        // A page shown in the reply as a live page's card (live_pages.rs), first.
+        let text = if local && crate::live_pages::on(cx) { markdown::live_pages(&item.text) } else { std::borrow::Cow::Borrowed(item.text.as_str()) };
+        let source = markdown::dead_file_links(&markdown::prepare(&markdown::pictures(&text, local), &self.summary.id), local).into_owned();
         // Thread ids as chips (chips.rs), and a live mark before each link
         // to another thread (thread_link_marks.rs).
         let source = self.with_thread_chips(source, cx);

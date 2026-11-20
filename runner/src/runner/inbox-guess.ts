@@ -17,7 +17,7 @@
 // only collects, as he suggested: when one of his threads finishes with
 // nothing for him, a cheap model and a strong one each guess whether he
 // needed to see it, and the done card's Archive opens a menu ("Didn't
-// need this", "Glad I saw this") whose pick says who was right. Both go in
+// need this", "Glad I saw this", "Not sure") whose pick says who was right. Both go in
 // a file, one line each. The guess archives nothing and shows nowhere.
 // The check-in (the experiment's reminder) reads the file and asks him
 // what to do with it.
@@ -37,6 +37,10 @@ export const INBOX_GUESS = 'inboxGuess';
 export const INBOX_GUESS_FILE = 'inbox-guess.jsonl';
 // The most of his message and of the reply a model is shown. A longer
 // reply keeps its start and its end, where the result and the caveats are.
+// A runner starting makes the guess for a thread that finished this
+// recently with none (catchUpInboxGuess): not for every finished thread in
+// the inbox, which would be a model call each at every start.
+export const GUESS_CATCH_UP_MS = 60 * 60_000;
 const ASKED_CHARS = 4_000;
 const REPLY_CHARS = 8_000;
 
@@ -47,8 +51,11 @@ export type Guess = { by: string; skip: boolean; why: string };
 // written down beside the guesses it answers.
 export type InboxGuess = { seq: number; guesses: Guess[] };
 
-// Mike's two answers from the Archive menu, as the file's `label`.
-const LABELS: Partial<Record<ArchiveVerdict, 'skip' | 'show'>> = { didntNeedToSee: 'skip', gladISaw: 'show' };
+// Mike's answers from the Archive menu, as the file's `label`. "Not sure"
+// (added 19 Nov: "sometimes like an in-betweeny where I'm not sure whether
+// it's valuable that I saw it") is `unsure`, so scoring leaves it out: it
+// mustn't teach a model to hide that kind of thread, nor count as a miss.
+const LABELS: Partial<Record<ArchiveVerdict, 'skip' | 'show' | 'unsure'>> = { didntNeedToSee: 'skip', gladISaw: 'show', notSure: 'unsure' };
 
 export const GUESS_SYSTEM = `You help the user of Threadbear, an app that runs AI coding agents in threads, keep their inbox short. A thread's agent has just finished a turn and says it needs nothing more from the user. Decide whether the user needs to see its reply, or whether the thread could have gone straight to the archive unread.
 
@@ -104,9 +111,13 @@ export const inboxGuessPart = {
     const { rec, rt } = st;
     try {
       if (!experimentOn(this.cfg.home, INBOX_GUESS)) return;
-      // A helper nobody's touched archives itself, and so does another
-      // lab's review of a change: there's nothing to learn from either.
-      if (rec.reviewOf || this.helperNobodyTouched(st)) return;
+      // Another lab's review of a change archives itself: nothing to learn.
+      if (rec.reviewOf) return;
+      // So does a helper nobody's touched, when it finishes clean
+      // (quiet-inbox.ts). One that stays, for its follow-ups or something
+      // left open, is in his inbox like any other, and he answers for it
+      // (two of his first sixteen answers, 19 Nov): the rule below says so.
+      const helper = this.helperNobodyTouched(st);
       const seq = this.looseEndsCard(st);
       if (seq === undefined) return;
       let guesses: Guess[];
@@ -119,6 +130,7 @@ export const inboxGuessPart = {
         // there's no done card to guess about, so no model is asked.
         if (rt.deleted || this.stopping || this.looseEndsCard(st) !== seq) return;
         if (ends.length) guesses = [{ by: 'rule', skip: false, why: 'Something is still open or booked.' }];
+        else if (helper) return;
         else guesses = await this.askInboxGuess(st, reply);
       }
       // A new turn, or him putting it away, while the models thought: the
@@ -129,6 +141,45 @@ export const inboxGuessPart = {
       this.writeInboxGuess({ kind: 'guess', threadId: rec.id, seq, guesses });
     } catch (e) {
       this.log.warn('inbox guess failed', { threadId: rec.id, error: String(e) });
+    }
+  },
+
+  // The guess a finished thread's done card is missing, made by the runner
+  // that takes the thread on. A guess takes a few seconds (git, then two
+  // models), and a runner handing over to a new release lets a thread go
+  // half a second after its turn ends, so the guess being made there is
+  // lost (guessInbox writes nothing once the thread has gone): seven of
+  // Mike's first sixteen answers had no guess beside them (19 Nov 2026).
+  // Called as a thread is adopted, and at start for threads that finished
+  // within `within` (GUESS_CATCH_UP_MS), which covers one that was idle
+  // when the old runner let everything go, or stopped. What was said comes
+  // from the log: the card's turn.completed has the follow-ups, and the
+  // turn's last text is the reply.
+  catchUpInboxGuess(this: Runner, st: ThreadState, within?: number): void {
+    const { rec } = st;
+    try {
+      // `finished`: its last turn ended for good, with no review to come
+      // (markFinished), which is when completeTurn would have guessed.
+      if (!rec.finished || this.bucket(rec) !== 'inbox') return;
+      const seq = this.looseEndsCard(st);
+      if (seq === undefined || rec.inboxGuess?.seq === seq) return;
+      if (within !== undefined && this.clock.now() - Date.parse(rec.finished.at) > within) return;
+      if (!experimentOn(this.cfg.home, INBOX_GUESS)) return;
+      const log = this.store.log(rec.id);
+      const done = log.read(seq, seq)[0];
+      if (done?.type !== 'turn.completed') return;
+      let reply: string | undefined;
+      for (let to = seq - 1; to >= 1 && reply === undefined; to -= 200) {
+        const page = log.read(Math.max(1, to - 199), to);
+        for (let i = page.length - 1; i >= 0 && reply === undefined; i--) {
+          const e = page[i];
+          if (e.type === 'assistant.text' && e.turnId === done.turnId) reply = e.text;
+          else if (e.type === 'turn.started' && e.turnId === done.turnId) reply = '';
+        }
+      }
+      void this.guessInbox(st, reply || rec.finished.reply || '', Boolean(done.next?.length));
+    } catch (e) {
+      this.log.warn('inbox guess catch-up failed', { threadId: rec.id, error: String(e) });
     }
   },
 

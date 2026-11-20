@@ -6,8 +6,9 @@ import { ConvexError, v } from 'convex/values';
 import { internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
 import { internal } from './_generated/api';
-import { messageButton, threadFields, views } from './schema';
+import { messageButton, threadFields, updateFailedValidator, views } from './schema';
 import { API_VERSION } from './version';
+import { endpointProblem } from './webPushEndpoint';
 import { clear, command, machines } from './machines';
 import { CLEAR_RETRY_MS, clearStateFrom } from './clearStates';
 import { steppingFor } from './stepping';
@@ -511,6 +512,7 @@ export const RUNNER_KEY_CAPS = {
   accounts: 20,
   runnerField: 300, // a heartbeat's icon, version, rpcUrl
   followProblem: 800, // a heartbeat's followProblem: a sentence or two
+  updateFailed: 2400, // a heartbeat's updateFailed error: the build's last word
   note: 500, // a schedule run's note
 } as const;
 const CAP = RUNNER_KEY_CAPS;
@@ -534,11 +536,14 @@ export const PICTURE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'i
 const PICTURE_PATH = 2_048;
 const PICTURE_SIDE = 100_000;
 const PICTURE_INDEX = 100;
-function checkPicture(caller: Caller, img: { seq: number; index?: number; path?: string; src?: string; mediaType: string; width?: number; height?: number }): void {
+// A reply's media also takes a live page (API 95, the livePages experiment):
+// stored as plain bytes, run only in the apps' sealed views.
+export const REPLY_TYPES = new Set([...PICTURE_TYPES, 'text/html']);
+function checkPicture(caller: Caller, img: { seq: number; index?: number; path?: string; src?: string; mediaType: string; width?: number; height?: number }, types: Set<string> = PICTURE_TYPES): void {
   if (caller.owner) return;
   const whole = (n: number, lo: number, hi: number) => Number.isSafeInteger(n) && n >= lo && n <= hi;
   const bad = (what: string) => new ConvexError({ kind: 'badArgs', message: `a picture's ${what} isn't one a runner key may write` });
-  if (!PICTURE_TYPES.has(img.mediaType)) throw bad('type');
+  if (!types.has(img.mediaType)) throw bad('type');
   if (!isSeq(img.seq)) throw bad('seq');
   if (img.index !== undefined && !whole(img.index, 0, PICTURE_INDEX)) throw bad('index');
   for (const side of [img.width, img.height]) if (side !== undefined && !whole(side, 1, PICTURE_SIDE)) throw bad('size');
@@ -1101,10 +1106,15 @@ export const sendStaleHeldPushes = internalMutation({
 });
 
 export const removeThreads = mutation({
-  args: { key: v.string(), threadIds: v.array(v.string()) },
+  // `runnerId` (API 92): the runner whose threads went. A row that's
+  // another runner's is left alone, whatever the key: the main Mac's owner
+  // key removed threads it had moved to another Mac, their rows there and
+  // all (David Clark's fork, 16 Nov 2026).
+  args: { key: v.string(), threadIds: v.array(v.string()), runnerId: v.optional(v.string()) },
   returns: v.null(),
-  handler: async (ctx, { key, threadIds }) => {
+  handler: async (ctx, { key, threadIds, runnerId }) => {
     const caller = await runnerAuth(ctx, key, 'removeThreads');
+    if (runnerId !== undefined) await actAs(ctx, caller, runnerId);
     for (const threadId of threadIds) {
       const row = await ctx.db
         .query('threads')
@@ -1112,6 +1122,7 @@ export const removeThreads = mutation({
         .unique();
       // A runner key leaves alone what isn't its own thread, there or not (ownThread).
       if (!caller.owner && !(row && mayTouch(caller, row.runnerId, threadId))) continue;
+      if (runnerId !== undefined && row && row.runnerId !== runnerId) continue;
       await archiveSoon(ctx, threadId);
       await dropThread(ctx, threadId, row, !caller.box);
     }
@@ -1153,7 +1164,7 @@ export const addReplyImage = mutation({
   returns: pictureAnswer,
   handler: async (ctx, { key, ...sent }) => {
     const caller = await runnerAuth(ctx, key, 'addReplyImage');
-    checkPicture(caller, sent);
+    checkPicture(caller, sent, REPLY_TYPES);
     const img = clean(sent);
     const mine = await ownThread(ctx, caller, img.threadId);
     await mustMayUseStorage(ctx, caller, img.storageId);
@@ -1331,9 +1342,13 @@ export const heartbeat = mutation({
       rpcUrl: v.optional(v.string()),
       pressure: v.optional(v.union(v.literal('memory'), v.literal('disk'))),
       followProblem: v.optional(v.string()),
+      updateFailed: v.optional(updateFailedValidator),
       // A box's: the provider's id for the machine it runs on (boxes.ts exchange's `machineId`).
       machineId: v.optional(v.string()),
     }),
+    // A box stopped by its save (runner/src/box-save.ts SaveHold): this
+    // heartbeat makes no work, so it doesn't mark the box as holding any.
+    held: v.optional(v.boolean()),
   },
   // The backend's API version (version.ts), so the runner can tell when it's
   // talking to an older backend than it was built for. firstSeen (API 37):
@@ -1350,9 +1365,13 @@ export const heartbeat = mutation({
     ownerKeyRotating: v.optional(v.boolean()),
     pushOff: v.optional(v.boolean()),
     pushFailing: v.optional(v.object({ failure: v.string(), since: v.number(), failed: v.number(), via: v.union(v.literal('apple'), v.literal('relay')) })),
+    // A box's key only: its box's state as this heartbeat found it, which a
+    // box stopped by its save waits on (`awake`) before it runs again
+    // (runner/src/box-save.ts SaveHold).
+    box: v.optional(v.object({ state: v.string() })),
   }),
-  handler: async (ctx, { key, runner }) => {
-    const caller = await runnerAuth(ctx, key, 'heartbeat');
+  handler: async (ctx, { key, runner, held }) => {
+    const caller = await runnerAuth(ctx, key, 'heartbeat', { housekeeping: held === true });
     runner = clean(runner);
     // A runner key heartbeats as its own runner only: the row has the
     // rpcUrl other Macs' apps dial.
@@ -1361,6 +1380,16 @@ export const heartbeat = mutation({
     // refused heartbeat would leave that Mac showing offline.
     if (!caller.owner) for (const field of ['version', 'release', 'startedAt', 'icon', 'rpcUrl'] as const) if (typeof runner[field] === 'string') (runner as Record<string, unknown>)[field] = cutBytes(runner[field], CAP.runnerField);
     if (!caller.owner && runner.followProblem !== undefined) runner = { ...runner, followProblem: cutBytes(runner.followProblem, CAP.followProblem) };
+    // A box doesn't follow main, so has no update to fail; a runner key's is
+    // cut to fit like the rest. The main Mac checks it against its own repo
+    // before acting on it (runner/src/fix-update.ts).
+    if (caller.box) {
+      const { updateFailed: _u, ...rest } = runner;
+      runner = rest;
+    } else if (!caller.owner && runner.updateFailed) {
+      const u = runner.updateFailed;
+      runner = { ...runner, updateFailed: { kind: u.kind, commit: cutBytes(u.commit, 64), subject: cutBytes(u.subject, CAP.runnerField), error: cutBytes(u.error, CAP.updateFailed), logFile: cutBytes(u.logFile, CAP.runnerField) } };
+    }
     // The Mac app reads startedAt as a time and the count as a number, so
     // anything else is left out rather than passed on (an offset of
     // "+////" once crashed the app's date parser; Daybreak, 7 Nov 2026).
@@ -1432,7 +1461,7 @@ export const heartbeat = mutation({
       }
     }
     const failing = caller.owner ? pushFailing(await ctx.db.query('pushHealth').first(), Date.now()) : null;
-    return { apiVersion: API_VERSION, ...(existing ? {} : { firstSeen: true }), ...(caller.owner && process.env.RUNNER_KEY_NEXT ? { ownerKeyRotating: true } : {}), ...(caller.owner && pushOff(process.env) ? { pushOff: true } : {}), ...(failing ? { pushFailing: failing } : {}) };
+    return { apiVersion: API_VERSION, ...(existing ? {} : { firstSeen: true }), ...(caller.owner && process.env.RUNNER_KEY_NEXT ? { ownerKeyRotating: true } : {}), ...(caller.owner && pushOff(process.env) ? { pushOff: true } : {}), ...(failing ? { pushFailing: failing } : {}), ...(boxRow ? { box: { state: boxRow.boxState.kind } } : {}) };
   },
 });
 
@@ -1990,6 +2019,10 @@ const accountDoc = v.object({
   // API 20: what the phone's new thread pickers offer.
   models: v.optional(v.array(v.object({ id: v.string(), title: v.string(), effortLevels: v.optional(v.array(v.string())), defaultEffort: v.optional(v.string()) }))),
   defaultEffort: v.optional(v.string()),
+  // API 91: a Claude login's sign-in, for the Mac's Runners panel.
+  loginEndsAt: v.optional(v.string()),
+  signedOut: v.optional(v.boolean()),
+  yearToken: v.optional(v.object({ madeAt: v.optional(v.string()) })),
   usage: v.optional(
     v.object({
       windows: v.array(v.object({ kind: v.string(), title: v.string(), remainingPercent: v.number(), resetsAt: v.optional(v.string()), detail: v.optional(v.string()) })),
@@ -3180,11 +3213,17 @@ const NOTE_MAX = 4_000;
 export const finishCommand = mutation({
   // result (API 44): a `call`'s answer as JSON text, kept only for one
   // (relay.ts), at most RESULT_MAX_BYTES. Text, so its size is what's stored.
-  args: { key: v.string(), commandId: v.id('commands'), ok: v.boolean(), note: v.optional(v.string()), resultThreadId: v.optional(v.string()), result: v.optional(v.string()) },
+  // held: a box finishing its `save` while the save holds it, which makes no
+  // work (lib.ts runnerAuth housekeeping); only for a `save` command.
+  args: { key: v.string(), commandId: v.id('commands'), ok: v.boolean(), note: v.optional(v.string()), resultThreadId: v.optional(v.string()), result: v.optional(v.string()), held: v.optional(v.boolean()) },
   returns: v.null(),
-  handler: async (ctx, { key, commandId, ok, note, resultThreadId, result }) => {
-    const caller = await runnerAuth(ctx, key, 'finishCommand');
+  handler: async (ctx, { key, commandId, ok, note, resultThreadId, result, held }) => {
+    // Read before the gate, which marks a box's call as work: a finish that
+    // changes nothing (its command already ended, or never taken: a repeat,
+    // a retry racing the first) makes none, nor does a held box's save's.
     const c = await ctx.db.get(commandId);
+    const ends = c !== null && (c.commandState.kind === 'taken' || c.commandState.kind === 'lapsed');
+    const caller = await runnerAuth(ctx, key, 'finishCommand', { housekeeping: !ends || (held === true && c?.kind === 'save') });
     if (!c) return null;
     if (!mayFinish(caller, c)) throw forbidden("finish that command: it isn't for its runner");
     // Only a taken command finishes, or one whose lease ran out, which its
@@ -3718,6 +3757,7 @@ const LIMITS_STARTED = 'limits-2026-11-07';
 const LIMITS_DONE = 'limits-2026-11-07-done';
 const MIGRATE_PAGE = 8;
 const APNS_TOKEN = /^[0-9a-fA-F]{16,200}$/;
+const FCM_TOKEN = /^[A-Za-z0-9_:-]{20,4096}$/;
 const MAX_DEVICES_PER_TOKEN = 5;
 async function markSet(ctx: QueryCtx | MutationCtx, name: string): Promise<boolean> {
   return (await ctx.db.query('backendMarks').withIndex('by_name', (q) => q.eq('name', name)).first()) !== null;
@@ -3745,7 +3785,12 @@ export const limitsMigration = internalMutation({
     for (const row of page.page as Record<string, any>[]) {
       if (what === 'devices') {
         // Junk, or from before tokenId (they get no pushes: pushTargets.ts; devices:dropUnlinked).
-        if (!row.tokenId || !APNS_TOKEN.test(row.apnsToken) || (row.pushKey !== undefined && row.pushKey.length > 100) || utf8Bytes(row.tokenName) > 200) await ctx.db.delete(row._id);
+        // An Android phone's token isn't hex (a Firebase token, or a UnifiedPush
+        // endpoint for the F-Droid build), so each kind is checked as
+        // phone:registerDevice checks it (this deleted every Android phone's
+        // row before 19 Nov 2026).
+        const tokenOk = row.platform === 'android' ? FCM_TOKEN.test(row.apnsToken) : row.platform === 'webpush' ? endpointProblem(row.apnsToken) === null : APNS_TOKEN.test(row.apnsToken);
+        if (!row.tokenId || !tokenOk || (row.pushKey !== undefined && row.pushKey.length > 100) || utf8Bytes(row.tokenName) > 200) await ctx.db.delete(row._id);
       } else if (what === 'deviceCap') {
         // Past a token's newest MAX_DEVICES_PER_TOKEN (phone.ts registerDevice); small rows by now.
         const newest = row.tokenId ? await ctx.db.query('devices').withIndex('by_tokenId', (x) => x.eq('tokenId', row.tokenId)).order('desc').take(MAX_DEVICES_PER_TOKEN) : [];
@@ -3879,7 +3924,7 @@ export const setThreadIndex = mutation({
 // the runner counts it reachable while it sleeps or starts (decision 6), and
 // `waiting` while a message wants it woken but its virtual runner has
 // maxBoxes up (boxes.ts wakeFor).
-const remoteRunner = v.object({ runnerId: v.string(), name: v.string(), icon: v.optional(v.string()), lastSeenAt: v.number(), rpcUrl: v.optional(v.string()), followProblem: v.optional(v.string()), box: v.optional(v.object({ state: v.string(), waiting: v.optional(v.boolean()), unreachable: v.optional(v.boolean()), unsure: v.optional(v.boolean()) })) });
+const remoteRunner = v.object({ runnerId: v.string(), name: v.string(), icon: v.optional(v.string()), lastSeenAt: v.number(), rpcUrl: v.optional(v.string()), followProblem: v.optional(v.string()), updateFailed: v.optional(updateFailedValidator), box: v.optional(v.object({ state: v.string(), waiting: v.optional(v.boolean()), unreachable: v.optional(v.boolean()), unsure: v.optional(v.boolean()), service: v.optional(v.string()), token: v.optional(v.union(v.literal('none'), v.literal('dead'))), login: v.optional(v.string()) })) });
 
 async function otherRunners(ctx: QueryCtx, runnerId: string) {
   const runners = [];
@@ -3892,15 +3937,28 @@ async function otherRunners(ctx: QueryCtx, runnerId: string) {
       ...(r.icon !== undefined ? { icon: r.icon } : {}),
       ...(r.rpcUrl !== undefined ? { rpcUrl: r.rpcUrl } : {}),
       ...(r.followProblem !== undefined ? { followProblem: r.followProblem } : {}),
+      ...(r.updateFailed !== undefined ? { updateFailed: r.updateFailed } : {}),
       ...(r.box ? { box: await boxSummary(ctx, r) } : {}),
     });
   }
   return runners;
 }
 
-async function boxSummary(ctx: QueryCtx, r: Doc<'runners'>): Promise<{ state: string; waiting?: boolean }> {
+// A box's state as the Mac's sidebar shows it. From API 94 its virtual
+// runner (`service`), and `token` with its `login` when the login has no
+// cloud token ('none') or a refused one ('dead'): the thread's token card.
+async function boxSummary(ctx: QueryCtx, r: Doc<'runners'>): Promise<{ state: string; waiting?: boolean; service?: string; token?: 'none' | 'dead'; login?: string }> {
   const row = await boxOfRunner(ctx, r);
-  return { state: row?.boxState.kind ?? 'expired', ...(row?.wantsWakeAt !== undefined || row?.waitsForHours !== undefined ? { waiting: true } : {}), ...(row?.unreachableSince !== undefined ? { unreachable: true } : {}), ...(row?.unsure?.surfaced ? { unsure: true } : {}) };
+  const token = row ? await ctx.db.query('cloudTokens').withIndex('by_login', (q) => q.eq('login', row.login)).unique() : null;
+  const missing = !row ? undefined : !token ? ('none' as const) : token.tokenState.kind === 'dead' ? ('dead' as const) : undefined;
+  return {
+    state: row?.boxState.kind ?? 'expired',
+    ...(row?.wantsWakeAt !== undefined || row?.waitsForHours !== undefined || row?.boxState.kind === 'waitingForRoom' ? { waiting: true } : {}),
+    ...(row?.unreachableSince !== undefined ? { unreachable: true } : {}),
+    ...(row?.unsure?.surfaced ? { unsure: true } : {}),
+    ...(row ? { service: row.serviceId as string } : {}),
+    ...(missing ? { token: missing, login: row!.login } : {}),
+  };
 }
 
 // API 29: the other runners on their own, so a heartbeat re-runs only this

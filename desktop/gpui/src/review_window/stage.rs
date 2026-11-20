@@ -245,7 +245,9 @@ impl ReviewWindow {
             .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| this.stage_scrolled(ev, cx)))
             .on_pinch(cx.listener(|this, ev: &PinchEvent, _, cx| this.stage_pinched(ev, cx)))
             .child(
+                // With an id, so a GIF option plays (files.rs, the pane's picture).
                 img(crate::rows::markdown::file_picture(&path))
+                    .id(SharedString::from(format!("stage-picture-{path}")))
                     .absolute()
                     .left(pt(image.x))
                     .top(pt(image.y))

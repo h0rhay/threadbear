@@ -36,6 +36,19 @@ type Entry = { pid: number; command: string; startedAt: string; lstart?: string;
 // started later, as it can only be one that got the CLI's pid after the CLI
 // went (Codex's second review: checked after assigning, it was too late to
 // take the process out of the job).
+// How far past now a CLI's start may read and still be the CLI: Windows
+// stamped CLIs up to 1.2 ms after node's Date.now() (19 Nov). add() doesn't
+// return until node's clock is NOT_AFTER_MARGIN_MS past it, and the pid can
+// only go to another process once the event loop has seen the CLI exit
+// (libuv lets go of the handle then, not later: Codex's review, 19 Nov), so
+// a process that got the pid started after notAfter whichever clock says.
+const NOT_AFTER_SLACK_MS = 20;
+const NOT_AFTER_MARGIN_MS = 5;
+// Holds the thread, event loop included, until Date.now() reaches ms.
+export function sleepUntil(ms: number): void {
+  const wait = ms - Date.now();
+  if (wait > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
+}
 export type JobControl = { assign(pid: number, name: string, notAfter: string): Promise<string>; end(name: string): Promise<unknown>; forget(name: string): Promise<unknown> };
 
 export const helperJobs: JobControl = {
@@ -133,12 +146,16 @@ export class ProcessRegistry {
     // in its job. Never the runner itself (tests register their own process).
     const job = this.jobs && pid !== process.pid ? newJobName() : undefined;
     // The CLI started before now, and its pid can't have gone to anything
-    // else yet: the runner holds the child until it has seen it exit, which
-    // can't happen before this returns. So anything with that pid that
-    // started after now isn't it (no slack: Codex's third review). Now is
-    // rounded up to the next millisecond, as Date.now() rounds down and the
-    // CLI can have started earlier in the same one.
-    const notAfter = ((BigInt(Date.now()) + 1n + FILETIME_AT_UNIX_EPOCH_MS) * 10_000n).toString();
+    // else yet: the event loop has to see the CLI exit first, which can't
+    // happen before this returns. So anything with that pid that started
+    // after now isn't it (Codex's third review). Now goes forward by
+    // NOT_AFTER_SLACK_MS, as node's clock isn't the one Windows stamps a
+    // process's start with: on the Windows box a CLI that started before
+    // Date.now() was read was stamped up to 1.2 ms after it, and its job was
+    // refused about half the time (19 Nov). The wait at the end keeps the
+    // slack from letting in a process that got the pid.
+    const notAfterMs = Date.now() + NOT_AFTER_SLACK_MS;
+    const notAfter = ((BigInt(notAfterMs) + FILETIME_AT_UNIX_EPOCH_MS) * 10_000n).toString();
     const assigned = job ? this.jobs!.assign(pid, job, notAfter) : undefined;
     // Taken before the probe, which can take a while: the process was started
     // moments ago, so on Windows this stands in for its start time if
@@ -157,6 +174,9 @@ export class ProcessRegistry {
     this.entries.set(pid, entry);
     this.save();
     if (job && assigned) this.settleJob(entry, job, assigned, notAfter);
+    // The probe takes PowerShell's start, far longer than this, unless it
+    // failed fast; then hold the runner the rest of the way.
+    if (job) sleepUntil(notAfterMs + NOT_AFTER_MARGIN_MS);
     this.scanTimer ??= setInterval(() => void this.scan(), SCAN_MS).unref();
   }
 

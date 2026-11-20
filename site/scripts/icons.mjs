@@ -2,6 +2,8 @@
 // Writes the Phosphor icons the site uses (regular weight unless it says, MIT, LICENSE-Phosphor) into
 // src/icons as plain SVGs, from any @phosphor-icons/react install on this Mac. Only needed when
 // adding an icon: the SVGs are committed. `node scripts/icons.mjs <path to @phosphor-icons/react>`
+// The agent-*.svg logos (the hero line) are not Phosphor's and not written here: they are LobeHub's
+// icons (MIT), copied from the desktop app's desktop/gpui/src/icons.rs.
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -18,6 +20,8 @@ const ICONS = {
   // apple-logo.svg isn't made here: Phosphor's filled apple has a flat bottom that looks cut off,
   // so it's Simple Icons' Apple mark (CC0), padded to Phosphor's margins by hand.
   "windows-logo": ["WindowsLogo", "fill"], "linux-logo": ["LinuxLogo", "fill"],
+  // The Android badge beside the App Store one in the install section.
+  "android-logo": ["AndroidLogo", "fill"],
   // The docs pages' own icons (site/docs-icons.json).
   "chats-circle": "ChatsCircle", "paper-plane-tilt": "PaperPlaneTilt", "archive": "Archive", "push-pin": "PushPin",
   "stack": "Stack", "clock": "Clock", "users-three": "UsersThree", "keyboard": "Keyboard", "flask": "Flask",

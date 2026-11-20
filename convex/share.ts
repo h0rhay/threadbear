@@ -112,13 +112,16 @@ export const phoneImage = v.object({
   url: v.string(),
   width: v.optional(v.number()),
   height: v.optional(v.number()),
+  // A reply's (API 95): what it is, so a live page (text/html, stored as
+  // plain bytes) is fetched into a sealed view rather than decoded.
+  mediaType: v.optional(v.string()),
 });
 
 export async function replyImagesFrom(ctx: QueryCtx, threadId: string, from: number, before?: number) {
   const rows = await ctx.db.query('replyImages').withIndex('by_thread_seq', (q) => (before === undefined ? q.eq('threadId', threadId).gte('seq', from) : q.eq('threadId', threadId).gte('seq', from).lt('seq', before))).order('desc').take(IMAGES_MAX);
   rows.reverse();
   const inReplies = new Set(rows.filter((r) => r.src).map((r) => r.path));
-  const out: { seq: number; src?: string; pinned?: boolean; url: string; width?: number; height?: number }[] = [];
+  const out: { seq: number; src?: string; pinned?: boolean; url: string; width?: number; height?: number; mediaType?: string }[] = [];
   for (const img of rows) {
     // A design review's still (API 86) is phone:reviewImages', not the thread's.
     if (img.src?.startsWith('review:')) continue;
@@ -128,7 +131,7 @@ export async function replyImagesFrom(ctx: QueryCtx, threadId: string, from: num
     }
     const url = await ctx.storage.getUrl(img.storageId);
     if (!url) continue;
-    out.push({ seq: img.seq, ...(img.src ? { src: img.src } : {}), ...(img.pinned ? { pinned: true } : {}), url, ...(img.width ? { width: img.width } : {}), ...(img.height ? { height: img.height } : {}) });
+    out.push({ seq: img.seq, ...(img.src ? { src: img.src } : {}), ...(img.pinned ? { pinned: true } : {}), url, ...(img.width ? { width: img.width } : {}), ...(img.height ? { height: img.height } : {}) , mediaType: img.mediaType });
   }
   return out;
 }

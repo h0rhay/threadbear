@@ -534,7 +534,7 @@ fn step(app: &Entity<Threadbear>, cmd: &Value, window: &mut Window, cx: &mut App
         "archive" | "snooze" if cmd.get("id").is_some() || cmd.get("said").is_some() => crate::sidebar::automation(app, cmd, window, cx),
         "click" if cmd.get("tip").is_some() || cmd.get("tipPrefix").is_some() => crate::sidebar::automation(app, cmd, window, cx),
         // The pane beside the thread (highlights.rs): the Swift app's names.
-        "preview" | "folder" | "highlight" | "trust" | "action" | "project-why" => crate::highlights::automation(app, cmd, window, cx),
+        "preview" | "folder" | "highlight" | "trust" | "action" | "switch" | "project-why" => crate::highlights::automation(app, cmd, window, cx),
         "expand" | "collapse" if cmd.get("highlightSection").is_some() => crate::highlights::automation(app, cmd, window, cx),
         "viewer" => {
             let side = app.read(cx).side.clone();
@@ -602,8 +602,8 @@ fn step(app: &Entity<Threadbear>, cmd: &Value, window: &mut Window, cx: &mut App
         "tile" => {
             let index = cmd["index"].as_u64().unwrap_or(0) as usize;
             let count = cmd["count"].as_u64().unwrap_or(1) as usize;
-            let images = app.update(cx, |t, cx| t.update_pane(cx, |p, _| p.last_row_images(count)))??;
-            crate::viewer::open_from_tile(&images, index, window, cx);
+            let (images, runner) = app.update(cx, |t, cx| t.update_pane(cx, |p, _| p.last_row_images(count).map(|images| (images, p.summary.runner_id.clone()))))??;
+            crate::viewer::open_from_tile(&images, index, runner.as_deref(), window, cx);
             let side = app.read(cx).side.clone();
             crate::viewer::viewer_command(&side, &json!({}), cx)
         }
@@ -1030,6 +1030,12 @@ fn step(app: &Entity<Threadbear>, cmd: &Value, window: &mut Window, cx: &mut App
         "snooze" => {
             let seconds = cmd["seconds"].as_i64().unwrap_or(3600);
             app.update(cx, |t, cx| t.snooze_open(seconds, cx))?;
+            Ok(json!("ok"))
+        }
+        // The token card on a virtual runner's thread (token_card.rs).
+        "token-card" => {
+            let press = text(cmd, "press").to_string();
+            app.update(cx, |t, cx| t.token_card_press(&press, cx))?;
             Ok(json!("ok"))
         }
         "menu" => {

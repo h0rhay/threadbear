@@ -4,12 +4,29 @@
       "count": 2
     }
   },
-  "convex/boxes.ts": {
+  "convex/boxService.ts": {
     "@convex-dev/explicit-table-ids": {
-      "count": 6
+      "count": 44
     },
     "@convex-dev/no-collect-in-query": {
-      "count": 1
+      "count": 5
+    },
+    "@convex-dev/no-process-env": {
+      "count": 3
+    },
+    "machines/no-direct-state-writes": {
+      "count": 2
+    },
+    "mikecann-lint/prefer-kind-discriminant": {
+      "count": 7
+    }
+  },
+  "convex/boxes.ts": {
+    "@convex-dev/explicit-table-ids": {
+      "count": 20
+    },
+    "@convex-dev/no-collect-in-query": {
+      "count": 2
     },
     "@convex-dev/no-process-env": {
       "count": 1
@@ -35,7 +52,7 @@
   },
   "convex/lib.ts": {
     "@convex-dev/explicit-table-ids": {
-      "count": 2
+      "count": 3
     },
     "@convex-dev/no-process-env": {
       "count": 2
@@ -126,10 +143,10 @@
   },
   "convex/schema.ts": {
     "@convex-dev/no-duplicate-indexes": {
-      "count": 10
+      "count": 11
     },
     "machines/no-optional-on-machine-tables": {
-      "count": 45
+      "count": 61
     }
   },
   "convex/share.ts": {
@@ -162,7 +179,7 @@
       "count": 4
     },
     "machines/no-direct-state-writes": {
-      "count": 8
+      "count": 10
     }
   },
   "convex/tokens.ts": {

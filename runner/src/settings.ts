@@ -1,6 +1,6 @@
 // settings.get and settings.update (docs/protocol.md): the runner's side
 // of the Settings window. Everything lives in runner.json.
-import { DEFAULT_LAB_REVIEWERS, labReviewerProblem, parseLabReviewers, type LabReviewer } from './lab-reviewers.ts';
+import { DEFAULT_LAB_REVIEWERS, labReviewerProblem, parseLabReviewers, ticked, type LabReviewer } from './lab-reviewers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Config } from './config.ts';
@@ -34,6 +34,10 @@ export type Settings = {
   // Who reviews, in order (lab-reviewers.ts): runner.json's list, or the
   // default when it has none.
   labReviewers: LabReviewer[];
+  // Who reviews a big or risky change, all at once, and how many lines make
+  // a change big (lab-review.ts, panelChange).
+  labPanel: LabReviewer[];
+  labPanelLines: number;
   // Keep the Mac awake while threads work (keep-awake.ts). Only on a Mac:
   // left out elsewhere, so Settings shows no switch for it.
   keepAwake?: boolean;
@@ -63,6 +67,7 @@ export type SettingsUpdate = {
   oneReply?: boolean;
   labReview?: boolean;
   labReviewers?: LabReviewer[];
+  labPanel?: LabReviewer[];
   keepAwake?: boolean;
   bringIn?: BringInSetting;
   spareWeek?: boolean;
@@ -97,6 +102,8 @@ export class SettingsService {
       oneReply: this.cfg.oneReply,
       labReview: this.cfg.labReview,
       labReviewers: (this.cfg.labReviewers ?? DEFAULT_LAB_REVIEWERS).map((r) => ({ ...r })),
+      labPanel: (this.cfg.labPanel ?? []).map((r) => ({ ...r })),
+      labPanelLines: this.cfg.labPanelLines,
       ...(process.platform === 'darwin' ? { keepAwake: this.cfg.keepAwake } : {}),
       bringIn: bringInSetting(this.cfg.home),
       spareWeek: spareWeekOn(this.cfg.home),
@@ -153,6 +160,10 @@ export class SettingsService {
       this.cfg.labReviewers = u.labReviewers.map((r) => ({ ...r }));
       json.labReviewers = u.labReviewers;
     }
+    if (u.labPanel !== undefined) this.cfg.labPanel = u.labPanel.map((r) => ({ ...r }));
+    // Saved with the list too, so a runner.json still in the old form (the
+    // panel ticked in labReviewers) keeps its panel as the ticks go.
+    if (u.labPanel !== undefined || u.labReviewers !== undefined) json.labPanel = this.cfg.labPanel ?? [];
     if (u.keepAwake !== undefined) json.keepAwake = this.cfg.keepAwake = u.keepAwake;
     // Read each time it's needed (bring-in.ts), so this takes effect at once.
     if (u.bringIn !== undefined) json.releases = { ...json.releases, bringIn: u.bringIn };
@@ -211,6 +222,17 @@ export function settingsMethods(s: SettingsService): Record<string, (p: Record<s
         const problem = p.labReviewers.map(labReviewerProblem).find(Boolean);
         if (problem) throw bad(problem);
         u.labReviewers = parseLabReviewers(p.labReviewers);
+        // An app from before the two lists ticks the panel in this one.
+        if (p.labPanel === undefined) {
+          const board = ticked(p.labReviewers);
+          if (board) u.labPanel = board;
+        }
+      }
+      if (p.labPanel !== undefined) {
+        if (!Array.isArray(p.labPanel)) throw bad('labPanel must be a list');
+        const problem = p.labPanel.map(labReviewerProblem).find(Boolean);
+        if (problem) throw bad(problem.replace('labReviewers', 'labPanel'));
+        u.labPanel = parseLabReviewers(p.labPanel);
       }
       if (p.keepAwake !== undefined) {
         if (typeof p.keepAwake !== 'boolean') throw bad('keepAwake must be a boolean');

@@ -138,13 +138,50 @@ Then('the move sheet stayed closed', async function (this: ThreadbearWorld) {
   assert.ok(!d.moveSheet, 'the sheet came up');
 });
 
+// What the viewer says it shows, until it's drawn: "showing 1 of 1 <path>",
+// with `after` (" (couldn't show)") when it won't be.
+async function viewerShows(world: ThreadbearWorld, number: number, total: number, file: string, after = ''): Promise<void> {
+  let said = '';
+  for (let tries = 0; tries < 60; tries += 1) {
+    said = await world.app.do({ cmd: 'viewer' }).catch((e) => String(e));
+    if (new RegExp(`showing ${number} of ${total} .*${file.replace('.', '\\.')}${after.replace(/[()]/g, '\\$&')}$`).test(said)) return;
+    await sleep(150);
+  }
+  assert.fail(`the viewer says "${said}", not picture ${number} of ${total} ${file}${after}`);
+}
+
+async function pressChip(world: ThreadbearWorld, number: number): Promise<void> {
+  const row = await world.until('my message', (d) => d.transcript.rows.find((r) => r.kind === 'user'));
+  const said = await world.app.do({ cmd: 'peek', row: row.id, words: `Picture ${number}`, press: true });
+  assert.ok(said.includes('quicklook'), `the chip opened nothing: ${said}`);
+}
+
+Then('pressing the picture chip in my message says it couldn\'t show picture {int} of {int} {string}', async function (this: ThreadbearWorld, number: number, total: number, file: string) {
+  await pressChip(this, number);
+  await viewerShows(this, number, total, file, " (couldn't show)");
+});
+
+// A real press on the chip among the words (`peek` with `press`).
+Then('pressing the picture chip in my message opens picture {int} of {int} {string}', async function (this: ThreadbearWorld, number: number, total: number, file: string) {
+  await pressChip(this, number);
+  await viewerShows(this, number, total, file);
+});
+
+// A real click on the tile over the words, where it's drawn (`tile-point`),
+// through the window's hit testing.
+When('I click picture {int} of my message', async function (this: ThreadbearWorld, number: number) {
+  const point = await this.app.do({ cmd: 'tile-point', count: 1, index: number - 1 });
+  const [, x, y] = point.trim().split(/\s+/);
+  assert.ok(x && y, point);
+  await this.app.do({ cmd: 'click-at', x: Number(x), y: Number(y) });
+});
+
+Given("mac-mini's pasted pictures were never put up", async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'mock', method: 'remotePictures', params: { up: false } });
+});
+
 // Both apps' `tiles`: what each picture of the message says when it isn't
 // drawn ("Couldn't get it from mac-mini"), "picture" when it is.
-Then('pressing the picture chip in my message opens nothing', async function (this: ThreadbearWorld) {
-  const row = await this.until('my message', (d) => d.transcript.rows.find((r) => r.kind === 'user'));
-  const said = await this.app.do({ cmd: 'peek', row: row.id, words: 'Picture 1', press: true }).then((r) => `ok ${r}`, (e) => String(e));
-  assert.ok(!said.includes('quicklook'), `the chip opened something: ${said}`);
-});
 
 Then('the pictures of my message say {string}', async function (this: ThreadbearWorld, words: string) {
   await this.until('a message with pictures', (d) => d.transcript.rows.some((r) => r.kind === 'user'));

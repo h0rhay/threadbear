@@ -162,7 +162,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `transcript.tooloutput` | Tool output styling | Numbered lines, field lists, only error lines red | Drawn monospaced lines. | build | M | `RowRenderer` (`numbered`, `fieldsText`) |
 | `transcript.heldback` | Held-back output | Fetches another runner's tool body when opened | Fetch on expand. | build | S | `TranscriptController` |
 | `transcript.diff` | Diff row | +N -M line, opens with a preview, Show N more lines, up to 1500 | Drawn line fills from `DiffBuilder`, with per-line layout caching for long diffs. | build | M | `RowRenderer` (`diffText`), `DiffBuilder` |
-| `transcript.images` | Images row | Layer grid, Quick Look on click, drag out | Drawn grid with decoding off the main thread, opening `file.quicklook`'s in-app viewer, and drag out through `drag.fileout`. | build | M | `Thumbnails` (`ImageGridView`), `Cells` |
+| `transcript.images` | Images row | Layer grid, Quick Look on click, drag out | Drawn grid with decoding off the main thread, opening `file.quicklook`'s in-app viewer, and drag out through `drag.fileout`. Another Mac's pictures come through the runner (`remote_pictures.rs`) and open in the viewer from there too. | build | M | `Thumbnails` (`ImageGridView`), `Cells` |
 | `transcript.approval` | Approval card | Whole command or diff, Allow, Always allow, Deny, Return allows | Drawn card with key handling. | build | M | `Cells` (`ApprovalRowCell`), `RowRenderer` |
 | `transcript.approval.stacked` | Stacked approval | Several calls, tick and cross on each, Allow N, Deny all | Drawn card. | build | M | `Cells`, `RowRenderer` (`StackedApproval`) |
 | `transcript.invisiblechars` | Invisible-character display | Writes `⟨U+2028⟩` in cards | Port `CardText`, a security display rule. | build | S | `CardText` |
@@ -209,7 +209,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `rich.threadchips` | Thread chips | Ids become chips, hover card, click opens | Drawn chip with `Popover` card, depending on `foundation.richtext` for inline placement. | build | S | `ThreadChips`, `ThreadRefs` |
 | `rich.threadlinkmarks` | Thread link marks | A link to another thread in a reply has a mini tile of it before it: an arc while it works, an orange badge when it needs you, red if it failed, a tick when done | Inline element from a markdown plugin (thread_link_marks.rs), live from the app's threads. GPUI only (17 Nov 2026). | build | S | none |
 | `rich.cardchips` | Card chips | Notion card mentions, click opens | Drawn chip, depending on `foundation.richtext`. | build | S | `CardChips`, `CardMentions` |
-| `rich.picturechips` | Picture chips | "Picture 1" in sent words, hover picture, click Quick Look | Drawn chip, `Popover` picture, and `file.quicklook`'s in-app viewer. | build | M | `PictureChips`, `InlinePictures` |
+| `rich.picturechips` | Picture chips | "Picture 1" in sent words, hover picture, click Quick Look | Drawn chip, `Popover` picture, and `file.quicklook`'s in-app viewer. On another Mac's thread the chip has no hover picture and opens that Mac's picture through the runner. | build | M | `PictureChips`, `InlinePictures` |
 | `rich.worklinks` | Work links | ↑ link jumps to the step | Port the link parsing and scroll to the row. | build | S | `WorkLinks`, `TranscriptController` |
 | `rich.filerefs` | File path refs | Paths in text become links, relative to the thread folder | Port the parsing and add click runs. | build | S | `FilePathRefs`, `TextKit` |
 | `rich.textservices` | Mac text services | Look Up, Translate, Writing Tools and Services for selected words | Shared selection getter, checked undoable returns, AppKit responder proxy and system popovers. Other systems omit these Mac services. | shim | M | `ComposerTextView`, `TextKit` |
@@ -480,7 +480,10 @@ Size is `none` throughout: the planning docs don't size these, and work the app 
 
 | ID | Feature | What it does | How in GPUI | Route | Size | Swift |
 |---|---|---|---|---|---|---|
-| `planned.cloud.sandboxes` | Cloud sandboxes | Runner in a throwaway VM, shown as a remote peer | Appears as another runner in the existing runner lists (not designed or built yet). | build | none | none |
+| `planned.cloud.sandboxes` | Cloud sandboxes | Runner in a throwaway VM, shown as a remote peer | Built as virtual runners (the `virtual.*` rows): one Runs on entry per virtual runner, never a box per thread in the runner lists. | build | none | none |
+| `virtual.runs-on` | Virtual runners in Runs on | A thread started on a machine of its own in the cloud (docs/virtual-runners.md) | After the machines, one entry per virtual runner (`services`), its folder and login this Mac's, sent with `serviceId`; a box's runner is never listed as a machine (`new_thread.rs`, `remote.rs`). GPUI only: the Swift app is frozen. | build | S | none |
+| `virtual.rows` | A box thread's row | Starting a machine, Waking, Asleep, Needs a cloud token | `sidebar.rs box_trailing` in core; needing a token takes the needs-you dot (`dress_box`). | build | S | none |
+| `virtual.token-card` | The token card | Make one, Paste a token, or this Mac's year-long token, in the thread | On the composer, as the limit box is (`token_card.rs`). | build | M | none |
 | `planned.schedule.anyrunner` | Any-runner schedules | First runner to reach it claims the run | A "no runner" option in `schedule.editor` (not confirmed as built). | build | none | none |
 | `planned.runner.smarterchoice` | Smarter runner choice | Picks the runner for a new thread | Changes what `composer.runner` offers (not confirmed as built). | build | none | none |
 | `planned.sync.fullconvex` | Full Convex | Drops the Tailscale link, runner tokens and pairing by token | Changes how `foundation.rpc` reaches other runners; `sync.full` exists but is off by default. | build | none | none |
@@ -492,12 +495,12 @@ Size is `none` throughout: the planning docs don't size these, and work the app 
 | `planned.exp.richblocks` | Rich blocks | Agents are told about mermaid and html blocks (standard since 10 Nov) | Needs `rich.mermaid` and `rich.html` in the web runtime and their sandbox. | web | none | none |
 | `planned.exp.schedulechecks` | Schedule checks (standard since 11 Nov) | A shell check gates a schedule run | Agents write the `check` field, and `schedule.editor` must keep it on save (unverified how saves treat a missing field). | build | none | none |
 | `planned.exp.looseends` | Loose ends (`looseEnds`) | "Still open" and "Coming back" on the done card | Added sections in `card.done`. | build | none | none |
-| `planned.exp.inboxguess` | Inbox guess (`inboxGuess`) | Not in the Swift app: its done card's Archive archives straight off | With the experiment on, the done card's Archive opens a menu, "Didn't need this" or "Glad I saw this", and sends the pick as the archive's `verdict` (`archive_from_card`). | build | none | none |
+| `planned.exp.inboxguess` | Inbox guess (`inboxGuess`) | Not in the Swift app: its done card's Archive archives straight off | With the experiment on, the done card's Archive opens a menu, "Didn't need this", "Glad I saw this" or "Not sure", and sends the pick as the archive's `verdict` (`archive_from_card`). | build | none | none |
 | `planned.exp.replybuttons` | Reply buttons | Pills in replies that agents create and update (standard since 11 Nov) | `rich.replybuttons`. | build | none | none |
 | `planned.exp.instructions` | Standing instructions | A Settings box applied to every session (standard since 11 Nov) | `settings.instructions`. | kit | none | none |
 | `planned.exp.movetorunner` | Move to runner (standard since 12 Nov) | Move a thread to another machine | `sidebar.move` plus the row menu and moving row, started only from the first Mac today. | build | none | none |
 | `planned.exp.acpagents` | ACP agents (`acpAgents`) | OpenCode and Cursor threads | Drive every provider choice from `ProviderInfo` rather than hardcoding two, and don't copy the web's `modelLabel`. | build | none | none |
-| `planned.exp.cardreviewer` | Card reviewer (`cardReviewer`) | Opus pre-reviews Auto cards | No new UI: a transcript note says "Allowed by the reviewer". | build | none | none |
+| `planned.exp.cardreviewer` | Card reviewer (standard since 20 Nov) | Opus pre-reviews Auto cards | No new UI: a transcript note says "Allowed by the reviewer". | build | none | none |
 | `planned.exp.fastmode` | Fast mode (`fastMode`) | Standard or Fast per Claude thread, `/fast` | The Speed row in `composer.modelpicker` and a chip suffix. | build | none | none |
 
 ## Route counts

@@ -33,7 +33,9 @@ The threads view has four sections. Inbox holds the threads for you, with
 the ones that need you at the top. The number on the Threads icon in the
 left-hand rail is how many are in it. The arrows at the end of its heading
 sort it newest first or oldest first instead, which is handy for working
-through a long inbox from the bottom up. ⌥⌘↓ (Go > Next Inbox Thread)
+through a long inbox from the bottom up. Whatever the order, a thread that's
+stopped mid-turn on a card for you (a password, a question, a permission)
+stays at the top, as the card closes if nobody answers it. ⌥⌘↓ (Go > Next Inbox Thread)
 opens the thread below the open one in the Inbox, or the Inbox's first if
 the open one is somewhere else; past the last one, a note says you're
 caught up. Once you've clicked the list, the up and down arrows move through
@@ -52,7 +54,13 @@ asked you something, as what they find can change what it asks. It comes to
 the inbox when they're done, and you can still open it and answer early.
 Hibernating and Archived, at the foot, hold the threads that are put away
 (see [Hibernate and archive](#hibernate-and-archive)). They start folded,
-showing only how many; click a heading to open or fold it. Hibernating also
+showing only how many; click a heading to open or fold it. A thread whose agent
+is waiting on its own work stays under Running too, with a grey spinner and
+what it's waiting for: on other threads to finish (a fix it needs, a review of
+its change), for something it's watching for while its commits aren't on
+main yet ("Waiting to land"), or for your app to restart onto what it landed.
+Its card says
+that rather than Done, as the job isn't over until it is. Hibernating also
 has the threads that have booked a message to themselves for later (an
 agent saying "I'll check again in 20 minutes") and have nothing for you
 until then. Each row says when it wakes, soonest first. When the time comes
@@ -302,7 +310,13 @@ Needs you card's buttons, to see where it goes: a picture of the file, or
 the page's address. On a Mac a local PDF shows its first page and a video
 its first frame. A PDF over 16 MB or a file that can't be previewed keeps
 its file symbol. Click it to open it (the middle mouse button works
-too). If an agent already has that page
+too). A file the side pane can draw opens there: Markdown, text, a page, a
+picture, a PDF, data and logs (JSON, YAML, TOML, CSV, `.log`) and code
+(TypeScript, Python, Rust, shell scripts and the rest), data and code
+coloured. Anything else opens in its own app, and ⌘-click opens any file
+there. A path with lines after it, in a link or in a reply's code
+(`server.ts:12` or `server.ts:121-125`), opens with those lines tinted,
+marked beside their numbers and scrolled to. If an agent already has that page
 open in Chrome through [BrowserBear](https://github.com/mikecann/browserbear)
 (say, a sign-in page it wants you to use), the click brings the agent's tab
 into your Chrome window rather than opening a second one. A link to a file
@@ -312,6 +326,10 @@ links to files on the Mac only say so. A link that isn't a web page (one
 that would open Slack, System Settings or another app) asks before it opens,
 naming the app, on the Mac and the phone, and so does a file that isn't a
 plain document (a `.command`, an app, a kind Threadbear can't place).
+For a kind it can't place, the question names the app it opens in and
+offers to always open that kind there ("Always open .tandem in Tandem"),
+so your own apps' files stop asking. To take that back, remove the entry
+from `trustedOpeners` in `desktop-links.json` in the data folder and restart the app.
 Another Mac's program never opens here, and its replies never show
 pictures from this Mac.
 
@@ -332,6 +350,13 @@ Files on ordinary disk and CD/DVD volumes work; third-party virtual drives
 such as VeraCrypt and RAM disks are refused until the app can verify them.
 An open Terminal shell holds off an automatic update restart on Windows:
 the app cannot yet tell whether PowerShell is waiting or running a command.
+On Windows, for now, a project's patches only run what you click: their
+buttons work, but their hooks, worktree setup and teardown, and the commands
+their panels and badges run don't run, even once you've trusted the patch.
+A folder's Claude Code hooks and the settings that run commands stay off
+too. Patches says so beside each patch it affects, and a new worktree's
+thread says when its setup didn't run. A schedule's check doesn't run in a
+repo's folder either.
 
 The Browser panel, the globe on a thread's right-hand rail, lists the pages a
 thread's agents have open through [BrowserBear](https://github.com/mikecann/browserbear):
@@ -373,9 +398,10 @@ Documents over 256 MB can be opened in their own app instead.
 Files, the folder on a thread's right-hand rail, opens the thread's own
 folder that way, without a link to it. Click it again to close it.
 
-A text file in the side pane opens for reading. The pencil in its bar
-switches to the raw text for editing, with line numbers down the side.
-What you type is saved a moment after you stop, and ⌘S saves it straight
+Code and plain text in the side pane open ready to type in, with line
+numbers down the side; the check mark in its bar puts the file away to
+read, and the pencil brings it back. Nothing is written until you type.
+Lines a link named lose their tint as soon as you do. What you type is saved a moment after you stop, and ⌘S saves it straight
 away. If the file changes on disk while you have unsaved edits (an agent
 rewrote it), nothing is written over: a bar asks whether to take the
 file's version or keep yours.
@@ -437,6 +463,19 @@ shown on the composer (the box you type in) and changed by clicking it.
   outright leaves a note in the thread saying why. It's for work on
   text you didn't write, like an error report or a web page. It catches a lot
   but it's no guarantee, and on a Codex thread it behaves like Ask before edits.
+  Before a card reaches you in an Auto thread (the safety check unsure, an edit
+  to a file Threadbear runs as code, a message to a thread with more access,
+  a project's brief), a reviewer looks at it first: Opus, with no tools,
+  shown the card in full and what the thread was asked to do. If it fits the
+  task and can't do real harm, it goes ahead and the thread says "Allowed by
+  the reviewer" with its reason. If the reviewer has doubts, or can't run (no
+  pool, a private folder, a card or brief too long to read whole), the card
+  comes to you after a note with its reason. It treats everything it reads
+  as data, and text trying to tell it what to answer is a reason to hand you
+  the card. Cards that hand out access lasting past the one action
+  (switching a thread to more access, starting a thread with more, a
+  schedule, moving a thread or changing its logins) always come to you, and
+  so do Codex threads' own tool cards.
 - **Plan first**: the agent looks around and writes a plan, but changes
   nothing yet. The plan shows as a card with Go ahead and Send back. Go
   ahead (or Return in an empty message box) lets it start, back in the mode
@@ -563,7 +602,9 @@ dragged out of the app itself (a picture in the transcript, a Highlights
 file) only goes in when you let go over the box, so a drag out that changes
 its mind doesn't land in your message.
 So "this one [Picture 1] should look like this one [Picture 2]" says which
-is which. The thumbnails show over the text too; the cross on one takes it
+is which. In the new app, thumbnails wrap to the box's width; after three
+rows, their strip scrolls so the words stay in view.
+The thumbnails show over the text too; the cross on one takes it
 and its chip out. Hover a chip to see its picture, in the composer or once
 it's sent. Click a chip or a thumbnail, in the composer or in the thread,
 to open the picture, with the arrows to step through the others.
@@ -854,7 +895,8 @@ The icons down the right edge of the window open and close the thread's
 own panels: Highlights at the top, one for each panel its patches add,
 and Patches at the foot. To open a thread in a panel of its own, beside
 the one you're reading, right-click it in the list and pick Open in New
-Panel.
+Panel. The × at the end of its title bar closes it, and Move to Main
+Panel, on the same right-click menu, brings it back to the main panel.
 
 A patch's panel follows the thread you pick, and steps aside for a thread
 that doesn't have it. To keep one in view while you work in another
@@ -970,10 +1012,9 @@ you've folded, between launches and for every thread: fold Sub-agents once
 and it stays folded everywhere. A project's heading folds for that project.
 
 Click a file and it opens in the panel, with Back to return to the list
-(a text file there has Edit too). A link opens in your browser, unless you
-change Default in its right-click menu to open pages in the panel. An
-edited code file opens in its own app, and a Tandem project opens in
-Tandem, here and in a reply. Right-click any of them for more,
+(code and text open there ready to type in). A link opens in your browser,
+unless you change Default in its right-click menu to open pages in the
+panel. A Tandem project opens in Tandem, here and in a reply. Right-click any of them for more,
 such as Reveal in Finder, or Remove to take it off the list. You can drag
 files out of Highlights into other apps.
 
@@ -990,6 +1031,9 @@ few things that matter most. To have something pinned, ask the thread
 
 ## Projects
 <!-- slug: projects -->
+
+When a project update needs your approval, its details show the current
+project name and ID alongside the proposed changes.
 
 <!-- picture: /docs-img/projects.webp alt: The Projects view: each project with its threads, what it's for and where it's up to -->
 
@@ -1222,6 +1266,20 @@ runner that's online in it. Adding or renaming a runner is done on its own machi
 so ask an agent to do it for you. Schedules need your
 Convex backend: with no internet, they wait.
 
+With the `virtualRunners` experiment on and a virtual runner set up in your
+backend (docs/virtual-runners.md), Runs on also lists it after the Macs,
+for example "Cloud (Fly)": the thread gets a machine of its own in the
+cloud, made from the folder's git repo on this Mac and your Claude login.
+Its row says "Starting a machine" while it boots, "Asleep" once it's been
+idle a while, and "Waking" when a message brings it back. The first time a
+login runs there, the thread asks for a cloud token in a card on its
+message box: Make one runs `claude setup-token` for that login and opens
+claude.ai to approve it (not on Windows, where you run it in a terminal
+and paste what it prints), Paste a token takes one you made, and Use this
+Mac's token appears when that login already has a year-long token here.
+The message waits and goes once it's set. If Claude later refuses the
+token, the same card comes back.
+
 With more than one runner, Runners (the rack icon near the bottom of the
 left-hand rail) opens a panel with each one: whether it's online and for
 how long, or when it was last heard from, the commit it runs, and the
@@ -1296,6 +1354,21 @@ when you click its refresh button. Once a thread has sat idle for half an
 hour its Claude has stopped, so it shows the last breakdown and how old
 it is until your next message.
 
+A Claude thread keeps its conversation in the provider's prompt cache for
+about an hour after its last model call. Wake a long thread after that
+(your message the next morning, a schedule, a report from a thread it
+started) and the whole conversation has to be read in again, which on a
+thread past 200k tokens costs about three times a warm turn. So a Claude
+thread with 200k tokens or more of context that has been idle for over an
+hour and five minutes compacts first: Claude Code summarises the
+conversation, asked to keep what was decided, what you asked for that
+isn't done, what's still running or waited on, the files, branches and
+threads involved, and how you said you want the work done. Then your
+message runs on the summary, in the same turn. It takes a minute or so
+before the turn starts, and a quiet line in the thread says it happened
+and why. A thread that's still warm, a shorter one, a slash command and
+Codex threads are left alone.
+
 To add another login, such as a second Claude subscription, give it a
 folder of its own under `accounts` in Threadbear's data folder, named
 `claude-1` (then `claude-2` and so on, or `codex-1` for Codex), and sign in
@@ -1348,6 +1421,14 @@ New token…. A token can only run models, so claude.ai's own connectors and
 Remote Control don't work on that login; MCP servers you set up yourself
 still do, and so do the usage numbers. To go back to signing in, delete
 that file.
+
+A login on another of your machines (a second Mac, a Linux box, a Windows PC) gets
+one from the Runners panel: open that machine's card, and its Claude logins
+are listed under its figures, each with Year-long token…. Your browser opens
+on claude.ai's page for it; click Authorize, then Copy code on the page it
+ends on, and Paste code back in the panel. That machine makes the token and
+keeps it, and it never leaves there. It needs `python3` on that machine,
+and your main Mac's app (it goes through your Convex backend).
 
 The sign-in command comes from the runner's provider list, so Cursor opens
 `agent login`, for example. Sign in… is offered only when the login's own
@@ -1509,12 +1590,27 @@ starts the jobs without asking.
 When a thread changes code (five lines or more, not counting docs) and
 finishes with nothing for you to do, Threadbear has another lab try to
 break the change: Codex reviews a Claude thread's change, and Claude a
-Codex one's, to begin with. Settings › General › Code review lists who
-reviews, in order: drag them into the order you want, add any other
+Codex one's, to begin with. Settings › General › Code review has two
+lists. Every change lists who reviews, in order: drag them into the order you want, add any other
 provider you have a login for (Grok, say), and pick each one's model and
 effort. The first that isn't the thread's own provider and has a login
 with room does the review, so when one runs out for the week, the next
-takes over. The review runs in a thread of its own in the same folder, with
+takes over. You can list a provider more than once on different models.
+Gemini reviews through OpenCode: give OpenCode a Google AI Studio key
+(`opencode auth login google`) and its Gemini models show up under
+OpenCode once the runner restarts.
+
+For a big change (150 lines of code or more) or one to code about
+sign-ins, passwords, secrets or payments, a review panel can look at it
+instead: the reviewers under Big or risky changes, each on its own model
+and effort, review at once, each in a thread of its own. A provider can be
+in both lists, and one only on the panel (Gemini, say, which is paid for
+every token it reads) never reviews a small change. Your thread waits for all of
+them and gets their findings in one numbered list, each saying who found
+it, and the round only passes if none of them found anything. Smaller
+changes still get the one reviewer, so the panel's cost goes where it
+pays. With fewer than two of the panel able to review, the one
+reviewer does. `"labPanelLines"` in `runner.json` changes the 150. The review runs in a thread of its own in the same folder, with
 the same permissions as the thread it reviews, and is told not to edit
 anything. Your thread says who is reviewing and waits. The reviewer gives a
 verdict: a list of concrete findings, or nothing that holds up. Then your
@@ -1522,8 +1618,10 @@ thread wakes with them numbered, and it can't finish until it has answered
 each one: fixed, disputed (saying why), or left for you to decide, which
 comes to you as a question. Anything it fixed gets reviewed again, just the
 new change, until a round finds nothing. A quiet line in the thread, over
-the reply, shows who reviewed and how it came out, with each finding and
-what was done about it under it; the line opens the review thread. It
+the reply, shows who reviewed and how it came out. It folds like the
+agent's work: click it for each finding and what was done about it, and
+the review thread's link under them. Findings still open (left for you,
+or not answered) show under it even while it's folded. It
 stays off the done card, as it happens in the background. The review thread is archived when it's
 done, so it stays out of your inbox. That holds however the review ends:
 if it gives no verdict, asks you something or stops with an error, your
@@ -1888,6 +1986,25 @@ closed; and a deleted thread's old messages being cleared away), with how many a
 and any one's history. It's for looking into something that seems stuck; it
 changes nothing.
 
+### On Android
+
+There's an Android app too, for the same things: your inbox, answering
+threads, starting new ones and notifications. It isn't on Google Play yet,
+so you install it yourself from GitHub, where each Threadbear release puts
+a new copy:
+
+1. On your Android phone, download
+   [the latest Threadbear APK](https://github.com/mikecann/threadbear/releases/latest/download/threadbear-android.apk).
+2. Open it from your downloads. The first time, Android asks whether your
+   browser may install apps: allow it, then tap Install.
+3. Open Threadbear and pair it with Scan the code, as above.
+
+After that it looks for new releases itself. When one's out, its inbox
+menu and Settings show "Update to" and the release's date, and tapping it
+downloads the new APK to install over the top, still paired. Notifications
+come through Google's Firebase, so a phone without Google Play services
+gets everything but those.
+
 ## Self-hosting your backend
 <!-- slug: self-hosting -->
 
@@ -2172,12 +2289,18 @@ on `main`, the runner builds it and switches over without cutting off any
 thread that's partway through a turn, and the app builds its new version in
 the background. The app swaps in the new version when you next quit it, when
 you choose Restart to Update in the Threadbear menu, or by itself when you've
-left it alone for a while with nothing typed. The window stays where it is
+left it alone for a few seconds. The window stays where it is
 while it does: the new version opens the same thread underneath and takes
 over, so you shouldn't see it go.
 
 Whatever's typed in a message box and not sent is kept through a quit or a
-restart. While a runner restart waits for threads to finish, a quiet line at
+restart, and so are your own answers in a card's Something else boxes, so
+neither holds the new version back: it swaps in and puts them back in their
+boxes. A few things still hold it: a picture still being copied into a box,
+an earlier message you're editing, a message still on its way, and words on
+the new-thread page (its folder and account choices aren't kept). When something else typed does (a
+title being renamed, say), the Updates panel names the box and the thread,
+with a button that opens the thread. While a runner restart waits for threads to finish, a quiet line at
 the top says how many it's waiting for, and hovering it names them. A message
 you send while the runner is restarting waits under its bubble and goes once
 the new one is up. If one can't be sent, its words go
@@ -2224,9 +2347,12 @@ window stays where it is: the new version opens the same thread underneath
 and takes over, as the Swift app's does.
 
 The Updates icon on the left-hand rail shows what's on its way for the app,
-the runner and the Claude Code and Codex tools. A grey dot means something
-is in progress and will sort itself out, and a coloured dot means it needs
-you. Right-click it for a quick Restart to Update.
+the runner and the Claude Code and Codex tools. While the app's next
+version (or a runner release) is building, a short arc goes round the
+icon; once the app's next version is ready to restart into, the icon turns
+green. A grey dot means something else is in progress and will sort itself
+out, and a coloured dot means it needs you. Right-click it for a quick
+Restart to Update.
 
 A few parts of the runner (the program that keeps it going, and the small
 Threadbear Runner app macOS names in its privacy prompts) don't come with
@@ -2260,6 +2386,12 @@ release runs until you say go: then it merges, runs the checks and lands. Let's 
 talks the release through first, what's in it and what it means for your
 own changes, and changes nothing until you say. From a thread, `tb updates`
 says the same, and `tb updates check` looks again now.
+Once a release is in, the thread offers to send Mike a short check-up: which
+release came in, how far behind you were, and how often Threadbear's own errors
+came up, with anything of yours only counted. You see the whole draft first,
+and it goes as a comment on a public Discussion on Mike's repo, under your
+GitHub login, only if you say Send. Never ask turns it off
+(`"releases": { "checkup": false }` in `runner.json`).
 
 You don't have to remember to look. Every 5 days, if Mike has a release
 your copy doesn't have, Threadbear starts that thread for you: it reaches

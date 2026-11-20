@@ -12,7 +12,7 @@ import type { CheckResult } from '../../src/schedule-check.ts';
 import { readRunnerJson } from '../../src/config.ts';
 import { convexPoster, toOwnedScheduleDoc, SCHEDULE_POOLS_API_VERSION } from '../../src/sync.ts';
 import { keptCheckFile } from '../../src/schedule-check.ts';
-import { scheduledSendMethods, sendScheduled } from '../../src/handover.ts';
+import { dropScheduled, scheduledSendMethods, sendScheduled } from '../../src/handover.ts';
 import { DRAIN_MAX_OLD_MS, DRAIN_SETTLE_MS } from '../../src/runner.ts';
 import { PatchTrust } from '../../src/patch-trust.ts';
 
@@ -2105,4 +2105,98 @@ test('a later failure of the schedules save is reported again, and stop ends the
   h.clock.advance(SAVE_RETRY_MS);
   // A stopped runner mustn't write over what the runner taking over has saved.
   assert.equal(fs.existsSync(file), false, 'the retry went with the scheduler');
+});
+
+// ae88bd2c, 20 Nov: deleted schedules kept delivering what they'd queued
+// for a busy thread. Deleted elsewhere counts too, one-offs included.
+test('a one-off deleted on the phone takes back its message queued for a busy thread', async () => {
+  const h = makeHarness();
+  const { thread } = h.runner.create({ text: 'Measure', accountId: 'claude-3' });
+  h.adapter.last.init();
+  const shared = fakeBackend(h.clock, [LAPTOP]);
+  const sched = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, self: LAPTOP, syncOn: true });
+  sched.start();
+  await sched.attach(shared.for('primary', LAPTOP.id));
+  await tick(8);
+  try {
+    const sc = await sched.create({ text: 'Land it', at: iso(h.clock.now() + MIN), threadId: thread.id });
+    const kept = await sched.create({ text: 'Keep me', at: iso(h.clock.now() + MIN), threadId: thread.id });
+    h.clock.advance(MIN);
+    await tick(20);
+    assert.equal(h.runner.mustGet(thread.id).rec.queue.length, 2);
+    assert.ok(sched.find(sc.id).finishedAt);
+    await shared.for('phone', LAPTOP.id).remove(sc.id);
+    await tick(8);
+    assert.deepEqual(h.runner.mustGet(thread.id).rec.queue.map(q => q.scheduleId), [kept.id]);
+  } finally { sched.stop(); }
+});
+
+test('a schedule saved here but not yet in the backend\'s rows keeps its queued message', async () => {
+  const h = makeHarness();
+  const { thread } = h.runner.create({ text: 'Measure', accountId: 'claude-3' });
+  h.adapter.last.init();
+  const sched = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, self: LAPTOP, syncOn: true });
+  sched.start();
+  // Rows reach the scheduler only when the test says, as a late snapshot would.
+  const be = fakeBackend(h.clock, [LAPTOP]).for('primary', LAPTOP.id);
+  let deliver: (rows: StoredSchedule[]) => void = () => {};
+  await sched.attach({ ...be, subscribe: (onRows) => { deliver = onRows; return () => {}; } });
+  deliver([]);
+  await tick(8);
+  try {
+    const sc = await sched.create({ text: 'Land it', cron: '*/5 * * * *', threadId: thread.id });
+    h.runner.sendScheduled(thread.id, 'Land it', sc.id, 'slot-1');
+    deliver([]);
+    assert.equal(h.runner.mustGet(thread.id).rec.queue.length, 1);
+    // Once the backend has shown it, leaving it out is a delete.
+    deliver([{ ...sc, runnerId: LAPTOP.id } as unknown as StoredSchedule]);
+    deliver([]);
+    assert.equal(h.runner.mustGet(thread.id).rec.queue.length, 0);
+  } finally { sched.stop(); }
+});
+
+test('deleting a schedule reaches a thread a draining runner still keeps', async () => {
+  const old = makeHarness();
+  const h = makeHarness(old.home);
+  const { thread } = old.runner.create({ text: 'Measure', accountId: 'claude-3' });
+  old.adapter.last.init();
+  const methods = scheduledSendMethods(old.runner) as Record<string, (p: Record<string, unknown>) => unknown>;
+  const peers = { call: async (_id: string, method: string, p: Record<string, unknown>) => methods[method](p) };
+  const sched = new Scheduler({
+    runner: h.runner, home: h.home, clock: h.clock, log: nullLogger,
+    elsewhere: () => true,
+    dropElsewhere: (id, scheduleId) => dropScheduled(h.runner, peers, id, scheduleId),
+  });
+  sched.start();
+  try {
+    const sc = await sched.create({ text: 'Land it', cron: '*/5 * * * *', threadId: thread.id });
+    old.runner.sendScheduled(thread.id, 'Land it', sc.id, 'slot-1');
+    old.runner.sendScheduled(thread.id, 'Other', 'other', 'slot-1');
+    await sched.delete(sc.id);
+    await tick(4);
+    assert.deepEqual(old.runner.mustGet(thread.id).rec.queue.map(q => q.scheduleId), ['other']);
+  } finally { sched.stop(); }
+});
+
+test('a schedule deleted on the phone while this runner was off is known as deleted from its first snapshot', async () => {
+  const h = makeHarness();
+  const { thread } = h.runner.create({ text: 'Measure', accountId: 'claude-3' });
+  h.adapter.last.init();
+  const shared = fakeBackend(h.clock, [LAPTOP]);
+  const first = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, self: LAPTOP, syncOn: true });
+  first.start();
+  await first.attach(shared.for('primary', LAPTOP.id));
+  await tick(8);
+  const sc = await first.create({ text: 'Land it', cron: '*/5 * * * *', threadId: thread.id });
+  await tick(8);
+  first.stop();
+  await shared.for('phone', LAPTOP.id).remove(sc.id);
+  const again = new Scheduler({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, self: LAPTOP, syncOn: true });
+  again.start();
+  try {
+    assert.equal(again.wasDeleted(sc.id), false);
+    await again.attach(shared.for('primary', LAPTOP.id));
+    await tick(8);
+    assert.equal(again.wasDeleted(sc.id), true);
+  } finally { again.stop(); }
 });

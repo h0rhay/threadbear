@@ -14,7 +14,7 @@ import { loadConfig, paths, readRunnerJson } from '../../src/config.ts';
 import { downgradeFetch, redirectTrap } from '../helpers/redirect-trap.ts';
 import { scrubText } from '../../src/redaction.ts';
 import { Scrubber } from '../../src/scrub.ts';
-import { SCRUB_API_VERSION, isConvexCloud, MESSAGE_PICTURES_API_VERSION } from '../../src/sync.ts';
+import { SCRUB_API_VERSION, isConvexCloud, MESSAGE_PICTURES_API_VERSION, LOGIN_STATE_API_VERSION } from '../../src/sync.ts';
 import { makePng } from '../helpers/png.ts';
 import { ConvexUseTally } from '../../src/convex-use.ts';
 
@@ -792,6 +792,10 @@ function setupFull(opts: { heads?: { threadId: string; lastSeq: number }[]; take
       buttons: (id) => h.runner.listButtons(id).buttons,
     },
     commands: {
+      yearToken: async (accountId, p) => {
+        applied.push(`yearToken ${accountId} ${JSON.stringify(p)}`);
+        return { state: 'waiting', url: 'https://claude.com/cai/oauth/authorize?state=x' };
+      },
       threadCommands: (id) => {
         applied.push(`commands ${id}`);
         return h.runner.threadCommands(id);
@@ -2508,7 +2512,7 @@ test('a row carries who started it, once the backend takes it', async () => {
 });
 
 // Reply pictures: for any thread, shared or not, once the backend takes them.
-function setupReplyImages(opts: { backend?: number; uploadFails?: () => Error | undefined; pastedPictures?: boolean } = {}) {
+function setupReplyImages(opts: { backend?: number; uploadFails?: () => Error | undefined; pastedPictures?: boolean; home?: string } = {}) {
   const h = makeHarness();
   const dir = tmpDir();
   const png = path.join(dir, 'guide.png');
@@ -2531,6 +2535,7 @@ function setupReplyImages(opts: { backend?: number; uploadFails?: () => Error | 
       startedAt: '2026-11-01T00:00:00.000Z',
       clock: h.clock,
       log: nullLogger,
+      ...(opts.home ? { home: opts.home } : {}),
       post: async (kind, fn, args) => {
         calls.push({ kind, fn, args });
         if (fn === 'sync:heartbeat') return { apiVersion: opts.backend ?? REPLY_IMAGES_API_VERSION };
@@ -2582,6 +2587,29 @@ test('reply pictures: from a thread that is not shared, with their size, new one
   assert.equal(uploads.length, 2);
   assert.notEqual(added()[1]!.seq, added()[0]!.seq);
   await sync.stop();
+});
+
+test('live pages: a page in a reply goes up as plain bytes, only with the experiment on and a backend that takes it', async () => {
+  const run = async (backend: number, on: boolean) => {
+    const home = tmpDir();
+    fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { livePages: on } }));
+    const { fresh, uploads, added, thread, settle } = setupReplyImages({ backend, home });
+    const page = path.join(tmpDir(), 'garden.html');
+    fs.writeFileSync(page, '<!doctype html><canvas></canvas><script>spin()</script>');
+    thread(`Turn it: ![Garden](${page})`);
+    await tick();
+    const sync = fresh();
+    sync.start();
+    await settle(sync);
+    await sync.stop();
+    return { uploads, added: added().map((a) => [a.src, a.mediaType]), page };
+  };
+  const on = await run(LIVE_PAGES_API_VERSION, true);
+  // Stored as bytes, so its URL never runs it on the backend's origin; the row says what it is.
+  assert.deepEqual(on.uploads, ['application/octet-stream']);
+  assert.deepEqual(on.added, [[on.page, 'text/html']]);
+  assert.deepEqual((await run(LIVE_PAGES_API_VERSION, false)).uploads, []);
+  assert.deepEqual((await run(LIVE_PAGES_API_VERSION - 1, true)).uploads, []);
 });
 
 test('pasted pictures: go up as they are sent, each named for its marker, never looked back for', async () => {
@@ -2742,7 +2770,7 @@ test("projects: notes go up only when they change, and a backend before API 50 a
 
 // docs/protocol.md, "Secrets".
 import { seal } from '../../src/secrets.ts';
-import { NOTES_APART_API_VERSION, SECRETS_API_VERSION } from '../../src/sync.ts';
+import { NOTES_APART_API_VERSION, SECRETS_API_VERSION, LIVE_PAGES_API_VERSION } from '../../src/sync.ts';
 
 test('secrets: the card goes up with the runner key, and the phone sealed answer is opened here', async () => {
   const f = setupFull({ apiVersion: SECRETS_API_VERSION });
@@ -4293,4 +4321,111 @@ test('a message row says how many pictures it came with, and goes with it from A
     assert.equal(first.pictures, says ? 1 : undefined, `backend ${backend}`);
     await f.sync.stop();
   }
+});
+
+// Year-long token… from the Mac's Runners panel (year-token-maker.ts): only
+// a command the main Mac queued (from: "mac") reaches the maker; the phone's
+// can't, and the answer goes back as the call's result.
+test("accounts.yearToken calls: the main Mac's reach the maker, nobody else's", async () => {
+  const { sync, push, applied, calls } = setupFull();
+  sync.start();
+  await sync.flushNow();
+  push([{ commandId: 'y1', kind: 'call', args: { method: 'accounts.yearToken', params: { accountId: 'claude-3', code: 'abcdefgh#ijklmnop', extra: 'dropped' }, from: 'mac' }, createdAt: 1 }]);
+  await tick(10);
+  push([{ commandId: 'y2', kind: 'call', args: { method: 'accounts.yearToken', params: { accountId: 'claude-3' } }, createdAt: 2 }]);
+  await tick(10);
+  assert.deepEqual(applied.filter((a) => a.startsWith('yearToken')), ['yearToken claude-3 {"code":"abcdefgh#ijklmnop"}']);
+  const y1 = calls.find((c) => c.fn === 'sync:finishCommand' && c.args.commandId === 'y1')!;
+  assert.equal(y1.args.ok, true);
+  assert.equal(JSON.parse(String(y1.args.result)).state, 'waiting');
+  const y2 = calls.find((c) => c.fn === 'sync:finishCommand' && c.args.commandId === 'y2')!;
+  assert.equal(y2.args.ok, false);
+  assert.match(String(y2.args.note), /Only the main Mac/);
+  await sync.stop();
+});
+
+test("an accounts row carries a login's sign-in and token date from backend API 90, never the token", () => {
+  const a = { id: 'claude-1', provider: 'claude', title: 't', configDir: '/x', loginEndsAt: '2027-11-18T00:00:00.000Z', signedOut: true, yearToken: { madeAt: '2026-11-18T00:00:00.000Z' } } as never;
+  assert.deepEqual(pickLogin(toAccountDoc(a, LOGIN_STATE_API_VERSION)), { loginEndsAt: '2027-11-18T00:00:00.000Z', signedOut: true, yearToken: { madeAt: '2026-11-18T00:00:00.000Z' } });
+  assert.deepEqual(pickLogin(toAccountDoc(a, LOGIN_STATE_API_VERSION - 1)), {});
+});
+function pickLogin(d: Record<string, unknown>) {
+  const out: Record<string, unknown> = {};
+  for (const k of ['loginEndsAt', 'signedOut', 'yearToken']) if (d[k] !== undefined) out[k] = d[k];
+  return out;
+}
+
+// Codex's review of the moved-thread fix (19 Nov): a thread that moved away
+// while another's picture was going up took its own pictures out of the
+// queue, and the upload's finish then dropped the next thread's picture.
+test("sharing: a thread moving away while a picture goes up leaves the others' pictures queued", async () => {
+  const h = makeHarness();
+  const calls: Call[] = [];
+  const uploads: string[] = [];
+  const moved = new Set<string>();
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((r) => (release = r));
+  let first = true;
+  const sync = new ConvexSync({
+    config: { enabled: true, url: 'https://x.convex.cloud', runnerId: 'r1' },
+    key: 'k',
+    runner: h.runner,
+    home: h.cfg.home,
+    version: '0.1.0+test',
+    startedAt: '2026-10-29T00:00:00.000Z',
+    clock: h.clock,
+    log: nullLogger,
+    movedAway: (id) => moved.has(id),
+    post: async (kind, fn, args) => {
+      calls.push({ kind, fn, args });
+      if (fn === 'sync:heartbeat') return { apiVersion: SHARE_API_VERSION };
+      if (fn === 'sync:shareImages') return [];
+      if (fn === 'sync:iconUploadUrl') return 'https://upload.example/u';
+      return null;
+    },
+    upload: async (_url, bytes) => {
+      if (first) {
+        first = false;
+        await held;
+      }
+      uploads.push(Buffer.from(bytes).toString('hex'));
+      return `st_${uploads.length}`;
+    },
+  });
+  const threads = ['A', 'B'].map((name, i) => {
+    const t = h.runner.create({ text: `draw ${name}`, cwd: h.cfg.defaults.cwd, accountId: 'claude-3' }).thread;
+    const pic = path.join(paths.media(h.cfg.home, t.id), `${name}.png`);
+    fs.mkdirSync(path.dirname(pic), { recursive: true });
+    fs.writeFileSync(pic, pngBytes(10 + i, 10));
+    const s = session(h, t.id);
+    s.init();
+    s.text('m1', `![${name}](${pic})`);
+    s.result('completed');
+    return { t, pic };
+  });
+  await tick();
+  sync.start();
+  await tick(20);
+  await sync.flushNow();
+  for (const { t } of threads) h.runner.share(t.id, { access: 'link' });
+  h.clock.advance(SYNC_COALESCE_MS);
+  await tick(20);
+  const flushing = sync.flushNow();
+  await tick(20);
+  // The first picture is on its way; its thread moves away meanwhile.
+  const [a, b] = threads;
+  const goingUp = calls.some((c) => c.fn === 'sync:iconUploadUrl');
+  assert.ok(goingUp, 'a picture is on its way up');
+  moved.add(a!.t.id);
+  h.runner.delete(a!.t.id);
+  await tick();
+  release!();
+  await flushing;
+  await tick(20);
+  await sync.flushNow();
+  await tick(20);
+  await sync.flushNow();
+  const added = calls.filter((c) => c.fn === 'sync:addShareImage').map((c) => c.args.threadId);
+  assert.ok(added.includes(b!.t.id), "B's picture still went up");
+  await sync.stop();
 });

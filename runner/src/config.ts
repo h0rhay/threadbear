@@ -6,8 +6,9 @@ import crypto from 'node:crypto';
 import { atomicWriteFileSync } from './fsutil.ts';
 import { RELEASE } from './release.ts';
 import { gatewayBase, gatewayUrlFrom } from './connectors.ts';
+import type { MailWatchSettings } from './mail-watch.ts';
 import { credentialUrlProblem } from './secure-url.ts';
-import { parseLabReviewers, type LabReviewer } from './lab-reviewers.ts';
+import { reviewerLists, type LabReviewer } from './lab-reviewers.ts';
 import { findGatewayClient } from './notion-tasks.ts';
 import { onPath } from './adapters/acp/agents.ts';
 import { dataDirFor, exeName, logFileFor } from './platform.ts';
@@ -87,6 +88,9 @@ export type Config = {
   // Where accounts are discovered. Tests can narrow these.
   claudeMainDir: string;
   claudeMainJson: string;
+  // Box mode (box-mode.ts): claude-main's email as the boot exchange gave
+  // it, as a setup-token login writes no oauthAccount to .claude.json.
+  claudeMainEmail?: string;
   tokenStatsAccountsDir: string;
   // <data dir>/accounts: more logins for anyone without Token Stats (the
   // guide's "Adding another login"), claude-N and codex-N as there.
@@ -145,6 +149,15 @@ export type Config = {
   // on its model and effort if it names them. Unset is Codex then Claude,
   // which is the other provider for either (lab-review.ts, reviewLogin).
   labReviewers?: LabReviewer[];
+  // Who reviews a big or risky change, all at once (runner.json `labPanel`,
+  // Settings > General > Code review > Big or risky changes;
+  // lab-reviewers.ts). Unset is no panel: one reviewer, as for any change.
+  labPanel?: LabReviewer[];
+  // How many lines of code a change needs for the panel to review it all
+  // at once (runner.json `labPanelLines`, 150 when
+  // unset; lab-review.ts, panelChange). A change to auth, payments or
+  // secrets gets the panel whatever its size.
+  labPanelLines: number;
   // Keep the Mac out of idle sleep while threads work (keep-awake.ts). On
   // unless runner.json says `keepAwake: false` (Settings > General).
   keepAwake: boolean;
@@ -234,13 +247,16 @@ export type RunnerJson = {
   oneReply?: boolean;
   labReview?: boolean;
   labReviewers?: unknown;
+  labPanel?: unknown;
+  labPanelLines?: unknown;
   keepAwake?: boolean;
   // spareWeek: false stops the runner starting a thread by itself when a
   // login's week is about to go unused (spare-week.ts). On when absent.
   spareWeek?: boolean;
   // bringIn: how often a fork's runner starts a thread to bring in Mike's
   // releases (bring-in.ts): every so many days, 'important' or 'off'.
-  releases?: { publish?: boolean; signingKey?: string; signingProvider?: string; bringIn?: number | 'important' | 'off' };
+  // checkup: false stops that thread offering Mike a check-up (checkup.ts).
+  releases?: { publish?: boolean; signingKey?: string; signingProvider?: string; bringIn?: number | 'important' | 'off'; checkup?: boolean };
   models?: { pool?: string | null; privateFolders?: string[] };
   // icon: an SF Symbol for this runner in lists (machine.ts works one out).
   // An rpcUrl left from the direct link between Macs (gone 13 Nov 2026) is ignored.
@@ -260,16 +276,19 @@ export type RunnerJson = {
   // The gateway, when it isn't the `connectors` MCP server in
   // ~/.claude.json; url "" or enabled: false turns the panel's polling off.
   connectors?: { url?: string; enabled?: boolean; headersHelper?: string };
+  // The email watcher (experiment mailWatch, mail-watch.ts): the command
+  // that prints new emails, how often, when the pile comes, and the
+  // decisions it may act on.
+  mailWatch?: MailWatchSettings;
 };
 
 // What defaults.permissionMode may be. Not Plan first: that waits for Mike
 // to approve a plan, so a thread nobody's watching (a schedule, one from
 // the phone) would only sit there.
 export type DefaultMode = Exclude<PermissionMode, 'plan'>;
-function labReviewersFrom(v: unknown): { labReviewers?: LabReviewer[] } {
-  const list = parseLabReviewers(v);
-  return list ? { labReviewers: list } : {};
-}
+// See Config.labPanelLines.
+export const LAB_PANEL_LINES = 150;
+
 
 export function defaultModeOf(v: unknown): DefaultMode | undefined {
   return v === 'full' || v === 'ask' || v === 'auto' ? v : undefined;
@@ -475,7 +494,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { readOnl
     // balance, and it's no longer in Settings).
     oneReply: json.oneReply !== false,
     labReview: json.labReview !== false,
-    ...labReviewersFrom(json.labReviewers),
+    ...reviewerLists(json.labReviewers, json.labPanel),
+    labPanelLines: typeof json.labPanelLines === 'number' && Number.isFinite(json.labPanelLines) && json.labPanelLines >= 0 ? Math.floor(json.labPanelLines) : LAB_PANEL_LINES,
     // On for everyone since 10 Nov 2026, after a few days as an experiment
     // on Mike's Mac; Settings turns it off for anyone who'd rather.
     keepAwake: json.keepAwake !== false,

@@ -12,7 +12,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { Runner, ThreadState } from '../runner.ts';
+import type { Runner, ThreadState, TurnHold } from '../runner.ts';
+import { CARRY_ON_TOKEN } from '../runner.ts';
 import type { ImageRef } from '../protocol.ts';
 import { normaliseRecord, type ThreadRecord } from '../store.ts';
 import type { RunnerPart } from './part.ts';
@@ -1146,6 +1147,148 @@ export const movesPart = {
 
   moveRunnerName(this: Runner, runnerId: string): string {
     return this.runnerNames?.(runnerId) ?? runnerId;
+  },
+
+  // Box mode: no turn starts in the thread while `reason` holds it
+  // (Runtime.holds); messages wait in its queue.
+  holdTurns(this: Runner, threadId: string, reason: TurnHold): void {
+    const st = this.threads.get(threadId);
+    if (!st) return;
+    (st.rt.holds ??= new Set()).add(reason);
+  },
+
+  // The hold lifted; what waited in the queue goes on.
+  releaseTurns(this: Runner, threadId: string, reason: TurnHold): void {
+    const st = this.threads.get(threadId);
+    if (!st?.rt.holds?.delete(reason)) return;
+    if (!st.rt.holds.size) st.rt.holds = undefined;
+    this.kickQueue(st);
+  },
+
+  // Box mode's save (src/box-save.ts). Every save the backend asks for is a
+  // stopping one (to sleep, at its day's hours, or to be archived), and
+  // once it's acknowledged the backend may delete the box: so nothing may
+  // change the thread's folder after the copy is taken. Turns are held, a
+  // running turn is interrupted (`turnGraceMs` to end), and the CLI closed;
+  // then `stopOthers` (box-procs.ts) kills every other process the box
+  // started, whatever it is (a setup's background children, a teardown,
+  // anything the agent left running), the runner's own work is waited for,
+  // and it looks once more that nothing new started, before the record is
+  // written out and returned. The hold stays whatever happens, a failure
+  // here included: only the backend lets it go (box-save.ts SaveHold).
+  async quiesceForSave(this: Runner, threadId: string, opts: { stopOthers?: () => Promise<unknown>; turnGraceMs?: number; waitMs?: number } = {}): Promise<ThreadRecord> {
+    const st = this.threads.get(threadId);
+    if (!st) throw new Error("The box's thread isn't here, so there's nothing to save.");
+    const { rt } = st;
+    this.holdTurns(threadId, 'save');
+    if (rt.turn || rt.approvals.size) this.interrupt(threadId);
+    const waitFor = async (busy: () => boolean, ms: number) => {
+      for (const end = Date.now() + ms; busy(); ) {
+        if (Date.now() > end) return false;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return true;
+    };
+    // The turn ends by itself if it can; if not, closing its CLI ends it.
+    await waitFor(() => Boolean(rt.turn), opts.turnGraceMs ?? 30_000);
+    this.flushDeltas(st);
+    if (rt.session && !rt.closing) {
+      this.rememberStoppedWork(st);
+      this.releaseSession(st);
+    }
+    await opts.stopOthers?.();
+    if (rt.closing) await rt.closing;
+    // And the patches' functions already being read (a live poll): no new
+    // one starts while the save holds it (readPatches).
+    const busy = () => Boolean(rt.turn || rt.restoreSetup || rt.hooksRunning || rt.runningActions?.size || rt.editing || rt.cleaning || rt.preparing || this.patchReads.size);
+    if (!(await waitFor(busy, opts.waitMs ?? 60_000))) throw new Error("The thread's work didn't stop in time, so it wasn't saved. It stays stopped until the backend wakes it.");
+    // Nothing new since: whatever the waits above let finish may have started something.
+    await opts.stopOthers?.();
+    this.flushDeltas(st);
+    this.store.save(st.rec);
+    return structuredClone(st.rec);
+  },
+
+  // Box mode, after a box restored its thread from a save (box-save.ts): the
+  // worktree's setup again, as the save carries no installed packages. The
+  // thread's turns are held ('setup', set as it loaded: RunnerDeps
+  // boxHolds) until it's done; a setup that fails says so, and the turns go
+  // ahead all the same. It's a writer a stopping save waits for
+  // (rt.restoreSetup). The checkout is the box's own clone, trusted as the
+  // runner's own checkout is.
+  async setUpRestored(this: Runner, threadId: string): Promise<void> {
+    const st = this.threads.get(threadId);
+    const run = async () => {
+      const w = st?.rec.worktree;
+      if (!st || !w || w.removedAt || !w.patchFile) return;
+      const patch = await findWorktreePatch(w.mainCheckout, this.panelsRoot, this.patchCache, undefined, this.patchTrust).catch(() => undefined);
+      if (!patch) {
+        this.emit(st, { type: 'system.note', text: "Couldn't find the worktree's patch after restoring this thread, so its setup didn't run again. Run it yourself if the thread needs it." });
+        return;
+      }
+      const ok = await this.setUpWorktree(st, { worktree: w, patchFile: path.join(w.path, w.patchFile) }, patch);
+      if (ok === false) this.emit(st, { type: 'system.note', text: "The worktree's setup failed after this thread was restored on a new machine. The thread carries on; run the setup yourself if it needs it." });
+    };
+    const going = run().catch((e: unknown) => {
+      if (st) this.emit(st, { type: 'system.note', text: `The worktree's setup couldn't run after this thread was restored: ${String((e as Error)?.message ?? e)}. The thread carries on.` });
+    });
+    if (st) st.rt.restoreSetup = going;
+    try {
+      await going;
+    } finally {
+      if (st && st.rt.restoreSetup === going) st.rt.restoreSetup = undefined;
+      this.releaseTurns(threadId, 'setup');
+    }
+  },
+
+  // Box mode: a turn refused with the box's cloud token (errorKind auth). A
+  // box has one login, so there's nowhere to move: the thread says so once,
+  // waits with its turns held (messages queue behind), and the backend is
+  // told (onBoxTokenRefused) so the token card shows on Mike's Mac.
+  holdForToken(this: Runner, st: ThreadState, turnId: string): void {
+    const { rec } = st;
+    const already = Boolean(rec.waitingForToken);
+    // Which token was refused: the one the box ran on (box.json), kept with
+    // the wait so a restart says it again with that version (box-token.ts).
+    const was = rec.waitingForToken;
+    const refusedSetAt = was?.refusedSetAt ?? this.boxTokenSetAt?.();
+    rec.waitingForToken = { since: was?.since ?? this.isoNow(), turnId, ...(refusedSetAt !== undefined ? { refusedSetAt } : {}), reported: was?.reported ?? false };
+    this.holdTurns(rec.id, 'token');
+    if (!already) this.emit(st, { type: 'system.note', text: "Claude refused this box's token. The thread carries on once a new one is set." });
+    this.markDirty(st);
+    this.onBoxTokenRefused?.(rec.id);
+  },
+
+  // The backend has heard the box's refusal (box-token.ts): kept, so a restart doesn't say it again.
+  tokenRefusalReported(this: Runner, threadId: string): void {
+    const st = this.threads.get(threadId);
+    if (!st?.rec.waitingForToken || st.rec.waitingForToken.reported) return;
+    st.rec.waitingForToken.reported = true;
+    this.markDirty(st);
+  },
+
+  // A newer cloud token is on disk (box-token.ts): the CLI goes so the next
+  // one starts on it, and the thread carries on by itself, unless a message
+  // of Mike's waited meanwhile, which goes instead.
+  tokenReplaced(this: Runner, threadId: string): void {
+    const st = this.threads.get(threadId);
+    if (!st?.rec.waitingForToken) return;
+    delete st.rec.waitingForToken;
+    this.markDirty(st);
+    if (st.rt.session && !st.rt.closing) this.releaseSession(st);
+    const queued = st.rec.queue.length > 0;
+    this.releaseTurns(threadId, 'token');
+    if (!queued && this.bucket(st.rec) === 'inbox') this.carryOn(st, CARRY_ON_TOKEN);
+  },
+
+  // Box mode's degraded state (box-mode.ts): the box can't use its folder,
+  // so its thread runs nothing and says why, and the box stays up holding
+  // its key until a person sees to it.
+  holdBroken(this: Runner, threadId: string, why: string): void {
+    const st = this.threads.get(threadId);
+    if (!st) return;
+    this.holdTurns(threadId, 'broken');
+    this.emit(st, { type: 'system.note', text: `This thread's machine can't run it: ${why} It stays up, with nothing run, until someone looks at it.` });
   },
 };
 

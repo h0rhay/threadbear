@@ -476,6 +476,42 @@ pub fn needs_you(app: &AppSide, runner: Option<&RunnerUpdates>) -> bool {
     app.not_following.is_some() || runner.is_some_and(launcher_needs_you) || from_mike(runner) || not_following(runner)
 }
 
+/// What the icon itself shows of the next version, so a glance says it
+/// without opening the panel. Mike opened and shut Updates every 40 minutes
+/// or so on 18 Nov to see whether a build had finished; he picked a ring
+/// round the icon while one builds and the icon filled green once it's
+/// ready (review d3ac73e3, 19 Nov).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextVersion {
+    /// Nothing on its way: the plain icon.
+    None,
+    /// The app's next version is building, or about to (waiting for main to
+    /// settle or for a Mac to build on), or the runner is building a
+    /// release: the ring turns.
+    Coming,
+    /// The app's next version is built and switches in when he's idle (or
+    /// now, from the panel): the icon fills green.
+    Ready,
+}
+
+pub fn next_version(app: &AppSide, runner: Option<&RunnerUpdates>) -> NextVersion {
+    if app.staged.is_some() {
+        NextVersion::Ready
+    } else if app.building || app.settling || app.waiting || runner.is_some_and(|r| r.state == "building") {
+        NextVersion::Coming
+    } else {
+        NextVersion::None
+    }
+}
+
+/// The grey dot: what `shown` and the CLIs count, less what the icon
+/// already shows as its ring or its green (`next_version`).
+pub fn quiet_dot(app: &AppSide, runner: Option<&RunnerUpdates>, clis: &[CliStatus]) -> bool {
+    let app = AppSide { staged: None, building: false, settling: false, waiting: false, ..app.clone() };
+    let runner = runner.map(|r| RunnerUpdates { state: if r.state == "building" { "idle".to_owned() } else { r.state.clone() }, ..r.clone() });
+    shown(&app, runner.as_ref()) || clis.iter().any(cli_pending)
+}
+
 /// A machine that isn't following GitHub's main: nothing fixes that by
 /// itself, and bruce sat three days behind unnoticed (9 Nov).
 fn not_following(runner: Option<&RunnerUpdates>) -> bool {
@@ -875,6 +911,10 @@ pub struct Hold {
     pub version: String,
     pub reason: String,
     pub missing: Vec<String>,
+    /// The thread the runner started to look into a protocol hold.
+    pub thread_id: Option<String>,
+    /// That thread is still open: the row says it's being looked into.
+    pub investigating: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -902,7 +942,7 @@ impl CliStatus {
             previous_version: text(v, "previousVersion"),
             can_update_now: v["canUpdateNow"].as_bool().unwrap_or(false),
             checked_ms: v["checkedAt"].as_str().and_then(parse_ms),
-            hold: v["hold"].is_object().then(|| Hold { version: v["hold"]["version"].as_str().unwrap_or("").to_owned(), reason: v["hold"]["reason"].as_str().unwrap_or("").to_owned(), missing: strings(&v["hold"]["missing"]) }),
+            hold: v["hold"].is_object().then(|| Hold { version: v["hold"]["version"].as_str().unwrap_or("").to_owned(), reason: v["hold"]["reason"].as_str().unwrap_or("").to_owned(), missing: strings(&v["hold"]["missing"]), thread_id: v["hold"]["threadId"].as_str().map(str::to_owned), investigating: v["hold"]["investigating"].as_bool().unwrap_or(false) }),
             update: v["update"].is_object().then(|| {
                 let u = &v["update"];
                 CliUpdate {
@@ -940,12 +980,29 @@ pub fn status_line(cli: &CliStatus) -> String {
         "behind" => format!("{installed}{}", cli.latest_version.as_ref().map_or_else(|| ", an update is available".to_owned(), |v| format!(", {v} available"))),
         "held" => {
             let version = cli.hold.as_ref().map(|h| h.version.clone()).or_else(|| cli.latest_version.clone()).unwrap_or_else(|| "The new version".to_owned());
+            if is_investigated(cli) {
+                return format!("{name} {version} is held back, investigating why");
+            }
             let reason = cli.hold.as_ref().map_or("", |h| h.reason.as_str());
             format!("{name} {version} is held back{}", if reason.is_empty() { String::new() } else { format!(" because {reason}") })
         }
         "missing" => format!("{name} isn't installed"),
         _ => installed,
     }
+}
+
+/// A held version a thread is looking into right now (the runner started it,
+/// so Mike isn't left to guess whether "Update anyway" is safe).
+pub fn is_investigated(cli: &CliStatus) -> bool {
+    cli.status == "held" && cli.hold.as_ref().is_some_and(|h| h.investigating && h.thread_id.is_some())
+}
+
+/// The thread on a held version, open or done, for a link to it.
+pub fn hold_thread(cli: &CliStatus) -> Option<&str> {
+    if cli.status != "held" {
+        return None;
+    }
+    cli.hold.as_ref().and_then(|h| h.thread_id.as_deref())
 }
 
 /// Who keeps it up to date, when that isn't the usual: a path set by hand is
@@ -1132,6 +1189,16 @@ mod tests {
         assert_eq!(banner_text(&codex).as_deref(), Some("Installing Codex 0.165.0"));
         codex.update = Some(CliUpdate { state: "failed".into(), target_version: Some("0.165.0".into()), message: Some("0.165.0 is held back".into()), ..Default::default() });
         assert_eq!(banner_text(&codex).as_deref(), Some("Couldn't update Codex to 0.165.0: 0.165.0 is held back"));
+        // A hold the runner started a thread on says so while it's open.
+        let looked = decode_clis(&json!([{ "provider": "codex", "path": "/x/codex", "managedBy": "threadbear", "installedVersion": "0.170.0", "latestVersion": "0.171.0", "status": "held", "policy": "auto", "inUse": [],
+            "hold": { "version": "0.171.0", "reason": "the app-server protocol changed", "missing": ["server request currentTime/read"], "threadId": "t1", "investigating": true } }]));
+        assert_eq!(status_line(&looked[0]), "Codex 0.171.0 is held back, investigating why");
+        assert_eq!(hold_thread(&looked[0]), Some("t1"));
+        let mut done = looked[0].clone();
+        done.hold.as_mut().unwrap().investigating = false;
+        assert_eq!(status_line(&done), "Codex 0.171.0 is held back because the app-server protocol changed");
+        assert_eq!(hold_thread(&done), Some("t1"), "still links what it found");
+        assert_eq!(hold_thread(&clis[1]), None);
         let current = CliStatus { status: "current".into(), ..clis[0].clone() };
         assert_eq!(status_line(&current), "Claude Code 2.1.311, up to date");
         assert!(!cli_pending(&current));
@@ -1168,6 +1235,36 @@ mod tests {
         let week = zone.timestamp_millis_opt(parse_ms("2026-11-14T01:20:00.000Z").unwrap()).unwrap();
         assert_eq!(checked_line(&clis, &week).as_deref(), Some("Checked Wed 9 am"));
         assert_eq!(checked_line(&[], &Local::now()), None);
+    }
+
+    #[test]
+    fn the_icon_shows_the_next_version_without_a_click() {
+        let app = |f: fn(&mut AppSide)| {
+            let mut a = AppSide { running: Some("abc1234".into()), ..Default::default() };
+            f(&mut a);
+            a
+        };
+        let nothing = app(|_| {});
+        assert_eq!(next_version(&nothing, None), NextVersion::None);
+        assert!(!quiet_dot(&nothing, None, &[]));
+        for coming in [app(|a| a.building = true), app(|a| a.settling = true), app(|a| a.waiting = true)] {
+            assert_eq!(next_version(&coming, None), NextVersion::Coming);
+            assert!(!quiet_dot(&coming, None, &[]), "the ring says it, so no grey dot too");
+        }
+        let runner = RunnerUpdates { state: "building".into(), ..Default::default() };
+        assert_eq!(next_version(&nothing, Some(&runner)), NextVersion::Coming);
+        assert!(!quiet_dot(&nothing, Some(&runner), &[]));
+        let ready = app(|a| {
+            a.staged = Some("def5678".into());
+            a.building = true;
+        });
+        assert_eq!(next_version(&ready, None), NextVersion::Ready, "ready wins over a newer one building");
+        assert!(!quiet_dot(&ready, None, &[]));
+        // What the ring and the green don't cover keeps its grey dot.
+        assert!(quiet_dot(&app(|a| a.failed = true), None, &[]));
+        assert!(quiet_dot(&ready, None, &mock_clis()));
+        let old = RunnerUpdates { state: "idle".into(), old_runners: vec![OldRunner::default()], ..Default::default() };
+        assert!(quiet_dot(&nothing, Some(&old), &[]));
     }
 
     #[test]

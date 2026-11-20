@@ -401,7 +401,12 @@ data class MessageImage(
     val url: String,
     val width: Int? = null,
     val height: Int? = null,
+    /** What it is (API 95): text/html for a live page, which this app doesn't run yet. */
+    val mediaType: String? = null,
 ) {
+    /** A live page an agent showed in its reply (the livePages experiment). */
+    val isPage: Boolean get() = mediaType == "text/html"
+
     companion object {
         fun read(o: JsonObject) = MessageImage(
             seq = o.needNum("seq").wholeCount() ?: throw BadRow("Not a seq"),
@@ -410,6 +415,7 @@ data class MessageImage(
             url = o.needStr("url"),
             width = o.num("width")?.wholeCount(),
             height = o.num("height")?.wholeCount(),
+            mediaType = o.str("mediaType"),
         )
     }
 }
@@ -500,6 +506,11 @@ object BackendApi {
     const val BUTTONS = 59
     const val SLASH_COMMANDS = 62
     const val PLANS = 72
+    /**
+     * From 93 a phone can register a Web Push endpoint (platform "webpush",
+     * phone:webPushKey for the VAPID key): the fdroid build's UnifiedPush.
+     */
+    const val WEB_PUSH = 93
 }
 
 enum class CommandState { PENDING, TAKEN, DONE, FAILED }

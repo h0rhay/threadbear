@@ -4,7 +4,9 @@
 // which the owning runner applies (step 3 of docs/convex-backend.md) and
 // marks done or failed. Nothing here touches a runner directly.
 import { ConvexError, v, type Infer } from 'convex/values';
-import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import { action, internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import { internal } from './_generated/api';
+import { AUTH_SECRET, P256DH, endpointProblem } from './webPushEndpoint';
 import type { Doc, Id } from './_generated/dataModel';
 import { command as commandMachine, queued } from './machines';
 import { messageButton, threadFields, views } from './schema';
@@ -1255,11 +1257,20 @@ export const registerDevice = mutation({
   // platform (API 66): "android" when apnsToken is the phone's Firebase token,
   // not an Apple one (the field keeps its name; the table is indexed by it).
   // Left out, as every iPhone does, it is an Apple token.
-  args: { token: v.string(), apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), pushKey: v.optional(v.string()), platform: v.optional(v.literal('android')) },
+  // platform "webpush" (API 93, the Android app's F-Droid build): apnsToken is
+  // its UnifiedPush endpoint, a public https address (webPushEndpoint.ts),
+  // and webPush has the subscription's p256dh and auth, base64url.
+  args: { token: v.string(), apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), pushKey: v.optional(v.string()), platform: v.optional(v.union(v.literal('android'), v.literal('webpush'))), webPush: v.optional(v.object({ p256dh: v.string(), auth: v.string() })) },
   returns: v.null(),
-  handler: async (ctx, { token, apnsToken, environment, pushKey, platform }) => {
+  handler: async (ctx, { token, apnsToken, environment, pushKey, platform, webPush }) => {
     if (pushKey !== undefined && !/^[A-Za-z0-9+/]{43}=$/.test(pushKey)) throw new ConvexError({ kind: 'invalid', message: 'pushKey must be base64 of 32 bytes' });
-    if (platform === 'android') {
+    if (platform === 'webpush') {
+      const problem = endpointProblem(apnsToken);
+      if (problem) throw new ConvexError({ kind: 'invalid', message: `apnsToken must be a public https UnifiedPush endpoint (it's ${problem})` });
+      if (!webPush || !P256DH.test(webPush.p256dh) || !AUTH_SECRET.test(webPush.auth)) throw new ConvexError({ kind: 'invalid', message: 'webPush needs p256dh (65 bytes) and auth (16 bytes), base64url' });
+    } else if (webPush) {
+      throw new ConvexError({ kind: 'invalid', message: 'webPush is only for platform "webpush"' });
+    } else if (platform === 'android') {
       if (!FCM_TOKEN.test(apnsToken)) throw new ConvexError({ kind: 'invalid', message: 'apnsToken must be the phone\'s Firebase token' });
     } else if (!APNS_TOKEN.test(apnsToken)) throw new ConvexError({ kind: 'invalid', message: 'apnsToken must be the device token in hex' });
     const t = await checkPhoneToken(ctx, token);
@@ -1268,7 +1279,7 @@ export const registerDevice = mutation({
       .withIndex('by_apnsToken', (q) => q.eq('apnsToken', apnsToken))
       .unique();
     const key = pushKey ?? existing?.pushKey;
-    const row = { apnsToken, environment, tokenName: t.name, tokenId: t.id, updatedAt: Date.now(), ...(existing?.notify ? { notify: existing.notify } : {}), ...(key ? { pushKey: key } : {}), ...(platform ? { platform } : {}) };
+    const row = { apnsToken, environment, tokenName: t.name, tokenId: t.id, updatedAt: Date.now(), ...(existing?.notify ? { notify: existing.notify } : {}), ...(key ? { pushKey: key } : {}), ...(platform ? { platform } : {}), ...(webPush ? { webPush } : {}) };
     // A phone token's oldest registrations give way to a new one (or one it
     // takes over from another token), so a token holds at most
     // MAX_DEVICES_PER_TOKEN rows: a phone reinstalled gets a new APNs token,
@@ -1284,6 +1295,46 @@ export const registerDevice = mutation({
     return null;
   },
 });
+
+// The F-Droid build's UnifiedPush registration needs this deployment's VAPID
+// public key first (API 93): an uncompressed P-256 point, base64url. Made
+// the first time anyone asks (devices:putVapidKey keeps the first one saved),
+// and the same from then on. An action, as only an action can make a key.
+export const webPushKey = action({
+  args: { token: v.string() },
+  returns: v.object({ vapid: v.string() }),
+  handler: async (ctx, { token }): Promise<{ vapid: string }> => {
+    await ctx.runQuery(internal.phone.phoneTokenOk, { token });
+    let key = await ctx.runQuery(internal.devices.vapidKey, {});
+    if (!key) {
+      const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])) as CryptoKeyPair;
+      const jwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+      if (!jwk.x || !jwk.y || !jwk.d) throw new Error('VAPID key export missing a part');
+      key = await ctx.runMutation(internal.devices.putVapidKey, { x: jwk.x, y: jwk.y, d: jwk.d });
+    }
+    const point = new Uint8Array(65);
+    point[0] = 4;
+    point.set(fromB64url(key.x), 1);
+    point.set(fromB64url(key.y), 33);
+    return { vapid: toB64url(point) };
+  },
+});
+
+// For phone actions: throws as any phone call does when the token's no good.
+export const phoneTokenOk = internalQuery({
+  args: { token: v.string() },
+  returns: v.null(),
+  handler: async (ctx, { token }) => {
+    await checkPhoneToken(ctx, token);
+    return null;
+  },
+});
+
+function fromB64url(s: string): Uint8Array {
+  const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+const toB64url = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
 // When this phone wants a push (API 3): "away" (the default) only while
 // Mike isn't at the Mac, "always", or "off".

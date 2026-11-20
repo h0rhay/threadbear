@@ -68,6 +68,14 @@ When("the app's next version, def5678, is ready", async function (this: Threadbe
   await this.app.do({ cmd: 'updates', preview: 'staged' });
 });
 
+When("the app's next version is building", async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'updates', preview: 'building' });
+});
+
+When("the app has no update on its way", async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'updates', preview: 'none' });
+});
+
 When("the app's next version is waiting for a Mac to build it on", async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'updates', preview: 'waiting' });
 });

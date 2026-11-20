@@ -3,12 +3,16 @@
 # file as a hard check and these as a report. Take a file off the list once
 # it passes there; the list only shrinks, except for a new test of something
 # that only runs on a Mac or Linux (tb land's, added 18 Nov: its test
-# harness makes repos through /bin/sh).
+# harness makes repos through /bin/sh),
+# and box mode's (box-mode, box-save, added 19 Nov: a box is a Linux machine,
+# and their tests make its repos through /bin/sh).
 account-isolation.test.ts
 acp-adapter.test.ts
 acp-grok.test.ts
 agent-write-trust.test.ts
 background.test.ts
+box-mode.test.ts
+box-save.test.ts
 check-mock-swift-tests.test.ts
 check-only.test.ts
 check-remote-line.test.ts
@@ -18,7 +22,6 @@ claude-trust.test.ts
 codex-approvals.test.ts
 contracts.test.ts
 desktop-ci-paths.test.ts
-frozen-cli.test.ts
 gpui-dev-app.test.ts
 gpui-driver-evidence.test.ts
 hangup-guard.test.ts
@@ -50,13 +53,11 @@ perf-build.test.ts
 perf-lock.test.ts
 perf-swift.test.ts
 projects.test.ts
-quiet-inbox.test.ts
 reinstall.test.ts
 release.test.ts
 remote-perf-lock.test.ts
 remote-ssh-drop.test.ts
 remote-turn.test.ts
-restart.test.ts
 rpc.test.ts
 runner-keys.test.ts
 runner.test.ts
@@ -64,7 +65,6 @@ safe-cut.test.ts
 safe-git.test.ts
 schedule-check-writes.test.ts
 script-trust.test.ts
-secrets-guard.test.ts
 self-hosted-plan.test.ts
 share-images.test.ts
 shared-cargo.test.ts
@@ -75,7 +75,6 @@ stage-update-hosts.test.ts
 stuck-jobs.test.ts
 swift-freeze.test.ts
 sync-main.test.ts
-sync.test.ts
 tb-dev.test.ts
 thread-keys.test.ts
 unvouched-upgrade.test.ts

@@ -104,6 +104,16 @@ When('a check-in is booked on {string}', async function (this: ThreadbearWorld, 
   await this.app.do({ cmd: 'mock', method: 'checkIn', params: { title } });
 });
 
+// Its agent ended the turn waiting on another thread (end_turn's waitFor),
+// or on the app restarting onto what it landed (the mock's `waitOn`).
+When('{string} waits on {string}', async function (this: ThreadbearWorld, title: string, on: string) {
+  await this.app.do({ cmd: 'mock', method: 'waitOn', params: { title, on } });
+});
+
+When('{string} waits for the app update', async function (this: ThreadbearWorld, title: string) {
+  await this.app.do({ cmd: 'mock', method: 'waitOn', params: { title, app: true } });
+});
+
 // Under Hibernating for its schedule: when that runs, in the time's place
 // ("3:05 pm" today, "Mon 9:00 am" otherwise; the clock's own style).
 Then('the row {string} says when its schedule messages it', async function (this: ThreadbearWorld, title: string) {

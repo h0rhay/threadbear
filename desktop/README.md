@@ -176,11 +176,18 @@ carry `@real-screen` and run on Tinker Desk under the host lease.
 
 ## Seeing it on a server
 
-`scripts/shot.sh OUT_DIR [--home DIR] [--click X,Y | --type TEXT | --key KEY]...`
+`scripts/shot.sh OUT_DIR [--home DIR] [--click X,Y | --type TEXT | --key KEY]... [--record S]`
 runs the debug build (`cargo build -p threadbear-gpui`) on a virtual display
 (Xvfb) with Mesa's software Vulkan, against the mock (or the runner in
 `--home`), and saves screenshots: `0.png` before any step, then one after
-each.
+each. `--record S` also films the window through the steps for S seconds to
+`clip.mp4` (needs ffmpeg), for motion when no Mac's screen is free. Under
+`remote.sh cloud` it finds the build in `$CARGO_TARGET_DIR` by itself:
+
+```bash
+scripts/remote.sh cloud -- bash -c 'cd desktop && cargo build -p threadbear-gpui && scripts/shot.sh /tmp/out --record 6 --key Return'
+scp 'cloud:/tmp/out/*' .
+```
 
 ## Known gaps
 

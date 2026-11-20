@@ -152,7 +152,12 @@ impl Threadbear {
 
     /// Something on its way for the runner or a CLI: the icon's grey dot.
     pub(crate) fn updates_quiet_dot(&self) -> bool {
-        rules::shown(&self.app_side(), self.updates_panel.runner.as_ref()) || self.updates_panel.clis.iter().any(rules::cli_pending)
+        rules::quiet_dot(&self.app_side(), self.updates_panel.runner.as_ref(), &self.updates_panel.clis)
+    }
+
+    /// The ring while the next version builds, green once it's ready.
+    pub(crate) fn next_version(&self) -> rules::NextVersion {
+        rules::next_version(&self.app_side(), self.updates_panel.runner.as_ref())
     }
 
     /// Something only Mike can do: the accent dot.
@@ -527,6 +532,11 @@ impl Threadbear {
     fn render_app_update(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let side = self.app_side();
         let mut out = vec![text_line(rules::app_line(&side), 12., style::label_text(cx)).into_any_element()];
+        // The thread whose box holds it, to go and send or clear it there.
+        if let (Some(threadbear_core::app_update::RestartWait::Held(_)), Some(id)) = (&side.wait, self.updater.hold_thread.clone()) {
+            let open = id.clone();
+            out.push(text_button(SharedString::from(format!("updates-hold-{id}")), self.thread_title(&id), "Open the thread with the words still typed", 12., true, false, cx, move |t, window, cx| t.open(open.clone(), window, cx)));
+        }
         if side.staged.is_some() {
             out.push(h_flex().child(push_button("updates-restart", "Restart to Update", "Quit and reopen on the new version. Running threads carry on in the runner.", false, false, cx, |t, _, cx| t.restart_to_update(cx))).into_any_element());
         } else if side.failed {
@@ -762,7 +772,8 @@ impl Threadbear {
         let title = rules::update_title(cli);
         // Its first line's baseline on the button's, as the Swift row's
         // `.firstTextBaseline` puts it.
-        let status = text_line(rules::status_line(cli), 12., if cli.status == "held" { system_orange(cx) } else { fg }).flex_1().min_w_0().when(title.is_some(), |s| s.mt(px(2.)));
+        // Being looked into needs nothing from Mike, so it isn't orange.
+        let status = text_line(rules::status_line(cli), 12., if cli.status == "held" && !rules::is_investigated(cli) { system_orange(cx) } else { fg }).flex_1().min_w_0().when(title.is_some(), |s| s.mt(px(2.)));
         let mut top = h_flex().items_start().gap(px(6.)).child(status);
         if let Some(title) = title {
             let tip = if cli.can_update_now {
@@ -781,6 +792,11 @@ impl Threadbear {
         }
         if let Some(missing) = cli.hold.as_ref().map(|h| &h.missing).filter(|m| !m.is_empty()) {
             row = row.child(text_line(format!("Missing: {}", missing.join(", ")), 11., tertiary).line_clamp(2));
+        }
+        if let Some(id) = rules::hold_thread(cli) {
+            let open = id.to_owned();
+            let tip = if rules::is_investigated(cli) { "Open the thread looking into it" } else { "Open the thread that looked into it" };
+            row = row.child(text_button(SharedString::from(format!("updates-hold-{provider}")), self.thread_title(id), tip, 12., true, false, cx, move |t, window, cx| t.open(open.clone(), window, cx)));
         }
         if let Some(managed) = rules::managed_line(cli) {
             row = row.child(text_line(managed, 11., tertiary));
@@ -853,7 +869,12 @@ impl Threadbear {
                 });
             }
         }
-        lines.extend(["# App".to_owned(), rules::app_line(&self.app_side()), "# Runner".to_owned()]);
+        let side = self.app_side();
+        lines.extend(["# App".to_owned(), rules::app_line(&side)]);
+        if let (Some(threadbear_core::app_update::RestartWait::Held(_)), Some(id)) = (&side.wait, &self.updater.hold_thread) {
+            lines.push(format!("  > {}", self.thread_title(id)));
+        }
+        lines.push("# Runner".to_owned());
         match &self.updates_panel.runner {
             Some(runner) => {
                 let (build, old, launcher) = (rules::build_line(runner), rules::old_runners_line(runner), rules::launcher_line(runner));
@@ -914,6 +935,9 @@ impl Threadbear {
                 lines.push(rules::dump_line(cli));
                 if let Some(missing) = cli.hold.as_ref().map(|h| &h.missing).filter(|m| !m.is_empty()) {
                     lines.push(format!("  Missing: {}", missing.join(", ")));
+                }
+                if let Some(id) = rules::hold_thread(cli) {
+                    lines.push(format!("  [{}]", self.thread_title(id)));
                 }
                 lines.extend(rules::managed_line(cli).map(|m| format!("  {m}")));
             }

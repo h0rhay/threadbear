@@ -183,6 +183,8 @@ for (const mode of MODES) {
         ['accounts.useReset', { accountId: 'codex-main' }],
         ['accounts.findWork', { accountId: 'codex-main' }],
         ['accounts.recheck', {}],
+        ['accounts.yearToken', { accountId: 'claude-main' }],
+        ['accounts.yearToken', { accountId: 'claude-main', runnerId: 'cb921b2447ea', code: 'abcdefgh#ijklmnop' }],
         ['panels.convexKey', { threadId: me.id, panelId: 'x' }],
         ['no.such.method', {}],
       ];
@@ -235,6 +237,22 @@ test('a thread lowered to Ask loses it at once: the mode is read at each call', 
     await c.call('threads.create', { text: 'x', permissionMode: 'full', accountId: 'claude-3' });
     h.runner.update({ threadId: me.id, permissionMode: 'ask' });
     await assert.rejects(c.call('threads.create', { text: 'x', permissionMode: 'full', accountId: 'claude-3' }), refused);
+    c.close();
+  } finally {
+    await server.close();
+  }
+});
+
+// Codex's review, 19 Nov: a Full access thread could ask another runner for
+// a token page, approve it with an account of its own and send the code.
+test("a Full access thread can't make a year-long token, here or on another runner", async () => {
+  const { h, server, token, url } = await serve();
+  const me = thread(h, 'full');
+  try {
+    const c = await as(url, token, me.id);
+    for (const params of [{ accountId: 'claude-main' }, { accountId: 'claude-main', runnerId: 'cb921b2447ea', code: 'abcdefgh#ijklmnop' }]) {
+      await assert.rejects(c.call('accounts.yearToken', params), /user's to do/);
+    }
     c.close();
   } finally {
     await server.close();
@@ -752,3 +770,33 @@ for (const mode of MODES) {
     }
   });
 }
+
+test("a login's cloud token and a thread on a virtual runner are the user's, from the app: refused to any thread's key, Full access too", async () => {
+  const started: unknown[] = [];
+  const tokens: unknown[] = [];
+  const { h, server, token, url } = await serve({
+    virtualStart: async (p) => {
+      started.push(p);
+      return { thread: { id: 'cloud-1', runnerId: 'abcdef012345' } };
+    },
+    methods: { 'cloudTokens.set': (p) => (tokens.push(p), {}), 'cloudTokens.make': (p) => (tokens.push(p), {}) },
+  });
+  const me = thread(h, 'full');
+  try {
+    const c = await as(url, token, me.id);
+    await assert.rejects(c.call('cloudTokens.set', { login: 'me@example.com', token: 'sk-ant-oat01-x' }), (e: { code?: number; message?: string }) => refused(e) && /card in the app/.test(e.message ?? ''));
+    await assert.rejects(c.call('cloudTokens.make', { login: 'me@example.com' }), refused);
+    await assert.rejects(c.call('threads.create', { text: 'x', serviceId: 'runnerServices:1', cwd: '/x', accountId: 'claude-3' }), (e: { code?: number; message?: string }) => refused(e) && /Runs on/.test(e.message ?? ''));
+    c.close();
+    assert.deepEqual([started.length, tokens.length], [0, 0]);
+    // The app, on the runner's token: through.
+    const app = await RunnerClient.connect(url, token);
+    assert.deepEqual(await app.call('threads.create', { text: 'x', serviceId: 'runnerServices:1', cwd: '/x', accountId: 'claude-3' }), { thread: { id: 'cloud-1', runnerId: 'abcdef012345' } });
+    assert.deepEqual(await app.call('cloudTokens.make', { login: 'me@example.com' }), {});
+    await assert.rejects(app.call('threads.create', { text: 'x', serviceId: 7 }), (e: { code?: number }) => e.code === -32602);
+    app.close();
+    assert.equal(started.length, 1);
+  } finally {
+    await server.close();
+  }
+});

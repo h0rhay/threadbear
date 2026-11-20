@@ -121,9 +121,25 @@ export class CallerGate {
     // Any agent's move, Full's too: it never starts a turn by itself
     // (Runner.update's carry-on after a limit is Mike's pick from the menu).
     if (method === 'threads.update' && (p.cwd !== undefined || p.accountId !== undefined || p.poolId !== undefined)) p = { ...p, byAgent: true };
+    // A CLI started ahead of a new thread is for the app's new-thread page
+    // (runner/warm-start.ts): a thread neither starts one nor takes the app's.
+    if (method === 'threads.warm') throw new RpcError(ErrorCode.notAllowed, "Starting a CLI ahead of a new thread is the app's to do.");
+    if (method === 'threads.create' && p.warmId !== undefined) {
+      const { warmId: _w, ...rest } = p;
+      p = rest;
+    }
     // Reinstalling stops every thread's runner; an agent hands that to the
     // user (install-runner.sh refuses from a thread too), Full access or not.
     if (method === 'runner.reinstall') throw new RpcError(ErrorCode.notAllowed, "Reinstalling the runner stops every thread's turn, so it's the user's to do: Reinstall now in the app's Updates panel.");
+    // A year-long token changes which Claude account a login (on any of
+    // the user's runners) runs as: a thread could approve the page with an
+    // account of its own choosing. Only the user's click in the app, Full
+    // access or not (Codex's review, 19 Nov).
+    if (method === 'accounts.yearToken') throw new RpcError(ErrorCode.notAllowed, "Making a year-long token is the user's to do: Year-long token… in the app's Usage or Runners panel.");
+    // A login's cloud token, and threads on a virtual runner (a box billed by
+    // the hour, holding a year-long token), are the user's own, from the app.
+    if (method.startsWith('cloudTokens.')) throw new RpcError(ErrorCode.notAllowed, "A login's cloud token is the user's to set, from the card in the app.");
+    if (method === 'threads.create' && p.serviceId !== undefined) throw new RpcError(ErrorCode.notAllowed, 'Starting a thread on a virtual runner is the user\'s to do, from Runs on in the app.');
     if (known?.mode === 'full') return p;
     if (GATED_READS.has(method)) return p;
     if (!known) throw new RpcError(ErrorCode.notAllowed, "This thread isn't one the runner knows now, so it can only read. Ask the user to do it in the app.");

@@ -162,6 +162,11 @@ wouldn't have caught any of that (they pass on Tinker Desk), and all of them
 take 15 to 30 minutes a system, so instead the workflow's own result holds
 the next landing.
 
+The runner, Convex and website tests (`runner.yml`), Android (`android.yml`)
+and the Xcode 26 builds (`xcode-26.yml`) hold too since 19 Nov: `runner.yml`
+was red on Windows from 16 to 19 Nov, and as the daily release waits for
+every workflow to pass on one commit, none went out.
+
 A workflow opts in with a line of its own in its file:
 
 ```yaml
@@ -195,6 +200,15 @@ isn't signed in or can't reach GitHub (a 403 for that allowance too), an
 answer from the last half hour still counts, saying how old it is; with
 none, the landing goes ahead and says it couldn't ask. Only `desktop.yml` has the mark
 so far.
+
+In someone else's copy the gate stays out of the way. Since 19 Nov every
+workflow's jobs only run in `mikecann/threadbear` (or when started by hand),
+as a fork's owner only builds and checks for their own system and their
+pushes were running every job on Linux, Mac, Windows and Android, mostly
+red. A marked workflow whose `if:` names one repo (`github.repository ==
+'owner/name'`) holds only where origin is that repo; in a fork, gh reads the
+`upstream` remote's runs first, so before this Mike's red Windows build held
+landings that only had to work on a Mac.
 
 ### Landing together
 
@@ -335,10 +349,10 @@ a group of eight.
 
 So a failed check says what failed, and that alone is run on each landing:
 
-- A failed `./check.sh` ends with `To run only what failed again: --only
-  "..."`: the steps that failed, and for the runner's unit tests the files
-  (when there are 8 or fewer). `./check.sh --quick --only "<that>"` runs
-  just those, and says `skip ... (--only left it out)` for the rest. It's
+- A failed `./check.sh` ends with `To run only what failed again:
+  ./check.sh --only "..."`: the steps that failed, and for the runner's
+  unit tests the files (when there are 8 or fewer). That command, run from
+  the checkout's top (`tb land` takes no `--only`), runs just those, and says `skip ... (--only left it out)` for the rest. It's
   the quick way to see a fix work, too. A run with `--only` ends with
   `--only ran: "..."`, the steps of those asked for that it ran: exit 0
   alone doesn't tell passing a step from skipping it.

@@ -4,7 +4,7 @@
 // secrets, a new box's key replacing the last one's, and the box's states.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { call, claimAndFinish, load, outcome } from '../helpers/convex-memory.ts';
+import { call, claimAndFinish, load, outcome, THREAD_BASICS } from '../helpers/convex-memory.ts';
 import { BOX_RUNNER, boxBackend, CLAUDE_TOKEN, later, LOGIN, OWNER, SEAL_KEY, THREAD } from '../helpers/box-backend.ts';
 
 const sync = load('sync');
@@ -27,14 +27,15 @@ async function save(s: Awaited<ReturnType<typeof boxBackend>>, boxKey: string, n
   await call(s.ctx, boxes.boxSaved, { key: boxKey, storageId: name, bytes });
 }
 
-test("a cloud token is kept sealed: listed by login and time only, never in the clear", async () => {
-  const s = await boxBackend();
+test("a cloud token is kept sealed: listed by login, time and state only, never in the clear", async () => {
+  const s = await boxBackend({ token: false });
   await s.setToken();
   const row = { ...s.rows('cloudTokens')[0] };
   assert.equal(row.login, LOGIN);
   assert.ok(!JSON.stringify(s.rows('cloudTokens')).includes(CLAUDE_TOKEN.slice(13, 40)), 'not stored in the clear');
   const listed = await call(s.ctx, boxes.cloudTokens, { key: OWNER });
-  assert.deepEqual(listed.map((l: Record<string, unknown>) => Object.keys(l).sort()), [['login', 'madeAt', 'setAt']]);
+  assert.deepEqual(listed.map((l: Record<string, unknown>) => Object.keys(l).sort()), [['login', 'madeAt', 'setAt', 'state']]);
+  assert.equal(listed[0].state, 'valid');
   assert.ok(!JSON.stringify(listed).includes(row.sealed));
   // Setting it again replaces it.
   await s.setToken(`sk-ant-oat01-${'R'.repeat(60)}`);
@@ -43,7 +44,7 @@ test("a cloud token is kept sealed: listed by login and time only, never in the 
 });
 
 test('only the main key sets or lists cloud tokens, and a deployment without a seal key says so', async () => {
-  const s = await boxBackend();
+  const s = await boxBackend({ token: false });
   await s.ctx.db.insert('runnerKeys', { runnerId: MINI, keyHash: await sha256(MINI_KEY), name: 'mac-mini', createdAt: 1 });
   assert.equal(await outcome(s.setToken(CLAUDE_TOKEN, LOGIN, MINI_KEY)), 'forbidden');
   assert.equal(await outcome(call(s.ctx, boxes.cloudTokens, { key: MINI_KEY })), 'forbidden');
@@ -88,6 +89,8 @@ test('the exchange works once: a box key, the runner and thread, the login token
   assert.equal(Buffer.from(got.threadKey, 'base64').length, 32);
   assert.deepEqual(got.repo, { origin: 'https://github.com/mikecann/threadbear.git', subfolder: 'runner', baseBranch: 'main' });
   assert.equal(got.save, null);
+  // The login it runs on, as box mode can't read it from a token login's .claude.json.
+  assert.equal(got.login, LOGIN);
   const row = s.box();
   assert.equal(row.boxState.kind, 'awake');
   assert.equal(row.boxKeyHash, await sha256(got.boxKey));
@@ -159,13 +162,15 @@ test('of two exchanges racing with one boot token, exactly one wins', async () =
   assert.equal(s.state(), 'waking');
 });
 
-test('with no cloud token for its login, the exchange refuses and the boot token still works once one is set', async () => {
+test('with its cloud token gone, the exchange refuses and the boot token still works once one is set', async () => {
   const s = await boxBackend();
   const token = await s.mint();
+  // Never happens by itself (rows aren't deleted): the exchange still refuses rather than hand out nothing.
+  const kept = s.rows('cloudTokens').splice(0);
   assert.equal(await outcome(s.exchange(token)), 'noCloudToken');
   assert.equal(s.state(), 'creating');
   assert.equal(s.box().boxKeyHash, undefined);
-  await s.setToken();
+  s.rows('cloudTokens').push(...kept);
   assert.equal((await s.exchange(token)).claudeToken, CLAUDE_TOKEN);
 });
 
@@ -523,4 +528,92 @@ test('no query hands back a sealed token, a thread key or a key hash', async () 
   const answers = [...viewed, await call(s.ctx, boxes.cloudTokens, { key: OWNER }), await call(s.ctx, sync.threadsOf, { key: got.boxKey, runnerId: BOX_RUNNER }), await call(s.ctx, sync.runnersList, { key: OWNER })];
   const text = JSON.stringify(answers);
   for (const x of [...sealed, CLAUDE_TOKEN, got.threadKey]) assert.ok(!text.includes(x), 'nothing secret in what queries return');
+});
+
+// Slice 3's exchange (docs/protocol.md, "Box keys"): the box makes its own
+// key and sends its hash, so an answer lost on the way can be asked for
+// again, by that machine with that key, and by nobody else.
+test("a box's own key: the exchange keeps only its hash, and replays the answer to the same machine and key, never to anyone else", async () => {
+  const s = await boxBackend();
+  await s.setToken();
+  const token = await s.mint();
+  const boxKey = `tbb_${'d'.repeat(64)}`;
+  const boxKeyHash = await sha256(boxKey);
+  const ask = (a: Record<string, unknown>) => call(s.a, boxes.exchange, { bootToken: token, ...a });
+  const got = await ask({ machineId: 'm-1', boxKeyHash });
+  // No key made here: the box has its own, which now works.
+  assert.equal(got.boxKey, undefined);
+  assert.equal(s.box().boxKeyHash, boxKeyHash);
+  assert.equal(s.box().keyMachineId, 'm-1');
+  assert.equal(await outcome(heartbeat(s, boxKey)), 'ok');
+  // The same machine and key, its answer lost: the same answer, nothing changed.
+  const again = await ask({ machineId: 'm-1', boxKeyHash });
+  assert.deepEqual({ ...again }, { ...got });
+  assert.equal(s.box().boxKeyHash, boxKeyHash);
+  assert.equal(s.box().boxState.kind, 'awake');
+  // Anyone else with the spent token: refused.
+  assert.equal(await outcome(ask({ machineId: 'm-2', boxKeyHash })), 'auth');
+  assert.equal(await outcome(ask({ machineId: 'm-1', boxKeyHash: await sha256(`tbb_${'e'.repeat(64)}`) })), 'auth');
+  assert.equal(await outcome(ask({ boxKeyHash })), 'auth');
+  assert.equal(await outcome(ask({ machineId: 'm-1' })), 'auth');
+  assert.equal(await outcome(ask({})), 'auth');
+  assert.equal(await outcome(ask({ machineId: 'm-1', boxKeyHash: 'not-a-hash' })), 'badArgs');
+  // Past the token's 10 minutes: refused, the key still working.
+  assert.equal(await outcome(later(11 * 60_000, () => ask({ machineId: 'm-1', boxKeyHash }))), 'auth');
+  // Once the key isn't the thread's any more (a newer box), refused too.
+  await s.report({ type: 'LOST' });
+  assert.equal(await outcome(ask({ machineId: 'm-1', boxKeyHash })), 'auth');
+});
+
+test("a box's heartbeat answers with its box's state, which a box stopped by its save waits on; no other key's does", async () => {
+  const s = await boxBackend();
+  const got = await s.boot();
+  const r = await heartbeat(s, got.boxKey);
+  assert.deepEqual(r.box, { state: 'awake' });
+  await s.report({ type: 'IDLE', attempt: 1 });
+  assert.deepEqual((await heartbeat(s, got.boxKey)).box, { state: s.state() });
+  assert.notEqual(s.state(), 'awake');
+  const owner = await call(s.ctx, sync.heartbeat, { key: OWNER, runner: { runnerId: 'mac1', name: 'Mac', version: 'v', startedAt: new Date().toISOString(), draining: false, threadCount: 0 } });
+  assert.equal(owner.box, undefined);
+});
+
+test("a box held by its save: its heartbeats and its save's finish, sent `held`, don't mark it as holding work again", async () => {
+  const s = await boxBackend();
+  const got = await s.boot();
+  await heartbeat(s, got.boxKey);
+  assert.deepEqual(s.box().workAttempts, [1]);
+  await s.report({ type: 'IDLE', attempt: 1 });
+  // As the idle cron does (boxService.ts sleepIdleBoxes).
+  await boxes.askToSave(s.ctx, s.box());
+  const cmd = s.rows('commands').find((c) => c.kind === 'save')!;
+  assert.ok(cmd, 'a save asked for');
+  await save(s, got.boxKey, 'save1');
+  assert.deepEqual(s.box().workAttempts ?? [], [], 'the save covers the work');
+  const beat = (held?: boolean) => call(s.ctx, sync.heartbeat, { key: got.boxKey, runner: { runnerId: BOX_RUNNER, name: 'box', version: 'v', startedAt: new Date().toISOString(), draining: false, threadCount: 1 }, ...(held ? { held } : {}) });
+  await beat(true);
+  // Its finish (whatever the command's own state makes of it, its key is checked first).
+  await outcome(call(s.ctx, sync.finishCommand, { key: got.boxKey, commandId: cmd._id, ok: true, held: true }));
+  assert.deepEqual(s.box().workAttempts ?? [], []);
+  // Without it, a heartbeat is the box at work again.
+  await beat();
+  assert.deepEqual(s.box().workAttempts, [1]);
+});
+
+test("a box's repeated finish of a command already ended (a retry racing the first) doesn't mark it as working", async () => {
+  const s = await boxBackend();
+  const got = await s.boot();
+  await call(s.ctx, sync.upsertThreads, { key: got.boxKey, threads: [{ ...THREAD_BASICS, threadId: THREAD, runnerId: BOX_RUNNER, title: 't', view: 'inbox', needsYou: false }] });
+  await s.report({ type: 'IDLE', attempt: 1 });
+  await boxes.askToSave(s.ctx, s.box());
+  const cmd = s.rows('commands').find((c) => c.kind === 'save')!;
+  assert.equal(await call(s.ctx, sync.takeCommand, { key: got.boxKey, commandId: cmd._id }), true);
+  await call(s.ctx, sync.finishCommand, { key: got.boxKey, commandId: cmd._id, ok: true, held: true });
+  await save(s, got.boxKey, 'save1');
+  assert.deepEqual(s.box().workAttempts ?? [], []);
+  // The same finish again, without `held` (a heartbeat's retry of a finish whose answer was lost).
+  await call(s.ctx, sync.finishCommand, { key: got.boxKey, commandId: cmd._id, ok: true });
+  assert.deepEqual(s.box().workAttempts ?? [], [], 'a finish that changes nothing makes no work');
+  // Anything else from the box is work again, as before.
+  await call(s.ctx, sync.heartbeat, { key: got.boxKey, runner: { runnerId: BOX_RUNNER, name: 'box', version: 'v', startedAt: new Date().toISOString(), draining: false, threadCount: 1 } });
+  assert.deepEqual(s.box().workAttempts, [1]);
 });

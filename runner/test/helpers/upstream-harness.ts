@@ -58,6 +58,11 @@ export function world() {
   git(root, 'init', '-q', '--bare', '-b', 'main', mikeBare);
   git(root, 'clone', '-q', mikeBare, mike);
   git(mike, 'checkout', '-q', '-b', 'main');
+  // The keys Mike's repo announces, as scripts/release-signers does: what
+  // his runner checks its own release tags against before pushing them.
+  fs.mkdirSync(path.join(mike, 'scripts'));
+  fs.copyFileSync(mikeKey.signers, path.join(mike, 'scripts', 'release-signers'));
+  git(mike, 'add', 'scripts/release-signers');
   commit(mike, 'a.txt', 'First');
   signedTag(mike, 'release/2026-10-01', mikeKey.priv);
   git(mike, 'push', '-q', 'origin', 'main', '--tags');

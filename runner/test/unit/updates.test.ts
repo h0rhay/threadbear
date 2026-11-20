@@ -264,6 +264,130 @@ test('codex: a version whose schema lacks a method we use is held; the first sta
   assert.deepEqual(t.npm.installs(), ['0.166.0', '0.164.0']);
 });
 
+test('codex: a protocol hold starts one thread looking into it, and a runner start whose lists now pass installs it by itself', async () => {
+  const t = setup();
+  t.u.update('codex', { version: '0.164.0' });
+  await t.u.settled();
+  const started: { version: string; current?: string; missing: string[] }[] = [];
+  const threads = new Map<string, 'open' | 'archived'>();
+  t.hooks.heldBack = (h) => {
+    started.push(h);
+    threads.set(`thread-${started.length}`, 'open');
+    return `thread-${started.length}`;
+  };
+  t.hooks.threadState = (id) => threads.get(id);
+  t.latest.codex = '0.166.0';
+  fs.writeFileSync(path.join(t.root, 'drop-0.166.0'), '');
+  t.u.check('codex');
+  await t.u.settled();
+  let c = of(t.u.list(), 'codex');
+  assert.equal(c.status, 'held');
+  assert.deepEqual(started, [{ version: '0.166.0', current: '0.164.0', missing: ['turn/steer'], added: [] }]);
+  assert.deepEqual(c.hold, { version: '0.166.0', reason: 'the app-server protocol changed', missing: ['turn/steer'], threadId: 'thread-1', investigating: true });
+  // Later checks start no second thread. Archived, it's no longer
+  // "investigating" and the app hears so at once; deleted, it isn't linked.
+  t.u.check('codex');
+  await t.u.settled();
+  assert.equal(started.length, 1);
+  const sent = t.changes.length;
+  t.u.threadChanged('thread-1');
+  t.u.threadChanged('some-other-thread');
+  assert.equal(t.changes.length, sent, 'nothing changed, nothing sent');
+  threads.set('thread-1', 'archived');
+  // A client reading the list first (clis.list) doesn't count as telling it.
+  t.u.list();
+  t.u.threadChanged('thread-1');
+  assert.equal(t.changes.length, sent + 1);
+  assert.deepEqual(of(t.changes.at(-1)!, 'codex').hold, { version: '0.166.0', reason: 'the app-server protocol changed', missing: ['turn/steer'], threadId: 'thread-1' });
+  threads.delete('thread-1');
+  t.u.threadChanged('thread-1');
+  assert.equal(of(t.changes.at(-1)!, 'codex').hold?.threadId, undefined);
+  // The fix lands (here: the version's schema stops lacking turn/steer) and
+  // the runner restarts: its first check puts the kept copy through the gate
+  // again, clears the hold and installs it, with no second download.
+  fs.rmSync(path.join(t.root, 'drop-0.166.0'));
+  const again = t.make();
+  again.check('codex');
+  await again.settled();
+  c = of(again.list(), 'codex');
+  assert.deepEqual([c.installedVersion, c.status, c.hold], ['0.166.0', 'current', undefined]);
+  assert.deepEqual(t.npm.installs(), ['0.164.0', '0.166.0']);
+  assert.equal(started.length, 1);
+});
+
+test('codex: a hold from before heldBack gets its thread at the next check, still held', async () => {
+  const t = setup({ latest: { codex: '0.166.0' } });
+  t.u.update('codex', { version: '0.164.0' });
+  await t.u.settled();
+  fs.writeFileSync(path.join(t.root, 'drop-0.166.0'), '');
+  t.u.check('codex');
+  await t.u.settled();
+  assert.equal(of(t.u.list(), 'codex').hold?.threadId, undefined, 'no hook, no thread');
+  const started: string[] = [];
+  t.hooks.heldBack = (h) => (started.push(h.version), 'thread-old');
+  t.hooks.threadState = () => 'open';
+  const again = t.make();
+  again.check('codex');
+  await again.settled();
+  const c = of(again.list(), 'codex');
+  assert.deepEqual([c.status, c.installedVersion, c.hold?.threadId, started], ['held', '0.164.0', 'thread-old', ['0.166.0']]);
+});
+
+test('codex: an old hold a newer release has passed starts no thread, and the newer one installs', async () => {
+  const t = setup({ latest: { codex: '0.166.0' } });
+  t.u.update('codex', { version: '0.164.0' });
+  await t.u.settled();
+  fs.writeFileSync(path.join(t.root, 'drop-0.166.0'), '');
+  t.u.check('codex');
+  await t.u.settled();
+  const started: string[] = [];
+  t.hooks.heldBack = (h) => (started.push(h.version), 'thread-x');
+  t.latest.codex = '0.167.0';
+  const again = t.make();
+  again.check('codex');
+  await again.settled();
+  const c = of(again.list(), 'codex');
+  assert.deepEqual([c.installedVersion, c.hold, started], ['0.167.0', undefined, []]);
+});
+
+test('codex: a recheck whose gate gives no answer tries again at the next check', async () => {
+  const t = setup({ latest: { codex: '0.166.0' } });
+  t.u.update('codex', { version: '0.164.0' });
+  await t.u.settled();
+  fs.writeFileSync(path.join(t.root, 'drop-0.166.0'), '');
+  t.u.check('codex');
+  await t.u.settled();
+  fs.rmSync(path.join(t.root, 'drop-0.166.0'));
+  // The kept copy's binary fails once (a timeout, say), then works.
+  const native = path.join(t.tools, '0.166.0', ...NATIVE);
+  const good = fs.readFileSync(native, 'utf8');
+  fs.writeFileSync(native, '#!/bin/sh\nexit 1\n');
+  const again = t.make();
+  again.check('codex');
+  await again.settled();
+  assert.equal(of(again.list(), 'codex').status, 'held');
+  fs.writeFileSync(native, good);
+  again.check('codex');
+  await again.settled();
+  const c = of(again.list(), 'codex');
+  assert.deepEqual([c.installedVersion, c.hold], ['0.166.0', undefined]);
+});
+
+test('codex: a hold from going back is never cleared by a recheck', async () => {
+  const t = setup();
+  t.u.update('codex', { version: '0.164.0' });
+  await t.u.settled();
+  t.u.update('codex', { version: '0.165.0' });
+  await t.u.settled();
+  t.u.update('codex', { version: '0.164.0' });
+  await t.u.settled();
+  const again = t.make();
+  again.check('codex');
+  await again.settled();
+  const c = of(again.list(), 'codex');
+  assert.deepEqual([c.installedVersion, c.hold?.reason], ['0.164.0', 'you went back from it']);
+});
+
 test('codex: new names only still activate, and are recorded', async () => {
   const t = setup();
   fs.writeFileSync(path.join(t.root, 'add-0.165.0'), '');

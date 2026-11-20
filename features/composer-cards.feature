@@ -95,7 +95,7 @@ Feature: The open card in the composer
   Scenario: Archive on the done card asks whether I needed to see the thread
     When I open the thread "Tidy the imports in the uploader"
     And I press "archive" on the card
-    Then the Archive menu offers "Didn't need this | Glad I saw this"
+    Then the Archive menu offers "Didn't need this | Glad I saw this | Not sure"
     And the "Inbox" section lists "Tidy the imports in the uploader"
     When I pick "Didn't need this" from the Archive menu
     Then the "Archived" section lists "Tidy the imports in the uploader"
@@ -143,6 +143,10 @@ Feature: The open card in the composer
     And the transcript's review line says "Reviewed by Codex: 1 open"
     And the transcript's review line says "#1 fixed: Drops the session on refresh."
     And the card doesn't show "Reviewed by"
+    # Folded as the line of work is, showing only what's still open (20 Nov).
+    And the transcript's review line is folded
+    When I open the transcript's review line
+    Then the transcript's review line is open
 
   @card.collapse
   Scenario: Folded, the card's picks show as chips over the box, and one can be taken back

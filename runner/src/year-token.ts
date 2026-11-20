@@ -32,6 +32,10 @@ export function onYearToken(fn: (token: string) => void): () => void {
   for (const t of seen) fn(t);
   return () => listeners.delete(fn);
 }
+/** A token read or made anywhere else (a cloud token, virtual-runners.ts): the scrubber knows it at once. */
+export function rememberToken(token: string): void {
+  noteRead(token);
+}
 function noteRead(token: string): void {
   if (seen.has(token)) return;
   seen.add(token);

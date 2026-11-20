@@ -95,6 +95,8 @@ pub struct Threadbear {
     /// The login each thread's limit box has picked in its Continue now on
     /// menu, when it isn't the first.
     pub(crate) limit_pick: HashMap<String, String>,
+    /// Each Claude login's cloud token card (token_card.rs).
+    pub(crate) token_cards: crate::token_card::TokenCards,
     /// Logins a Use a reset is on its way for (`use_reset`).
     pub(crate) resetting: std::collections::HashSet<String>,
     /// The Threads button's badge, kept until the app next changes (the same
@@ -523,6 +525,7 @@ impl Threadbear {
             menus_stale: true,
             failed_on_account: HashMap::new(),
             limit_pick: HashMap::new(),
+            token_cards: Default::default(),
             resetting: Default::default(),
             inbox_count_cache: Default::default(),
             sections_cache: Default::default(),
@@ -858,6 +861,7 @@ impl Threadbear {
                 if let Status::Connected { hello, .. } = &status {
                     self.logins = RunnerLogins::from_hello(hello);
                     self.remote.experiments = hello["experiments"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_owned)).collect();
+                    crate::live_pages::set_on(self.remote.experiments.iter().any(|e| e == crate::live_pages::EXPERIMENT), self.main_window, cx);
                     self.runner_version = hello["runnerVersion"].as_str().unwrap_or("").to_owned();
                     self.upstream_on = hello["updates"]["upstream"]["state"].as_str().is_some_and(|s| s != "off");
                     self.upstream_checkout = hello["updates"]["upstream"]["checkout"].as_str().filter(|c| !c.is_empty()).map(str::to_owned);
@@ -935,6 +939,9 @@ impl Threadbear {
                         // word; everything shown gets a move just picked.
                         let from_runner = t.clone();
                         self.starting_moves.dress(&mut t, crate::now_ms());
+                        if let Some(b) = self.remote.box_of(t.runner_id.as_deref()) {
+                            threadbear_core::sidebar::dress_box(&mut t, b);
+                        }
                         if let Some(pane) = &self.pane {
                             pane.update(cx, |p, cx| p.summary_changed(&t, cx));
                         }
@@ -1739,6 +1746,8 @@ impl Threadbear {
         // What came across from the Swift app, while its note's up. Set
         // after, as the literal above is as long as serde_json's macro goes.
         dump["importNote"] = json!(self.import_note);
+        // A virtual runner's thread waiting on a cloud token (token_card.rs).
+        dump["tokenCard"] = self.token_card_dump();
         // Panels pinned to their threads (pinned_panels.rs).
         dump["pinnedPanels"] = self.pinned_panels_dump(cx);
         // The tour or a page's intro on show, and Finish setting up (tour.rs, setup_panel.rs).
@@ -2001,7 +2010,13 @@ impl Render for Threadbear {
         // The web panels' pages are native views: shown and placed once the
         // window's laid out, where their panels were drawn (web_panels.rs).
         // ⌘K's box covers them as the share popover does (open_anything.rs).
-        let pages = crate::web_panels::sweeper(self.open_menu_at(), self.share_popover.is_some() || self.anything.is_some());
+        // The picture viewer and the pane's own menu as well, as videos are
+        // below (a live page in the transcript drew over the viewer: Gemini's
+        // review, 19 Nov).
+        let pages = {
+            let side = self.side.read(cx);
+            crate::web_panels::sweeper(self.open_menu_at().or(side.menu.as_ref().map(|m| m.position)), self.share_popover.is_some() || self.anything.is_some() || side.viewer.is_open())
+        };
         // Videos and PDFs in the system's views the same way (media_view.rs),
         // hidden under the picture viewer and the pane's own menus too.
         let media = {

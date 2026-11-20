@@ -57,6 +57,11 @@ function why(r: Run): string {
   );
 }
 
+// A snapshot's git commands compare files by their contents, never trusting
+// stat data the repo's config says to (core.checkStat minimal, trustctime
+// off): through git's own environment config, which untrustedGit lets by.
+const FRESH_STAT = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.checkStat', GIT_CONFIG_VALUE_0: 'default', GIT_CONFIG_KEY_1: 'core.trustctime', GIT_CONFIG_VALUE_1: 'true' };
+
 // Commits Threadbear makes for a move are its own, whatever git's config says.
 const AUTHOR = {
   GIT_AUTHOR_NAME: 'Threadbear',
@@ -178,7 +183,17 @@ export async function changedFiles(cwd: string, max = 20): Promise<string[]> {
  * `bundle`) when there's nothing origin doesn't have: T's worktree from
  * origin is the same.
  */
-export async function packGit(worktree: string, cwd: string, bundleFile: string): Promise<{ ok: true; meta: GitMeta; bundle?: string } | { ok: false; reason: string }> {
+// Under a node_modules folder: installed packages, which unpackGit won't
+// bring in (trust reads them as installed and doesn't hash them).
+export function underNodeModules(file: string): boolean {
+  return file.split('/').some((part) => part.toLowerCase() === 'node_modules');
+}
+
+// `leaveOut`: untracked files kept out of the wip commit (a box's save
+// leaves out what unpackGit refuses, box-save.ts); their names come back in
+// `leftOut`. A file there that's tracked or staged and changed can't be
+// left out without losing that change, so it fails the pack instead.
+export async function packGit(worktree: string, cwd: string, bundleFile: string, opts: { leaveOut?: (file: string) => boolean } = {}): Promise<{ ok: true; meta: GitMeta; bundle?: string; leftOut?: string[] } | { ok: false; reason: string }> {
   const top = await repoTop(worktree);
   if (!top) return { ok: false, reason: `${worktree} isn't a git checkout.` };
   const head = await out(top, ['rev-parse', '--verify', 'HEAD^{commit}']);
@@ -194,11 +209,49 @@ export async function packGit(worktree: string, cwd: string, bundleFile: string)
   // throwaway index, so the checkout's own staging is left alone.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-move-index-'));
   let wip: string | undefined;
+  let leftOut: string[] = [];
   try {
-    const env = { GIT_INDEX_FILE: path.join(tmp, 'index'), ...AUTHOR };
+    // Every file hashed afresh, whatever the repo's config says of stat
+    // data (checkStat minimal, trustctime off): the index is built from
+    // HEAD, which has none, and these settings go with it.
+    const env = { GIT_INDEX_FILE: path.join(tmp, 'index'), ...AUTHOR, ...FRESH_STAT };
     let r = await run(top, ['read-tree', 'HEAD'], env);
     if (r.ok) r = await run(top, ['add', '-A', '.'], env);
     if (!r.ok) return { ok: false, reason: `Couldn't read the uncommitted changes in ${top}: ${why(r)}` };
+    if (opts.leaveOut) {
+      // A box's save carries what's staged too: the checkout's own index's
+      // paths that HEAD hasn't (an ignored path added with -f among them),
+      // added from the files as they are. Only its paths are read from that
+      // index, never its stat data.
+      const indexed = await run(top, ['ls-files', '-z']);
+      if (!indexed.ok) return { ok: false, reason: `Couldn't read the index of ${top}: ${why(indexed)}` };
+      const real = new Set(indexed.stdout.split('\0').filter(Boolean));
+      const headTree = await run(top, ['read-tree', 'HEAD'], { GIT_INDEX_FILE: path.join(tmp, 'head-index') });
+      const head = headTree.ok ? new Set((await run(top, ['ls-files', '-z'], { GIT_INDEX_FILE: path.join(tmp, 'head-index') })).stdout.split('\0').filter(Boolean)) : new Set<string>();
+      // There as an entry, a symlink whose target is missing included (lstat, not exists).
+      const staged = [...real].filter((f) => !head.has(f) && fs.lstatSync(path.join(top, f), { throwIfNoEntry: false }) !== undefined);
+      for (let i = 0; i < staged.length; i += 200) {
+        const add = await run(top, ['add', '-f', '--', ...staged.slice(i, i + 200).map((f) => `:(literal)${f}`)], env);
+        if (!add.ok) return { ok: false, reason: `Couldn't read the staged changes in ${top}: ${why(add)}` };
+      }
+      const changed = await run(top, ['diff', '--cached', '--name-status', '-z', '--no-renames', 'HEAD'], env);
+      if (!changed.ok) return { ok: false, reason: `Couldn't read the uncommitted changes in ${top}: ${why(changed)}` };
+      // "<status>\0<path>\0", repeated. Untracked means not in the
+      // checkout's own index: a file staged there is the thread's work, not
+      // a leftover install.
+      const parts = changed.stdout.split('\0');
+      for (let i = 0; i + 1 < parts.length; i += 2) {
+        const [status, file] = [parts[i]!, parts[i + 1]!];
+        if (!file || !opts.leaveOut(file)) continue;
+        if (status !== 'A' || real.has(file)) return { ok: false, reason: `${file} is tracked or staged, with changes, under a folder the thread's save can't carry (installed packages). Commit or undo that change, and it can save.` };
+        leftOut.push(file);
+      }
+      // Back to HEAD's (or nothing) in the throwaway index: the commit has none of them.
+      for (let i = 0; i < leftOut.length; i += 200) {
+        const back = await run(top, ['reset', '-q', 'HEAD', '--', ...leftOut.slice(i, i + 200).map((f) => `:(literal)${f}`)], env);
+        if (!back.ok) return { ok: false, reason: `Couldn't leave ${leftOut[i]} out: ${why(back)}` };
+      }
+    }
     const tree = await out(top, ['write-tree'], env);
     const headTree = await out(top, ['rev-parse', 'HEAD^{tree}']);
     if (!tree) return { ok: false, reason: `Couldn't read the uncommitted changes in ${top}.` };
@@ -210,7 +263,8 @@ export async function packGit(worktree: string, cwd: string, bundleFile: string)
     fs.rmSync(tmp, { recursive: true, force: true });
   }
   const meta: GitMeta = { branch, head, ...(wip ? { wip } : {}), ...(base ? { base } : {}), ...(origin && withoutCredentials(origin) ? { origin: withoutCredentials(origin) } : {}), subdir };
-  if (base === head && !wip) return { ok: true, meta };
+  const extra = leftOut.length ? { leftOut } : {};
+  if (base === head && !wip) return { ok: true, meta, ...extra };
 
   // A bundle names refs, so the tips get ones of their own for as long as
   // it takes. With head at the base only the wip commit goes (git leaves
@@ -224,7 +278,7 @@ export async function packGit(worktree: string, cwd: string, bundleFile: string)
     await run(top, ['update-ref', '-d', HEAD_REF]);
     if (wip) await run(top, ['update-ref', '-d', WIP_REF]);
   }
-  return { ok: true, meta, bundle: bundleFile };
+  return { ok: true, meta, bundle: bundleFile, ...extra };
 }
 
 /**
@@ -262,7 +316,7 @@ export async function unpackGit(worktree: string, meta: GitMeta, bundleFile?: st
       // move never has any (Codex's review, 10 Nov 2026).
       const brought = await run(worktree, ['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', meta.head, meta.wip]);
       if (!brought.ok) return { ok: false, reason: `Couldn't read the uncommitted changes: ${why(brought)}` };
-      const packaged = brought.stdout.split('\0').find((f) => f.split('/').some((part) => part.toLowerCase() === 'node_modules'));
+      const packaged = brought.stdout.split('\0').find(underNodeModules);
       if (packaged) return { ok: false, reason: `Its uncommitted changes include ${packaged}, under node_modules, which a move doesn't carry: installed packages are set up again on this machine.` };
       // The worktree as the wip commit has it, then the index back at head:
       // its changes are uncommitted again, new files untracked again.

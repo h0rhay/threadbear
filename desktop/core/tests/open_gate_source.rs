@@ -339,7 +339,7 @@ fn checked_files_open_by_reference_not_by_path() {
     let gate = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpui/src/open_gate.rs")).unwrap().replace("\r\n", "\n");
     let open_file = fn_body(&gate, "pub(crate) fn open_file(");
     assert!(!open_file.contains("system_open("), "open_file opens without open_checked:\n{open_file}");
-    assert_eq!(open_file.matches("open_checked(").count(), 2, "both the document and the yes go through open_checked:\n{open_file}");
+    assert_eq!(open_file.matches("open_checked(").count(), 3, "the document, a remembered kind and the yes all go through open_checked:\n{open_file}");
     let checked = fn_body(&gate, "fn open_checked(");
     assert!(checked.contains("still_same("), "open_checked doesn't look again");
     let mac = gate.split("#[cfg(target_os = \"macos\")]\nfn open_the_file(").nth(1).expect("the Mac's open_the_file");

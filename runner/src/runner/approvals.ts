@@ -15,7 +15,7 @@ import { SECRET_TIMEOUT_DEFAULT_MIN, SECRET_TIMEOUT_MAX_MIN, type SecretFiles } 
 import { START_CARD, type RequestAnswer } from '../cross-runner.ts';
 import { noAppToAllow } from '../app-seen.ts';
 import { REMOTE_ALLOW_REFUSED, remoteCardShowsAll } from '../tools.ts';
-import { reviewCard, reviewsCards, type CardForReview, type CardVerdict } from './card-review.ts';
+import { reviewCard, reviewerLeftIt, reviewsCards, type CardForReview, type CardVerdict } from './card-review.ts';
 
 export type SecretRequest = { label: string; reason: string; placeholder?: string; timeoutMinutes?: number; toolUseId?: string; signal?: AbortSignal };
 export type SecretAnswer = ({ status: 'saved' } & SecretFiles) | { status: 'declined' | 'expired'; message?: string };
@@ -203,8 +203,16 @@ export const approvalsPart = {
       this.emit(st, { type: 'system.note', text: `Allowed by the reviewer: ${card.title}. ${verdict.why}` }, rt.turn?.turnId);
       return { decision: 'allow' };
     }
-    if (!verdict.allow && verdict.why) this.emit(st, { type: 'system.note', text: `The reviewer left this one for you: ${verdict.why}` }, rt.turn?.turnId);
-    return show();
+    // Switched out of Auto meanwhile, it's an ordinary card.
+    const why = verdict.allow || entry.stale || !reviewsCards(this, st) ? undefined : verdict.why;
+    if (!why) return show();
+    this.emit(st, { type: 'system.note', text: `The reviewer left this one for you: ${why}` }, rt.turn?.turnId);
+    // The agent sees only the answer, so without this it guessed why it was
+    // asked and told Mike it was Claude's own safety check (20 Nov 2026).
+    // Only on Mike's no (a click or writing instead): a card closed without
+    // him isn't his to explain.
+    const a = await show();
+    return a.decision === 'deny' && !a.stopped && !a.noApp ? { ...a, reviewer: reviewerLeftIt(why) } : a;
   },
 
   // The card itself, for Mike.

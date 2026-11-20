@@ -155,6 +155,10 @@ Before(async function (this: ThreadbearWorld, { pickle }) {
   // both drivers leave out otherwise (TB_MOCK_NO_REMOTE in gpui.ts, swift.ts).
   if (pickle.tags.some((t) => t.name === '@remote-threads')) process.env.TB_MOCK_REMOTE = '1';
   else delete process.env.TB_MOCK_REMOTE;
+  // Virtual runners: the mock's "Cloud (Fly)" and a thread on a box of it in
+  // each state (MOCK_VIRTUAL_RUNNERS in its server.mjs).
+  if (pickle.tags.some((t) => t.name === '@virtual-runners')) process.env.MOCK_VIRTUAL_RUNNERS = '1';
+  else delete process.env.MOCK_VIRTUAL_RUNNERS;
   // Decisions on the Projects page: the mock's cards of asks in Threadbear,
   // and the projectDecisions experiment on in its hello.
   if (pickle.tags.some((t) => t.name === '@project-decisions')) process.env.TB_MOCK_DECISIONS = '1';
@@ -173,6 +177,9 @@ Before(async function (this: ThreadbearWorld, { pickle }) {
   // the mock's made-up PR.
   if (pickle.tags.some((t) => t.name === '@inline-prs')) process.env.TB_MOCK_PRS = '1';
   else delete process.env.TB_MOCK_PRS;
+  // Its files read 3 s after the rest of it, as a big PR's are.
+  if (pickle.tags.some((t) => t.name === '@slow-pr-files')) process.env.TB_MOCK_PR_FILES_MS = '3000';
+  else delete process.env.TB_MOCK_PR_FILES_MS;
   // Parts of a project: Photo sync as a part of Threadbear.
   if (pickle.tags.some((t) => t.name === '@project-parts')) process.env.TB_MOCK_PARTS = '1';
   else delete process.env.TB_MOCK_PARTS;

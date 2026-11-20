@@ -76,7 +76,7 @@ pub(crate) fn file_symbol(name: &str) -> &'static str {
 
 /// A file's path for its card, with the home folder as `~`.
 pub(crate) fn short_path(path: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = crate::files::home_dir();
     if home.is_empty() { path.to_owned() } else { threadbear_core::new_thread::abbreviate_home(path, &home) }
 }
 

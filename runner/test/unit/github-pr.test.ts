@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parsePrUrl, fetchPr, prAct, splitPatch, prStates } from '../../src/github-pr.ts';
+import { parsePrUrl, fetchPr, fetchPrFiles, prAct, splitPatch, prStates } from '../../src/github-pr.ts';
 import type { Gh } from '../../src/land-gate.ts';
 
 const view = {
@@ -114,6 +114,29 @@ test('fetchPr still answers when the diff or repo read fails', async () => {
   assert.equal(pr.canMerge, false);
   assert.deepEqual(pr.files, []);
   assert.equal(pr.filesError, 'unexpected');
+});
+
+test('without its files, fetchPr skips the diff and says they come later', async () => {
+  const calls: string[][] = [];
+  const gh = fakeGh(calls, {
+    'pr view': { ok: true, stdout: JSON.stringify(view) },
+    'repo view': { ok: true, stdout: JSON.stringify(repo) },
+  });
+  const pr = await fetchPr({ owner: 'acme', repo: 'app', number: 72 }, gh, { files: false });
+  assert.ok(!calls.some((c) => c[1] === 'diff'), 'no gh pr diff');
+  assert.deepEqual(pr.files, []);
+  assert.equal(pr.filesLater, true);
+  assert.equal(pr.filesError, undefined);
+});
+
+test('fetchPrFiles reads only the diff, through gh -R', async () => {
+  const calls: string[][] = [];
+  const gh = fakeGh(calls, { 'pr diff': { ok: true, stdout: patch } });
+  const got = await fetchPrFiles({ owner: 'acme', repo: 'app', number: 72 }, gh);
+  assert.deepEqual(calls, [['pr', 'diff', '72', '-R', 'acme/app']]);
+  assert.deepEqual(got.files.map((f) => f.path), ['src/a.ts', 'img.png', 'new name.md']);
+  const failed = await fetchPrFiles({ owner: 'acme', repo: 'app', number: 72 }, fakeGh([], {}));
+  assert.deepEqual(failed, { files: [], filesError: 'unexpected' });
 });
 
 test("fetchPr's error says what gh said", async () => {

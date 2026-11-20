@@ -22,6 +22,11 @@
 #               pid holding the client's end, and every process (below),
 #               in one answer, so any number of connections waiting to be
 #               looked up share one (peer.ts)
+#   idle        milliseconds since the last keyboard or mouse input in this
+#               session (presence.ts)
+#   awake       on = 1: keep the computer from sleeping by itself while this
+#               helper runs; on = 0: let it again (keep-awake.ts)
+#   power       "<on battery 0|1> <percent, or -1 when unknown>"
 #
 # The runner doesn't run this file: it reads it once when it starts and
 # sends it whole as the helper's first line, to a two-line loader passed as
@@ -51,10 +56,10 @@ $asm = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.A
 $type = $asm.DefineDynamicModule('ThreadbearNative').DefineType('ThreadbearNative.Kernel32', 'Public, Class')
 $importCtor = [Runtime.InteropServices.DllImportAttribute].GetConstructor([string])
 $lastError = [Runtime.InteropServices.DllImportAttribute].GetField('SetLastError')
-function Declare($name, $ret, [Type[]]$params) {
-  $m = $type.DefinePInvokeMethod($name, 'kernel32.dll', [Reflection.MethodAttributes]'Public, Static, PinvokeImpl', [Reflection.CallingConventions]::Standard, $ret, $params, [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+function Declare($name, $ret, [Type[]]$params, $dll = 'kernel32.dll') {
+  $m = $type.DefinePInvokeMethod($name, $dll, [Reflection.MethodAttributes]'Public, Static, PinvokeImpl', [Reflection.CallingConventions]::Standard, $ret, $params, [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
   $m.SetImplementationFlags('PreserveSig')
-  $m.SetCustomAttribute((New-Object Reflection.Emit.CustomAttributeBuilder($importCtor, @('kernel32.dll'), [Reflection.FieldInfo[]]@($lastError), @($true))))
+  $m.SetCustomAttribute((New-Object Reflection.Emit.CustomAttributeBuilder($importCtor, @($dll), [Reflection.FieldInfo[]]@($lastError), @($true))))
 }
 Declare 'CreateJobObjectW' ([IntPtr]) @([IntPtr], [string])
 Declare 'OpenJobObjectW' ([IntPtr]) @([UInt32], [bool], [string])
@@ -64,6 +69,12 @@ Declare 'TerminateJobObject' ([bool]) @([IntPtr], [UInt32])
 Declare 'CloseHandle' ([bool]) @([IntPtr])
 $long = [long].MakeByRefType()
 Declare 'GetProcessTimes' ([bool]) @([IntPtr], $long, $long, $long, $long)
+# idle, awake and power. LASTINPUTINFO and SYSTEM_POWER_STATUS are passed
+# as byte arrays, which are pinned, so what Windows writes is seen.
+Declare 'GetLastInputInfo' ([bool]) @([byte[]]) 'user32.dll'
+Declare 'GetTickCount' ([UInt32]) @()
+Declare 'SetThreadExecutionState' ([UInt32]) @([UInt32])
+Declare 'GetSystemPowerStatus' ([bool]) @([byte[]])
 $K = $type.CreateType()
 function LastError { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
 # The job of each CLI this helper has put in one, by name. A helper started
@@ -217,6 +228,37 @@ while ($true) {
           }
         }
         $result = $me.Value
+      }
+      'idle' {
+        # LASTINPUTINFO: cbSize (8), then the tick count of the last input.
+        # Both tick counts wrap at 2^32 ms (49.7 days), so the gap is taken
+        # modulo that.
+        $info = New-Object byte[] 8
+        $info[0] = 8
+        if (-not $K::GetLastInputInfo($info)) { throw "GetLastInputInfo failed ($(LastError))" }
+        $last = [BitConverter]::ToUInt32($info, 4)
+        $now = $K::GetTickCount()
+        $result = [string](([long]$now - [long]$last + 4294967296) % 4294967296)
+      }
+      'awake' {
+        # Held by this helper's own thread, which answers every question, so
+        # it lasts until asked to let go or the helper ends (with the runner,
+        # as its stdin closes). ES_CONTINUOUS, plus ES_SYSTEM_REQUIRED to
+        # keep it: idle sleep only, as caffeinate -i on a Mac, so the screen
+        # still turns off and locks.
+        $flags = if ([int]$req.on -eq 1) { [UInt32]2147483649 } else { [UInt32]2147483648 }
+        if ($K::SetThreadExecutionState($flags) -eq 0) { throw 'SetThreadExecutionState failed' }
+        $result = if ([int]$req.on -eq 1) { 'held' } else { 'let go' }
+      }
+      'power' {
+        # SYSTEM_POWER_STATUS: ACLineStatus (0 battery, 1 plugged in, 255
+        # unknown), BatteryFlag (128: no battery), BatteryLifePercent (255
+        # unknown), then more the runner doesn't need.
+        $status = New-Object byte[] 12
+        if (-not $K::GetSystemPowerStatus($status)) { throw "GetSystemPowerStatus failed ($(LastError))" }
+        $battery = if ($status[0] -eq 0 -and $status[1] -ne 128) { 1 } else { 0 }
+        $percent = if ($status[2] -eq 255) { -1 } else { [int]$status[2] }
+        $result = "$battery $percent"
       }
       default { throw "unknown op: $($req.op)" }
     }

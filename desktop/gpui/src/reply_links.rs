@@ -61,6 +61,18 @@ struct LinkPrefs {
     web_link_click: Option<String>,
     /// The PR tab's Merge, as its menu's Default set it (pr_view.rs).
     pr_merge_method: Option<String>,
+    /// Kinds of file Mike said always open in their app, from the open
+    /// gate's question ("Always open .tandem in Tandem"). Read one by one,
+    /// so an entry edited by hand into something else is dropped alone,
+    /// not with every other choice here.
+    #[serde(deserialize_with = "each_opener")]
+    trusted_openers: Vec<threadbear_core::open_policy::TrustedOpener>,
+}
+
+fn each_opener<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<threadbear_core::open_policy::TrustedOpener>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let items = value.as_array().cloned().unwrap_or_default();
+    Ok(items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
 }
 
 static PREFS: Mutex<Option<LinkPrefs>> = Mutex::new(None);
@@ -108,6 +120,19 @@ pub(crate) fn set_web_click(action: WebLinkAction) {
 /// The merge method Mike starred in a PR tab's Merge menu, if he has.
 pub(crate) fn pr_merge_method() -> Option<threadbear_core::pull_requests::MergeMethod> {
     with_prefs(|p| p.pr_merge_method.as_deref().and_then(threadbear_core::pull_requests::MergeMethod::parse))
+}
+
+/// The kinds of file that open in their app without asking (open_gate.rs).
+pub(crate) fn trusted_openers() -> Vec<threadbear_core::open_policy::TrustedOpener> {
+    with_prefs(|p| p.trusted_openers.clone())
+}
+
+/// Remembers that `kind` always opens in its app.
+pub(crate) fn trust_opener(kind: threadbear_core::open_policy::TrustedOpener) {
+    save_prefs(|p| {
+        p.trusted_openers.retain(|k| !k.same(&kind));
+        p.trusted_openers.push(kind);
+    });
 }
 
 pub(crate) fn set_pr_merge_method(method: threadbear_core::pull_requests::MergeMethod) {
@@ -261,11 +286,19 @@ impl ThreadPane {
                 LinkKind::Web(web) => Some(LinkTarget::Web(web)),
                 // A link with no scheme is looked for from the thread's folder
                 // like a path in inline code; a `file:` URL is the file.
-                LinkKind::File(path) if path.starts_with('/') || threadbear_core::reducer::text::is_windows_path(&path) => Some(LinkTarget::File(Some(FileLink { path, query: None, fragment: None }))),
+                LinkKind::File(path) if path.starts_with('/') || threadbear_core::reducer::text::is_windows_path(&path) => Some(LinkTarget::File(Some(self.whole_path_link(path)))),
                 LinkKind::File(path) => Some(LinkTarget::File(self.find_file(&path))),
                 _ => None,
             },
         }
+    }
+
+    /// A link's whole path, and the lines after it (`/w/a.ts:12-18`), unless
+    /// a file here has that very name.
+    fn whole_path_link(&self, path: String) -> FileLink {
+        let lines = file_refs::line_range(&path).filter(|_| self.summary.is_remote() || policy::local_metadata(Path::new(&path)).is_err());
+        let path = if lines.is_some() { file_refs::strip_line(&path).to_owned() } else { path };
+        FileLink { path, query: None, fragment: None, lines }
     }
 
     /// The file a path in a reply names: from the thread's folder and what
@@ -338,7 +371,7 @@ impl ThreadPane {
             if action == FileLinkAction::Finder {
                 open_gate::reveal(&path, Origin::OtherMac, cx);
             } else {
-                self.preview_in_pane(&path, cx);
+                self.preview_in_pane(&path, file.lines, cx);
             }
             return;
         }
@@ -353,7 +386,7 @@ impl ThreadPane {
             action = FileLinkAction::App;
         }
         match action {
-            FileLinkAction::Panel if self.owns_pane(cx) => self.preview_in_pane(&path, cx),
+            FileLinkAction::Panel if self.owns_pane(cx) => self.preview_in_pane(&path, file.lines, cx),
             FileLinkAction::Finder => open_gate::reveal(&path, Origin::ThisMac, cx),
             // The pane belongs to the selected thread: a sub-agent's or a
             // project page's link goes to its app.
@@ -397,13 +430,14 @@ impl ThreadPane {
     }
 
     /// A file in the pane beside the transcript, opening the pane if it's
-    /// closed (`PaneModel.show`).
-    fn preview_in_pane(&mut self, path: &str, cx: &mut Context<Self>) {
+    /// closed (`PaneModel.show`), with the `lines` a link named (`a.ts:12-18`)
+    /// tinted and scrolled to.
+    fn preview_in_pane(&mut self, path: &str, lines: Option<(usize, usize)>, cx: &mut Context<Self>) {
         let thread = self.summary.clone();
         let Some(app) = self.composer.read(cx).app.upgrade() else { return };
         let side = app.read(cx).side.clone();
         let section = side.update(cx, |side, cx| {
-            side.preview_path(path, None, &thread, cx);
+            side.preview_path_at(path, None, lines, &thread, cx);
             side.section_for(&thread)
         });
         show_pane(&app, &section, cx);
@@ -751,6 +785,7 @@ fn rested(serial: u64, pane: &WeakEntity<ThreadPane>, thread: &str, row: &str, w
         return;
     }
     hide_peek(cx);
+    preload_pr(pane, &url, cx);
     let spot = link_spot(at, &url, window, cx);
     PEEK.with(|p| p.borrow_mut().hovered = Some(Hovered { pane: pane.clone(), thread: thread.to_owned(), row: row.to_owned(), url: url.clone(), spot, card: None }));
     let (pane, row, thread) = (pane.clone(), row.to_owned(), thread.to_owned());
@@ -773,7 +808,21 @@ fn rested(serial: u64, pane: &WeakEntity<ThreadPane>, thread: &str, row: &str, w
         .detach();
 }
 
-/// Whether a link can have a card, cheaply: a web page or a file does
+/// A rest on a PR link that opens in a tab (the inlinePrs experiment) starts
+/// reading the PR, ahead of the click (pr_view.rs `preload_pr`).
+fn preload_pr(pane: &WeakEntity<ThreadPane>, url: &str, cx: &mut App) {
+    if crate::pr_view::pr_url(url).is_none() {
+        return;
+    }
+    let Some(app) = pane.upgrade().and_then(|p| p.read(cx).app.upgrade()) else { return };
+    if !crate::pr_view::on(app.read(cx)) {
+        return;
+    }
+    let side = app.read(cx).side.clone();
+    side.update(cx, |side, cx| side.preload_pr(url, cx));
+}
+
+/// Whether a link can have a card, cheaply:a web page or a file does
 /// (`peek(atCharacter:)`); Threadbear's own links (a step, a thread, a
 /// review, a chip, a reply button) and other apps' (`mailto:`) don't.
 pub(crate) fn has_card(url: &str) -> bool {
@@ -1132,8 +1181,10 @@ pub(crate) fn peek_command(app: &Entity<crate::app::Threadbear>, cmd: &serde_jso
             _ => None,
         }
     } else { None };
-    // Its card, as resting the pointer there shows it.
+    // Its card, as resting the pointer there shows it, and a PR's read
+    // started, as the rest starts it.
     hide_peek(cx);
+    preload_pr(&pane.downgrade(), &url, cx);
     let Some(card) = pane.read(cx).peek_card(&url, &row.id) else { return Some(Err(format!("{words} has no card"))) };
     let card = match card {
         Card::File { words, picture: FilePicture::Lines(path, None) } => {

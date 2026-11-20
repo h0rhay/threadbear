@@ -30,7 +30,9 @@ export type CodexResolver = (start: string) => { command: string; native: boolea
 // relies on that a generated schema lacks, and what's new in it.
 export type SurfaceCheck = (generatedDir: string) => { missing: string[]; added: string[] };
 
-export type CodexHold = { version: string; reason: string; missing?: string[] };
+// threadId: the thread started to look into a protocol hold (manager.ts
+// heldBack), so the Updates panel links it rather than leaving Mike to.
+export type CodexHold = { version: string; reason: string; missing?: string[]; added?: string[]; threadId?: string };
 export type CodexState = {
   current?: string;
   previous?: string;
@@ -260,6 +262,32 @@ export class CodexCopies {
     s.installs.push({ version, at: new Date(this.now()).toISOString(), result: 'activated' });
     this.saveState(s);
     return { previous: before !== version ? before : undefined };
+  }
+
+  // A held version's kept copy through the gate again, as the runner's
+  // lists may have changed since (a fix landed that takes something off
+  // them). undefined when it can't be checked.
+  async regate(version: string): Promise<{ missing: string[]; added: string[] } | undefined> {
+    if (!this.has(version)) return undefined;
+    const v = await this.verify(path.join(this.dir, version), version);
+    if (!v.binary) return undefined;
+    return (await this.gate(v.binary)).result;
+  }
+
+  // Updates the hold in place (its missing list, its thread), if it's
+  // still that version's.
+  updateHold(version: string, patch: Partial<CodexHold>): void {
+    const s = this.state();
+    if (s.hold?.version !== version) return;
+    s.hold = { ...s.hold, ...patch };
+    this.saveState(s);
+  }
+
+  clearHold(version: string): void {
+    const s = this.state();
+    if (s.hold?.version !== version) return;
+    delete s.hold;
+    this.saveState(s);
   }
 
   setHold(hold: CodexHold): void {

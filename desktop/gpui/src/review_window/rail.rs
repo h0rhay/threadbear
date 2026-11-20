@@ -291,7 +291,7 @@ impl ReviewWindow {
         if !sent.images.is_empty() {
             let edge = style::hairline(cx);
             column = column.child(h_flex().flex_wrap().gap(px(6.)).children(sent.images.iter().map(|image| {
-                img(std::path::PathBuf::from(&image.path)).size(px(48.)).rounded(px(6.)).border_1().border_color(edge).object_fit(ObjectFit::Cover)
+                img(crate::rows::markdown::file_picture(&image.path)).size(px(48.)).rounded(px(6.)).border_1().border_color(edge).object_fit(ObjectFit::Cover)
             })));
         }
         column

@@ -323,6 +323,9 @@ export const ACCESS: Record<string, Access> = {
   wakePastHours: 'owner',
   setCloudToken: 'owner',
   cloudTokens: 'owner',
+  // A box's own login's token (API 94): refused by a turn, and fetched again once set.
+  tokenRefused: 'own',
+  boxCloudToken: 'own',
   mintBootToken: 'owner',
   archiveBox: 'owner',
   boxSaved: 'own',
@@ -607,6 +610,8 @@ export const BOX_CALLS: ReadonlySet<string> = new Set([
   'moveDone',
   'moveFailed',
   'boxSaved',
+  'tokenRefused',
+  'boxCloudToken',
 ]);
 
 /**

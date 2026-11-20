@@ -651,7 +651,8 @@ async function bringBack(op: Op): Promise<void> {
         memoryMb: claim.memoryMb,
         ...(claim.region ? { region: claim.region } : {}),
         // Nothing reusable (decision 5): the boot token works once, for BOOT_MS.
-        env: { THREADBEAR_SYNC_URL: site, THREADBEAR_BOX_BOOT: bootToken },
+        // And which variable holds the machine's own id (BoxProvider.machineIdEnv), for its exchange.
+        env: { THREADBEAR_SYNC_URL: site, THREADBEAR_BOX_BOOT: bootToken, ...(made.machineIdEnv ? { THREADBEAR_MACHINE_ID_ENV: made.machineIdEnv } : {}) },
         name: `tb-${boxId}-${attempt}`,
         tags: { tb_box: boxId, tb_attempt: String(attempt), tb_service: seen!.serviceId },
         // One box per attempt, however often this is tried.

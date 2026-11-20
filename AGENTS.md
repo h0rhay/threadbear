@@ -81,7 +81,10 @@ cherry-picked.
   Mike's own logins. Never read or copy OAuth tokens or Keychain credentials.
   The one exception is a login's year-long token that Mike made with
   Year-long token… (`threadbear-token.json` in that login's folder): the
-  runner passes it to that login's CLI and nowhere else (Mike, 17 Nov).
+  runner passes it to that login's CLI and nowhere else (Mike, 17 Nov), but
+  to Convex as that login's cloud token when Mike picks it on a cloud token
+  card (`cloudTokens.useMac`). A cloud token made with Make one goes only to
+  `boxes:setCloudToken`, never to disk or the log.
 - Tests that hit a real model use the cheapest model, tiny prompts, a temp
   working folder and a temp runner data dir, never the real one.
 - Never kill processes you didn't start; T3 Code runs the same CLIs.
@@ -244,6 +247,12 @@ else may be using that desktop: first check nothing's recording it
 names, including variants) and that your window really is in front (`front`,
 then a look at the screen). Wake its screen with `caffeinate -u`, or the events go nowhere.
 
+A spec or tool that installs the web runtime puts it in `runtimeParent()`
+(`features/support/web-runtime.ts`), never straight in the temp folder:
+remote.sh's temp folder is on Tinker Desk's external SSD, and Chromium's
+helpers run from there asked macOS for that disk on every new build, with
+nobody at the screen to answer (19 Nov).
+
 ## The GPUI port
 
 The desktop app is being rewritten as one GPUI app for Mac, Windows and Linux
@@ -275,11 +284,18 @@ of your own in a commit on top. A comment to them goes past Mike first.
 Work rewritten by hand from their PR or fork gets a `Co-Authored-By:`
 trailer for them, as 434438d9 does for Wayne.
 
-A commit on someone's fork isn't an offer, however good it looks: they haven't
-asked for it to go anywhere. Don't suggest bringing one in, and don't take one,
-unless Mike asks for that one by name or they've opened a PR. Mike, 6 Nov: "I
-don't think you should be pulling in anybody's stuff willy nilly." Telling him
-what people have built is fine, and that's all the fork watch schedule does.
+A commit on someone's fork isn't an offer: they haven't asked for it to go
+anywhere. The fork watch schedule (`~/dev/me/misc/schedules/threadbear-fork-watch`)
+is what brings them in. It takes the small ones it's sure of by itself (a real
+bug, test or check fix, small enough to read whole, that changes nothing about
+how Threadbear works), written fresh from what the diff does and credited as
+above, and asks Mike about features and anything that changes how something
+works. Mike, 19 Nov: "for these small things like these fixes... that you are
+pretty certain are valuable, I think in the future you should just
+automatically pull them in. And leaving it up to me, the bigger decisions."
+Outside that schedule, don't take a fork's commit unless Mike asks for that
+one by name or its author has opened a PR (his 6 Nov "I don't think you
+should be pulling in anybody's stuff willy nilly" still stands for the rest).
 
 ## Experiments
 
@@ -332,6 +348,10 @@ interrupt, snooze or archive it. The runner puts its own `tb` on your PATH;
 if `tb` isn't found (an older runner, or outside a thread), use
 `runner/bin/tb`. `tb --help` lists the rest.
 
+- Lint is mikecann-lint (`eslint.config.mjs`). `./check.sh` lints the code files a
+  landing changed (everything when the lint setup or packages change), so a landing
+  that adds a lint problem doesn't land. Fix the cause the message names; old problems
+  are exempt in `eslint-suppressions.json`. A disable comment needs a reason after `--`.
 - `./check.sh` runs every check (`--quick`: the runner's typecheck and
   unit tests, about a minute, the Mac app's release build when `app/`
   or `dock/` changed, and the GPUI port's core and client tests and a
@@ -346,7 +366,12 @@ if `tb` isn't found (an older runner, or outside a thread), use
   is a volume on its external SSD mounted there, not a link (remote.sh
   refuses links on that path). A `--desk` run that sits with no output may
   be waiting on macOS asking Desk Runner to reach a removable volume:
-  `desk "screencapture -x /tmp/s.png"` shows the screen (17 Nov). A host that stops answering partway is dropped for the next
+  `desk "screencapture -x /tmp/s.png"` shows the screen (17 Nov). Fix
+  that yourself, never ask Mike (19 Nov: "I want you to be able to access
+  that hard drive"): `desk "open 'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders'"`,
+  click Desk Runner.app's row open with a CGEvent click run through `desk`
+  (it has Accessibility) and see Removable Volumes is on. On 19 Nov it
+  was on already, and opening the row was enough. Close System Settings after. A host that stops answering partway is dropped for the next
   one. If none can be reached it runs here
   at low priority. `--e2e` always runs here, as it needs the claude login. It skips the deploy tests and BearDock's
   unless something they cover changed from main (`--all` runs them

@@ -284,6 +284,19 @@ export THREADBEAR_SHARED_CARGO_BASE="\$HOME/$base" THREADBEAR_SHARED_CARGO_SRC="
 export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 export TMPDIR="\$HOME/$base/tmp"
 mkdir -p "\$TMPDIR"
+# The web runtimes the specs and real-screen tools install, though, go on the
+# home disk. On Tinker Desk $base is an external SSD, and Chromium starts its
+# helpers as apps in their own right: run from that disk, each new build's
+# Threadbear Helper asked macOS for it, with nobody at the screen to answer,
+# and the prompt held Desk Runner's own reads too (19 Nov). The specs' driver
+# also gives the app its temp folder there (features/support/gpui.ts), as the
+# helpers inherit it. That disk is the small one, so this checkout's
+# folder is emptied as each run starts and ends (its runs take turns), and
+# another checkout's, left by a run that was killed, once a day old.
+export THREADBEAR_WEB_RUNTIME_PARENT="\$HOME/.cache/threadbear-check/web-runtimes/$key"
+find "\$HOME/.cache/threadbear-check/web-runtimes" -mindepth 1 -maxdepth 1 ! -name "$key" -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+rm -rf "\$THREADBEAR_WEB_RUNTIME_PARENT"
+mkdir -p "\$THREADBEAR_WEB_RUNTIME_PARENT"
 . scripts/build-priority.sh
 # The shared targets' cargo goes in front of build-priority's, which wrote the
 # real cargo's path into its own as it was made: so the slot's wait and copy
@@ -300,15 +313,21 @@ PRELUDE
 # on 13 Nov every spec scenario failed with ENOSPC on the cloud box, cargo said
 # nothing, and the run ended 0. So a run that leaves the host under 1 GiB free
 # fails, whatever its command said, and says why.
+# The home disk too, where the web runtimes went (above), and checked before
+# they're cleared, as that's when it was fullest.
 read -r -d '' postlude <<POSTLUDE || true
-kb="\$(df -Pk "\$HOME/$base" 2>/dev/null | awk 'END { print \$4 }')"
-case "\$kb" in
-  ""|*[!0123456789-]*) ;;
-  *) if [ "\$kb" -lt 1048576 ]; then
-       echo "remote.sh: $host has only \$((kb / 1024)) MiB free after this run, so whatever it wrote may have failed for want of space, even if it said it passed. Treating it as failed. Run it again: it gives back idle build folders there first, or says why it can't." >&2
-       [ "\$rc" != 0 ] || rc=1
-     fi ;;
-esac
+for disk in "\$HOME/$base" "\$HOME/.cache/threadbear-check/web-runtimes"; do
+  kb="\$(df -Pk "\$disk" 2>/dev/null | awk 'END { print \$4 }')"
+  case "\$kb" in
+    ""|*[!0123456789-]*) ;;
+    *) if [ "\$kb" -lt 1048576 ]; then
+         echo "remote.sh: $host has only \$((kb / 1024)) MiB free after this run (on the disk with \$disk), so whatever it wrote may have failed for want of space, even if it said it passed. Treating it as failed. Run it again: it gives back idle build folders there first, or says why it can't." >&2
+         [ "\$rc" != 0 ] || rc=1
+         break
+       fi ;;
+  esac
+done
+rm -rf "\$THREADBEAR_WEB_RUNTIME_PARENT"
 exit "\$rc"
 POSTLUDE
 run="$prelude

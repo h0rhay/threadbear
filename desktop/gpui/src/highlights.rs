@@ -78,11 +78,17 @@ pub(crate) struct PanePreview {
     pub memory: FolderMemory,
     /// A text file with its own text up, raw (the Markdown menu's Markdown).
     pub editing: bool,
+    /// A live page opened big from its card (live_pages.rs, Full size): the
+    /// running page shows here in place of the file's own preview.
+    pub live: bool,
+    /// The lines a reply's link named (`a.ts:12-18`), first and last,
+    /// counted from 1: tinted and scrolled to once its text is up.
+    pub lines: Option<(usize, usize)>,
 }
 
 impl PanePreview {
     pub(crate) fn new(target: Target, title: String, from: String) -> Self {
-        PanePreview { target, title, from, opened: 0, back: vec![], memory: Default::default(), editing: false }
+        PanePreview { target, title, from, opened: 0, back: vec![], memory: Default::default(), editing: false, live: false, lines: None }
     }
 
     pub(crate) fn file_path(&self) -> Option<&str> {
@@ -726,11 +732,17 @@ impl SidePane {
     }
 
     pub(crate) fn preview_path(&mut self, path: &str, title: Option<String>, thread: &ThreadSummary, cx: &mut Context<Self>) {
+        self.preview_path_at(path, title, None, thread, cx);
+    }
+
+    /// `preview_path`, with lines of its text to tint and scroll to.
+    pub(crate) fn preview_path_at(&mut self, path: &str, title: Option<String>, lines: Option<(usize, usize)>, thread: &ThreadSummary, cx: &mut Context<Self>) {
         let section = self.section_for(thread);
         // A folder browsed in place of its picture; the runner says which it is.
         let target = if self.files.is_known_folder(path) { Target::Folder(path.to_owned()) } else { Target::File(path.to_owned()) };
         let title = title.unwrap_or_else(|| core::last_component(path).to_owned());
-        let preview = PanePreview::new(target, title, section);
+        let mut preview = PanePreview::new(target, title, section);
+        preview.lines = lines;
         self.show_preview(preview, &thread.id.clone(), cx);
     }
 
@@ -740,8 +752,9 @@ impl SidePane {
         // A file being worked on is saved before anything takes its place.
         self.leave_edit(thread_id, cx);
         preview.opened = self.previews.get(thread_id).map_or(0, |p| p.opened) + 1;
-        // A Markdown file opens as its bar's menu last left it, on this
-        // runner's machine (`MarkdownView.opensRaw`).
+        // A Markdown file opens as its bar's menu last left it, and code and
+        // plain text ready to type in, on this runner's machine
+        // (`MarkdownView.opensRaw`).
         let here = self.thread(cx).is_some_and(|t| t.id == thread_id && !t.is_remote());
         if let Some(path) = preview.file_path() {
             preview.editing = here && threadbear_core::text_file::MarkdownView::opens_raw(path, self.files.prefs.markdown_view);
@@ -1132,6 +1145,20 @@ pub(crate) struct PaneRow {
     /// Its symbol turns, as a list row whose tone is `working` (the sidebar's
     /// arc, so working looks the same in both).
     pub turning: bool,
+    /// A switch at the end of the title's line (a list panel row's `toggle`).
+    pub switch: Option<RowSwitch>,
+}
+
+/// `PaneRow.switch`: its icon, lit when on, its tooltip, and what a press
+/// does. While `pending` (a press on its way to the runner) it shows the new
+/// state and takes no more presses.
+pub(crate) struct RowSwitch {
+    pub id: SharedString,
+    pub symbol: String,
+    pub on: bool,
+    pub pending: bool,
+    pub tip: String,
+    pub press: Rc<dyn Fn(&mut SidePane, &mut Context<SidePane>)>,
 }
 
 impl PaneRow {
@@ -1156,6 +1183,7 @@ impl PaneRow {
             drag: None,
             thumb: None,
             turning: false,
+            switch: None,
         }
     }
 
@@ -1251,6 +1279,11 @@ impl PaneRow {
         self
     }
 
+    pub(crate) fn switch(mut self, switch: Option<RowSwitch>) -> Self {
+        self.switch = switch;
+        self
+    }
+
     pub(crate) fn render(self, p: Palette, cx: &mut Context<SidePane>) -> impl IntoElement + use<> {
         let hover = p.hover;
         let label_color = if self.quiet { p.secondary } else { p.fg };
@@ -1262,7 +1295,8 @@ impl PaneRow {
             .child(div().min_w_0().truncate().text_size(px(style::size::LABEL)).line_height(px(style::natural_line(style::size::LABEL))).text_color(label_color).child(self.title.clone()))
             .child(div().flex_1().min_w(px(4.)))
             .when_some(self.trailing, |s, t| s.child(div().flex_none().text_size(px(style::size::SMALL)).line_height(px(style::natural_line(style::size::SMALL))).text_color(p.faint).child(t)))
-            .when_some(self.trailing_symbol, |s, symbol| s.child(icon(&symbol, 11., self.icon_color.unwrap_or(p.secondary))));
+            .when_some(self.trailing_symbol, |s, symbol| s.child(icon(&symbol, 11., self.icon_color.unwrap_or(p.secondary))))
+            .when_some(self.switch, |s, switch| s.child(row_switch(switch, p, cx)));
         let body = v_flex()
             .flex_1()
             .min_w_0()
@@ -1314,6 +1348,36 @@ impl PaneRow {
         crate::file_drag::FileDragExt::file_drag(wrapper, self.drag)
     }
 
+}
+
+/// A row's switch: its icon on a soft fill when on, faint when off. Its
+/// press is its own, so the row's click (opening the link) doesn't fire.
+fn row_switch(switch: RowSwitch, p: Palette, cx: &mut Context<SidePane>) -> impl IntoElement + use<> {
+    let (fill, color) = if switch.on { (style::primary_opacity(cx, 0.14), p.accent) } else { (gpui_kit::transparent_black(), p.faint) };
+    let hover = style::primary_opacity(cx, 0.22);
+    let (pending, press) = (switch.pending, switch.press.clone());
+    tipped(
+        div()
+            .id(switch.id)
+            .flex_none()
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .bg(fill)
+            .when(pending, |s| s.opacity(0.6))
+            .when(!pending, |s| s.hover(move |st| st.bg(hover)).cursor_pointer())
+            .child(icon(&switch.symbol, 12., color)),
+        switch.tip,
+    )
+    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+        cx.stop_propagation();
+        if !pending {
+            (press)(this, cx);
+        }
+    }))
 }
 
 /// `SectionHeading`: a quiet heading, a hairline to the edge, the count when
@@ -2161,7 +2225,8 @@ impl SidePane {
 /// Scripted commands for the pane, the same names and shapes as the Swift
 /// app's (app/README.md): `panel`, `highlight`, `preview`, `folder`,
 /// `trust`, `action`, `project-why`, and `collapse`/`expand` with
-/// `highlightSection`.
+/// `highlightSection`. `switch` (`row`, a list row's title) is GPUI's own:
+/// it presses that row's switch in the list panel showing.
 #[cfg(feature = "automation")]
 pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Window, cx: &mut App) -> Result<Value, String> {
     let side = app.read(cx).side.clone();
@@ -2203,6 +2268,7 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Win
         "folder" => crate::folders::folder_command(&side, &thread, cmd, window, cx),
         "trust" => crate::patches::trust_command(&side, &thread, cmd, cx),
         "action" => crate::patches::action_command(&side, &thread, cmd, cx),
+        "switch" => crate::patches::switch_command(&side, &thread, cmd, cx),
         other => Err(format!("unknown pane command {other:?}")),
     }
 }

@@ -128,7 +128,10 @@ agent_backoff_until=0
 # OpenCode 2 leaves a background service behind even with --standalone, so
 # it's stopped after every model round and when the night ends.
 stop_opencode() { pkill -f "$oc_home/bin/opencode" 2>/dev/null || true; }
-trap stop_opencode EXIT
+# A round runs in its own process group (see the cap below), so the night
+# ending early has to stop it itself.
+pid=""
+trap 'stop_opencode; [ -z "$pid" ] || kill -TERM -- "-$pid" 2>/dev/null' EXIT
 
 # NIGHTLY_FUZZ_START=3 starts the rotation at the monkey, for a try.
 n=${NIGHTLY_FUZZ_START:-0}; stress_n=0; agent_n=0; busy_waits=0; fast_fails=0
@@ -167,7 +170,26 @@ while [ "$(now)" -lt "$stop" ]; do
   # NIGHTLY_FUZZ_QUEUE=1 waits in line instead, for a daytime try (the host's
   # busy all day, so a run that always gives way may never get a turn).
   try=--try; [ "${NIGHTLY_FUZZ_QUEUE:-}" != 1 ] || try=""
-  bash "$root/desktop/scripts/remote.sh" local --desk $try -- "${cmd[@]}" >"$dir.log" 2>&1 </dev/null || rc=$?
+  # A round that hangs is stopped rather than left to take the night: on
+  # 18 Nov round 0's remote.sh sat in one mkdir from 23:00 until it was
+  # killed at 07:31, so the whole night was one empty round. A healthy round
+  # is its minutes plus a build (25 at most so far), so 40 over is a hang.
+  # set -m gives the round its own process group, so the stop reaches all of it.
+  cap=$(( (round_min + 40) * 60 ))
+  set -m
+  bash "$root/desktop/scripts/remote.sh" local --desk $try -- "${cmd[@]}" >"$dir.log" 2>&1 </dev/null &
+  pid=$!
+  set +m
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $(( $(now) - started )) -ge "$cap" ]; then
+      say "round $n: $kind still going after $(( cap / 60 )) min: stopping it (hung)"
+      kill -TERM -- "-$pid" 2>/dev/null; sleep 30; kill -KILL -- "-$pid" 2>/dev/null
+      break
+    fi
+    sleep 15
+  done
+  wait "$pid" || rc=$?
+  pid=""
   if [ "$rc" = 75 ]; then
     # Someone else's turn: give it back and try again shortly.
     rm -f "$dir.log"; busy_waits=$((busy_waits + 1))

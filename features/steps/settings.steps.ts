@@ -3,7 +3,7 @@ import { Then, When } from '@cucumber/cucumber';
 import type { ThreadbearWorld } from '../support/world.ts';
 
 /** The Settings window while it's open, from either app's dump. */
-type SettingsInfo = { tab: string; accent?: string; compact?: boolean; keepAwake?: boolean | null; fullSync?: boolean | null; spareWeek?: boolean | null; modelWeeks?: { switch: string; on: boolean } | null; privateFolders?: string[] | null; labReviewers?: string[] | null };
+type SettingsInfo = { tab: string; accent?: string; compact?: boolean; keepAwake?: boolean | null; fullSync?: boolean | null; spareWeek?: boolean | null; modelWeeks?: { switch: string; on: boolean } | null; privateFolders?: string[] | null; labReviewers?: string[] | null; labPanel?: string[] | null };
 const shown = (d: unknown) => (d as { settingsWindow?: SettingsInfo | null }).settingsWindow;
 
 When('I open Settings', async function (this: ThreadbearWorld) {

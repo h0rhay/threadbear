@@ -104,7 +104,7 @@ export function isCodexLogin(dir: string): boolean {
 }
 
 export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 'tokenStatsAccountsDir' | 'userHome' | 'pathEnv'> &
-  Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'hiddenLogins' | 'accountsDir' | 'home' | 'cursorPath' | 'opencodePath' | 'grokPath'>>;
+  Partial<Pick<Config, 'codexMainDir' | 'accountNotes' | 'hiddenLogins' | 'accountsDir' | 'home' | 'cursorPath' | 'opencodePath' | 'grokPath' | 'claudeMainEmail'>>;
 
 // claude-main is ~/.claude (its .claude.json sits at ~/.claude.json);
 // codex-main is ~/.codex. Token Stats' Accounts folder holds claude-N and
@@ -113,7 +113,8 @@ export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 
 export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
   const out: Account[] = [];
   if (isDirectory(cfg.claudeMainDir)) {
-    const own = readLoginProfile(cfg.claudeMainJson);
+    // A box's login is given (box-mode.ts), not read: a token login has no oauthAccount.
+    const own = cfg.claudeMainEmail ? { email: cfg.claudeMainEmail } : readLoginProfile(cfg.claudeMainJson);
     out.push(claudeAccount('claude-main', cfg.claudeMainDir, own?.email ? own : readLoginProfile(path.join(cfg.claudeMainDir, '.claude.json'))));
   }
   // Token Stats' folder (Mike's app), then the data dir's own accounts

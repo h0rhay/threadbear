@@ -65,6 +65,25 @@ Feature: Sending a message
     When I paste a long dictation into the composer
     Then the composer's cursor is in view
 
+  # A click anywhere in the box takes the keyboard there, not just one on its
+  # words: the page behind took it back from the box's own padding (19 Nov).
+  # Not run on the frozen Swift app.
+  @composer.textbox @swift-pending
+  Scenario: A click in the box off its words puts the cursor in it
+    When I start a new thread
+    And I click away from the message box
+    And I click the message box under its controls
+    And I type "on the page" where the cursor is
+    Then the composer says "on the page"
+
+  @composer.textbox @swift-pending
+  Scenario: A click in a thread's box off its words puts the cursor in it
+    Given I open the thread "Morning brief"
+    When I click away from the message box
+    And I click the message box under its controls
+    And I type "in the thread" where the cursor is
+    Then the composer says "in the thread"
+
   @composer.textbox
   Scenario: What I've typed stays with its thread
     When I type "half a thought" in the composer

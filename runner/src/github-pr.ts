@@ -53,7 +53,11 @@ export type PrView = {
   filesError?: string;
   /** Lines left out of a very large diff. */
   filesCut?: number;
+  /** Asked for without its files: they come from `fetchPrFiles`. */
+  filesLater?: boolean;
 };
+
+export type PrFiles = Pick<PrView, 'files' | 'filesError' | 'filesCut'>;
 
 // A name gh takes as a repo: GitHub's own rules, and never starting with a
 // "-" that gh would read as a flag.
@@ -171,13 +175,28 @@ function prState(v: any): PrState {
 
 const VIEW_FIELDS = 'number,title,url,state,isDraft,author,headRefName,baseRefName,additions,deletions,changedFiles,body,createdAt,mergedAt,closedAt,mergedBy,reviewDecision,mergeable,statusCheckRollup,comments,reviews';
 
-export async function fetchPr(ref: PrRef, gh: Gh = realGh): Promise<PrView> {
+/** A PR's files, from its whole diff. A big PR's diff is the slowest of
+ *  the reads (two seconds for 600 KB, 19 Nov), so the app asks for it
+ *  apart and shows the rest first. */
+export async function fetchPrFiles(ref: PrRef, gh: Gh = realGh): Promise<PrFiles> {
+  return prFiles(await run(gh, ['pr', 'diff', String(ref.number), '-R', repoArg(ref)]));
+}
+
+function prFiles(diffOut: { ok: boolean; stdout: string; stderr: string }): PrFiles {
+  if (!diffOut.ok) return { files: [], filesError: failed(diffOut.stderr) };
+  const { files, cut } = cutFiles(splitPatch(diffOut.stdout));
+  return cut ? { files, filesCut: cut } : { files };
+}
+
+/** The PR. With `files: false`, without its files (`filesLater`). */
+export async function fetchPr(ref: PrRef, gh: Gh = realGh, opts: { files?: boolean } = {}): Promise<PrView> {
   const R = repoArg(ref);
   const n = String(ref.number);
-  const [viewOut, repoOut, diffOut] = await Promise.all([
+  const withFiles = opts.files !== false;
+  const [viewOut, repoOut, files] = await Promise.all([
     run(gh, ['pr', 'view', n, '-R', R, '--json', VIEW_FIELDS]),
     run(gh, ['repo', 'view', R, '--json', 'viewerPermission,rebaseMergeAllowed,squashMergeAllowed,mergeCommitAllowed']),
-    run(gh, ['pr', 'diff', n, '-R', R]),
+    withFiles ? fetchPrFiles(ref, gh) : undefined,
   ]);
   if (!viewOut.ok) throw new Error(failed(viewOut.stderr));
   const v = JSON.parse(viewOut.stdout);
@@ -192,7 +211,6 @@ export async function fetchPr(ref: PrRef, gh: Gh = realGh): Promise<PrView> {
   if (repo.squashMergeAllowed) methods.push('squash');
   if (repo.mergeCommitAllowed) methods.push('merge');
   const state = prState(v);
-  const { files, cut } = diffOut.ok ? cutFiles(splitPatch(diffOut.stdout)) : { files: [], cut: 0 };
   const pr: PrView = {
     url: String(v.url || `https://github.com/${R}/pull/${n}`),
     owner: ref.owner,
@@ -214,13 +232,11 @@ export async function fetchPr(ref: PrRef, gh: Gh = realGh): Promise<PrView> {
     mergeMethods: methods,
     checks: checks(Array.isArray(v.statusCheckRollup) ? v.statusCheckRollup : []),
     activity: activity(v.comments, v.reviews),
-    files,
+    ...(files ?? { files: [], filesLater: true }),
   };
   if (v.mergedAt) pr.mergedAt = String(v.mergedAt);
   if (v.closedAt) pr.closedAt = String(v.closedAt);
   if (v.mergedBy?.login) pr.mergedBy = String(v.mergedBy.login);
-  if (!diffOut.ok) pr.filesError = failed(diffOut.stderr);
-  if (cut) pr.filesCut = cut;
   return pr;
 }
 

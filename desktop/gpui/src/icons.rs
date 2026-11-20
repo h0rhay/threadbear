@@ -89,6 +89,9 @@ pub fn runner_symbol(icon: Option<&str>) -> &'static str {
     }
 }
 
+/// A virtual runner's symbol: its Runs on entry and its threads' tiles.
+pub const VIRTUAL_RUNNER: &str = "cloud.bolt";
+
 /// The bundled icon for one of the app's SF Symbol names.
 pub fn symbol(name: &str) -> Icon {
     try_symbol(name).unwrap_or_else(|| Icon::new(IconName::CircleQuestionMark))
@@ -156,6 +159,9 @@ pub fn try_symbol(name: &str) -> Option<Icon> {
         // The symbols a runner can name for itself (`RunnerInfo.icon`).
         "laptopcomputer" => IconName::Laptop,
         "cloud" => IconName::Cloud,
+        // A virtual runner (Runs on, a box thread's row): a machine made on
+        // demand, so not the plain cloud a Hetzner runner names for itself.
+        "cloud.bolt" => IconName::CloudLightning,
         "server.rack" => IconName::Server,
         "smartphone" => IconName::Smartphone,
         "arrow.right.square" => IconName::SquareArrowRight,
@@ -287,6 +293,8 @@ pub fn try_symbol(name: &str) -> Option<Icon> {
         "sparkle.magnifyingglass" => IconName::Search,
         "text.quote" => IconName::TextQuote,
         "arrow.up.circle.fill" => IconName::CircleArrowUp,
+        // A list panel row's switch when its patch names no icon.
+        "power" => IconName::Power,
         _ => return None,
     };
     Some(Icon::new(lucide))

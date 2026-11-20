@@ -313,6 +313,10 @@ pub(crate) enum MenuAction {
     /// the chosen runner (new_thread.rs).
     Runner(Option<String>),
     DefaultRunner(Option<String>),
+    /// A virtual runner, by its id (`RemoteThreads.services`), and the
+    /// same as the default.
+    Service(String),
+    DefaultService(String),
     DraftFolder(String),
     /// Other… under that Folder: a path on that Mac, typed (`typeRemoteFolder`).
     TypeDraftFolder,
@@ -669,7 +673,7 @@ impl Threadbear {
         if !asks {
             return self.toggle_archive(window, cx);
         }
-        let rows = vec![MenuRow::item("Didn't need this", "eye.slash", MenuAction::ArchiveAs("didntNeedToSee")), MenuRow::item("Glad I saw this", "eye", MenuAction::ArchiveAs("gladISaw"))];
+        let rows = vec![MenuRow::item("Didn't need this", "eye.slash", MenuAction::ArchiveAs("didntNeedToSee")), MenuRow::item("Glad I saw this", "eye", MenuAction::ArchiveAs("gladISaw")), MenuRow::item("Not sure", "questionmark.circle", MenuAction::ArchiveAs("notSure"))];
         self.open_menu(Some(id), rows, at, false, window, cx);
     }
 
@@ -808,6 +812,9 @@ impl Threadbear {
             move |t| {
                 t.snoozed_until = Some(local);
                 t.wake_when = None;
+                // Mike's own snooze replaces a wait on its work, as the runner's does.
+                t.waiting_on = None;
+                t.awaiting_app_restart = None;
             },
             json!({ "snoozedUntil": until }),
             cx,
@@ -872,6 +879,9 @@ impl Threadbear {
             |t| {
                 t.snoozed_until = Some("9999-12-31T00:00:00.000Z".into());
                 t.snoozed_until_restart = Some(true);
+                t.waiting_on = None;
+                t.awaiting_app_restart = None;
+                t.wake_when = None;
             },
             json!({ "snoozedUntil": "restart" }),
             cx,
@@ -890,6 +900,8 @@ impl Threadbear {
             t.snoozed_until = Some("9999-12-31T00:00:00.000Z".into());
             t.snoozed_until_restart = None;
             t.wake_when = Some(json!({ "said": said, "pending": true }));
+            t.waiting_on = None;
+            t.awaiting_app_restart = None;
         }
         let guess = self.threads.get(&id).cloned();
         self.leave_selection(&id, next, window, cx);
@@ -1003,6 +1015,8 @@ impl Threadbear {
             }
             MenuAction::Runner(runner) => return self.choose_new_thread_runner(runner, true, cx),
             MenuAction::DefaultRunner(runner) => return self.set_default_runner(runner, cx),
+            MenuAction::Service(id) => return self.choose_new_thread_service(id, true, cx),
+            MenuAction::DefaultService(id) => return self.set_default_service(id, cx),
             MenuAction::DraftFolder(folder) => return self.change_new_draft(&json!({ "cwd": folder }), cx),
             MenuAction::TypeDraftFolder => {
                 self.type_remote_folder(window, cx);
@@ -1065,6 +1079,8 @@ impl Threadbear {
             MenuAction::Sort(_)
             | MenuAction::Runner(_)
             | MenuAction::DefaultRunner(_)
+            | MenuAction::Service(_)
+            | MenuAction::DefaultService(_)
             | MenuAction::DraftFolder(_)
             | MenuAction::TypeDraftFolder
             | MenuAction::EditSchedule(_)
@@ -1639,6 +1655,8 @@ impl Threadbear {
         self.note_navigation();
         self.new_thread.picks.project = None;
         self.new_thread.focus_pending = true;
+        // Its CLI starts now, while the message is written (warm start).
+        self.warm_new_thread(cx);
         cx.notify();
     }
 
@@ -1809,7 +1827,7 @@ impl Threadbear {
             look.done = false;
         }
         let nested_row = matches!(nest, Nest::Child { .. });
-        let trailing = rows::trailing(t, &look, mode, clock, wake);
+        let trailing = self.row_trailing(t, &look, mode, clock, wake);
         let job = rows::job_mark(t, &look);
         let id = t.id.clone();
         // Not while a page is in the thread's place: it isn't what's showing.
@@ -2140,6 +2158,19 @@ impl Threadbear {
             .collect()
     }
 
+    /// What a row says at its right (`rows::trailing`), and for a thread on
+    /// a virtual runner what its box is doing, quietly (`box_trailing`):
+    /// starting, asleep, waking, needing a token. Not once it's archived,
+    /// nor while it's moving.
+    pub(crate) fn row_trailing(&self, t: &ThreadSummary, look: &RowLook, mode: RowMode, clock: &Clock, wake: Option<&threadbear_core::inbox::Wake>) -> rows::Trailing {
+        if mode != RowMode::Archive && t.moving.is_none() {
+            if let Some(line) = self.remote.box_of(t.runner_id.as_deref()).and_then(rows::box_trailing) {
+                return line;
+            }
+        }
+        rows::trailing(t, look, mode, clock, wake)
+    }
+
     /// The sidebar as `dump` reports it, in the Swift app's shape.
     #[cfg(feature = "automation")]
     pub(crate) fn sidebar_dump(&self, cx: &App) -> Value {
@@ -2153,7 +2184,7 @@ impl Threadbear {
             let mode = RowMode::of(key, t, now);
             let look = RowLook::of(t, section);
             let plain = if mode == RowMode::Inbox { look } else { RowLook::PLAIN };
-            let tail = rows::trailing(t, &plain, mode, &clock, (key == "hibernating").then(|| wakes.get(&t.id)).flatten());
+            let tail = self.row_trailing(t, &plain, mode, &clock, (key == "hibernating").then(|| wakes.get(&t.id)).flatten());
             let hovered = self.sidebar.hover_override.as_deref() == Some(t.id.as_str());
             let tile = match rows::tile(t).0 {
                 Tile::Letter(l) => l,
@@ -2763,12 +2794,35 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Win
             // scrolled to first, as a person would, so the click's middle
             // lands on it (settings_window::scroll_into_view). Partly counts
             // as shown above, with its middle maybe past the pane's edge.
-            if cmd["settings"].as_bool() == Some(true) {
+            // The same elsewhere, for one wholly out of sight: the PR tab's
+            // Close without merging and the Runners panel's Paste code sit
+            // below their pane's bottom on GitHub's 1024 by 768 Macs. Each
+            // scroll whose column it's in is tried till it shows.
+            let settings = cmd["settings"].as_bool() == Some(true);
+            if settings || found.is_empty() {
                 let target = found.last().cloned().or_else(|| window.elements().into_iter().filter(|e| e.label().is_some_and(&matches)).last());
-                if target.is_some_and(|t| crate::settings_window::scroll_into_view(app, t.bounds(), cx)) {
-                    window.refresh();
-                    window.render_frame(cx);
-                    found = shown(window);
+                if let Some(bounds) = target.map(|t| t.bounds()) {
+                    if settings {
+                        if crate::settings_window::scroll_into_view(app, bounds, cx) {
+                            window.refresh();
+                            window.render_frame(cx);
+                            found = shown(window);
+                        }
+                    } else {
+                        let scrolls = app.read(cx).side.read(cx).prs.shown_scroll().into_iter().chain(crate::activity_panels::panel_scrolls());
+                        for scroll in scrolls {
+                            let pane = scroll.bounds();
+                            if bounds.center().x < pane.left() || bounds.center().x > pane.right() || !crate::settings_window::scroll_to(&scroll, bounds) {
+                                continue;
+                            }
+                            window.refresh();
+                            window.render_frame(cx);
+                            found = shown(window);
+                            if !found.is_empty() {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             let Some(target) = found.last() else { return Err(format!("no control with the tip {tip:?}")) };

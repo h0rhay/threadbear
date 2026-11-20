@@ -29,7 +29,11 @@ export async function presentAt(ctx: QueryCtx | MutationCtx, runnerId: string): 
 // Caller this returns.
 // A box key (boxes.ts, tbb_...) is looked up among boxes instead: it's one
 // box's, for one runner and one thread (runnerAccess.ts BOX_CALLS).
-export async function runnerAuth(ctx: QueryCtx | MutationCtx, key: string, fn: string): Promise<Caller> {
+// `housekeeping`: a box's call that makes no work (a heartbeat or a save's
+// finish while its save holds it, sent with `held`), which doesn't mark its
+// attempt as holding work (keyUsed). A box saying so falsely only takes its
+// own thread's protection away.
+export async function runnerAuth(ctx: QueryCtx | MutationCtx, key: string, fn: string, opts: { housekeeping?: boolean } = {}): Promise<Caller> {
   const owners = [process.env.RUNNER_KEY, process.env.RUNNER_KEY_NEXT];
   // The owner key needs no lookup; anything else may be a runner key or a box key.
   const other = Boolean(key) && !isOwnerKey(key, owners);
@@ -40,7 +44,7 @@ export async function runnerAuth(ctx: QueryCtx | MutationCtx, key: string, fn: s
   if (!c) throw new ConvexError({ kind: 'auth', message: 'bad runner key' });
   if (!mayCall(c, fn)) throw forbidden(`call ${fn}: ${c.box ? "a box's key runs its one thread, and nothing else" : "only the main Mac's key (the deployment's RUNNER_KEY) can"}`);
   // A save isn't work (its SAVED says what it covers), and a duplicate one mustn't count as any.
-  if (boxRow && !BOX_READS.has(fn) && fn !== 'boxSaved') await keyUsed(ctx, boxRow);
+  if (boxRow && !BOX_READS.has(fn) && fn !== 'boxSaved' && !opts.housekeeping) await keyUsed(ctx, boxRow);
   return c;
 }
 

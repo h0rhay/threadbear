@@ -26,6 +26,7 @@ import type { UpdateFailure } from './fix-update.ts';
 import { machineTrouble } from './machine-trouble.ts';
 import { cleanGitError, followOrigin as fetchAndFollowOrigin, oldestMissingAt, type OriginResult } from './follow-origin.ts';
 import { LAND_TIMES_FILE } from './land-queue.ts';
+import { FETCH_TIMEOUT_MS, gitAsync as gitWithin, repoKey } from './upstream.ts';
 
 export const CHECK_INTERVAL_MS = 5 * 60_000;
 // After main's ref changes in the checkout (a commit or merge landing), the
@@ -468,8 +469,48 @@ export async function landChecked(checkout: string, prefix: string, commit: stri
     return undefined; // not a checkout: can't tell, so check
   }
   const line = passedLandCheck(path.join(common, LAND_TIMES_FILE), commit);
-  if (!line) return undefined;
-  return `tb land's check passed them at this commit on ${line.host}${line.at ? ` at ${line.at}` : ''}`;
+  if (line) return `tb land's check passed them at this commit on ${line.host}${line.at ? ` at ${line.at}` : ''}`;
+  return onMikesMain(checkout, commit);
+}
+
+const MIKES_REPO = 'github.com/mikecann/threadbear';
+
+// Someone else's copy that follows Mike's main as it is (pulled, not
+// brought in through a checked landing) has no landing line for it, so its
+// runner ran the whole unit suite for every update: 6 minutes on a loaded
+// Mac, ADEMark's second account on Tinker Desk (19 Nov 2026). Mike's main
+// only moves to commits a landing's check passed, so a commit his main has
+// needs no second run. His main is fetched fresh for it, under whichever
+// remote's URL is his (its own name, upstream or origin), as setup does
+// (scripts/checked-upstream.mjs): a ref already here may be a fork's, left
+// behind when the remote was pointed at his. A fetch that fails checks.
+// It's the person's own checkout, so the fetch leaves FETCH_HEAD alone: a
+// `git merge FETCH_HEAD` of theirs would take Mike's main (Codex's review).
+export async function onMikesMain(checkout: string, commit: string): Promise<string | undefined> {
+  let remotes: string[];
+  try {
+    remotes = (await gitWithin(checkout, ['remote'])).split('\n').filter(Boolean);
+  } catch {
+    return undefined;
+  }
+  for (const remote of remotes) {
+    let url: string;
+    try {
+      url = await gitWithin(checkout, ['config', '--get', `remote.${remote}.url`]);
+    } catch {
+      continue;
+    }
+    if (repoKey(url) !== MIKES_REPO) continue;
+    const main = `refs/remotes/${remote}/main`;
+    try {
+      await gitWithin(checkout, ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, `+refs/heads/main:${main}`], { timeoutMs: FETCH_TIMEOUT_MS });
+      await gitWithin(checkout, ['merge-base', '--is-ancestor', commit, main]);
+      return `${remote}/main has this commit, and a landing's check passed them there`;
+    } catch {
+      // not fetched, or not his
+    }
+  }
+  return undefined;
 }
 
 // deploy.mjs from the clone, stopping after it has pointed current at the

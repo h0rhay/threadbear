@@ -20,7 +20,11 @@ reading the code, unless it says it was tested.
 Commands, moves, runner requests and thread clears are now state machines (below).
 A virtual runner's box (`boxes.boxState`, docs/virtual-runners.md) was
 born one on 18 Nov 2026 (`convex/boxMachine.ts`): a new table, so nothing
-to backfill and no stepping stone.
+to backfill and no stepping stone. A login's cloud token for boxes
+(`cloudTokens.tokenState`: valid, dead once a box's turn on it is refused)
+became one on 19 Nov 2026 (`convex/cloudTokenMachine.ts`), with a
+`tokenState` backfill (rows set before it are valid), and boxes gained
+`needsToken`, waiting for one.
 
 ## Still to do, most worth it first
 
@@ -51,7 +55,8 @@ Machines page (`/machines`). So far: **commands** (`convex/commandMachine.ts`),
 (`convex/requestMachine.ts`, no timers: a request's card expires on the
 asking runner, which closes it), **thread clears**
 (`convex/clearMachine.ts`) and **boxes** (`convex/boxMachine.ts`, a thread's
-box on a virtual runner, with a boot timeout and a heartbeat lease). Next, one at a time, the table above.
+box on a virtual runner, with a boot timeout and a heartbeat lease) and **cloud
+tokens** (`convex/cloudTokenMachine.ts`, no timers). Next, one at a time, the table above.
 
 Moves keep each deadline as a time in the state's data (`askBy`,
 `giveUpAt`), not a delay from entering it: the backfill brings a move over

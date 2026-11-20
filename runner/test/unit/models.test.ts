@@ -191,22 +191,22 @@ test('settings: update saves to runner.json, applies at once, and a bad field ch
 test('settings: experiments lists each with its switch, and update saves only known ids', () => {
   const s = settingsSetup();
   const file = path.join(s.home, 'runner.json');
-  fs.writeFileSync(file, JSON.stringify({ experiments: { coldCompact: true } }));
+  fs.writeFileSync(file, JSON.stringify({ experiments: { warmStart: true } }));
   const listed = s.svc.get().experiments;
   assert.ok(listed.length > 0);
   // Every experiment file shows, so a new one needs nothing in the app.
   assert.deepEqual(listed.map((x) => x.id), EXPERIMENTS.map((x) => x.id));
-  assert.equal(listed.find((x) => x.id === 'coldCompact')?.on, true);
-  assert.equal(listed.find((x) => x.id === 'cardReviewer')?.on, false);
+  assert.equal(listed.find((x) => x.id === 'warmStart')?.on, true);
+  assert.equal(listed.find((x) => x.id === 'inboxGuess')?.on, false);
   assert.ok(listed.every((x) => x.name && x.does), 'each has a name and what it does');
-  const r = s.methods['settings.update']({ experiments: { cardReviewer: true } }) as { settings: any };
-  assert.equal(r.settings.experiments.find((x: any) => x.id === 'cardReviewer').on, true);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { coldCompact: true, cardReviewer: true }, 'the others are kept');
+  const r = s.methods['settings.update']({ experiments: { inboxGuess: true } }) as { settings: any };
+  assert.equal(r.settings.experiments.find((x: any) => x.id === 'inboxGuess').on, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { warmStart: true, inboxGuess: true }, 'the others are kept');
   assert.equal(s.published.at(-1)?.method, 'settings.updated');
-  for (const bad of [{ experiments: { nope: true } }, { experiments: { cardReviewer: 'yes' } }, { experiments: [] }, { experiments: null }]) {
+  for (const bad of [{ experiments: { nope: true } }, { experiments: { inboxGuess: 'yes' } }, { experiments: [] }, { experiments: null }]) {
     assert.throws(() => s.methods['settings.update'](bad), (e: RpcError) => e.code === ErrorCode.badParams, JSON.stringify(bad));
   }
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { coldCompact: true, cardReviewer: true }, 'a refused update changed nothing');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).experiments, { warmStart: true, inboxGuess: true }, 'a refused update changed nothing');
 });
 
 test('settings: keeping the Mac awake is on until turned off, and only a Mac shows it', () => {

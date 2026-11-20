@@ -23,7 +23,7 @@ import { cliName } from '../providers.ts';
 // What this updates. An ACP agent's CLI isn't touched by Threadbear.
 const MANAGED: readonly AnyProvider[] = ['claude', 'codex'];
 import { claudeChannel, claudeInstalledVersion, claudeLatestVersion, runClaudeUpdate } from './claude.ts';
-import { CodexCopies, NPM_LATEST, codexPackageVersion, type CodexResolver, type SurfaceCheck } from './codex.ts';
+import { CodexCopies, NPM_LATEST, codexPackageVersion, type CodexHold, type CodexResolver, type SurfaceCheck } from './codex.ts';
 import { VERSION_RE, compareVersions, defaultExec, defaultFetchText, type Exec, type FetchText } from './exec.ts';
 import { UpdateHistory, type ProviderState, type UpdatesFile } from './history.ts';
 
@@ -43,6 +43,15 @@ export type CliUpdatesHooks = {
   versionsInUse(p: Provider): { version: string; threadIds: string[] }[];
   // The real binary paths the runner's live Codex processes started.
   codexBinariesInUse(): string[];
+  // A Codex version held back because its protocol lacks something the
+  // runner uses: starts a thread that looks into it, and returns its id, so
+  // Mike isn't left with an orange line and two buttons to guess between
+  // (20 Nov 2026, 0.171.0 dropped currentTime/read). Undefined, or a
+  // runner that can't land a fix (no checkout, or one that follows
+  // GitHub's main), leaves the hold as it was.
+  heldBack?(h: { version: string; current?: string; missing: string[]; added: string[] }): string | undefined;
+  // Where that thread is: open, archived, or undefined once it's deleted.
+  threadState?(threadId: string): 'open' | 'archived' | undefined;
 };
 
 export type CliUpdatesDeps = {
@@ -99,6 +108,16 @@ export class CliUpdates {
   private stopped = false;
   // The Claude version before the newest update, for the "go back" hint.
   private lastClaude?: string;
+  // Held Codex versions already put through the gate again since this
+  // runner started (recheckHold).
+  private regated = new Set<string>();
+  private rechecking?: Promise<void>;
+  // The hold thread's state as last sent, so only a change re-sends the list.
+  // The hold's thread and where it was, as status() last read it and as
+  // the last clis.updated sent it: a read in between (clis.list) mustn't
+  // pass for telling the app.
+  private readThread?: { id: string; state?: 'open' | 'archived' };
+  private sentThread?: { id: string; state?: 'open' | 'archived' };
 
   constructor(d: CliUpdatesDeps) {
     this.d = d;
@@ -315,7 +334,17 @@ export class CliUpdates {
     if (latestVersion) out.latestVersion = latestVersion;
     if (codexState?.previous && this.copies.has(codexState.previous)) out.previousVersion = codexState.previous;
     if (s.checkedAt) out.checkedAt = s.checkedAt;
-    if (hold) out.hold = { ...hold };
+    if (hold) {
+      const { added: _added, threadId, ...shown } = hold;
+      out.hold = shown;
+      // A deleted thread isn't linked; an archived one is, as what it found.
+      const state = threadId ? this.d.hooks.threadState?.(threadId) : undefined;
+      this.readThread = threadId ? { id: threadId, state } : undefined;
+      if (threadId && state) out.hold.threadId = threadId;
+      if (state === 'open') out.hold.investigating = true;
+    } else if (p === 'codex') {
+      this.readThread = undefined;
+    }
     if (s.update) out.update = { ...s.update };
     return out;
   }
@@ -396,6 +425,9 @@ export class CliUpdates {
       // The last known value stays.
       this.d.log.info('cli updates: version check failed', { provider: p, error: (e as Error).message });
     }
+    // After the lookup, so a newer release can make the hold moot, but not
+    // inside it: the kept copy needs no network.
+    if (p === 'codex' && this.managedCodex() && this.policy(p) !== 'off') await this.recheckHold();
     if (this.policy(p) !== 'auto') return;
     const latest = this.st[p]?.latestVersion;
     if (p === 'codex' && this.managedCodex() && !this.copies.currentVersion()) {
@@ -407,6 +439,84 @@ export class CliUpdates {
     if (!latest || !installed || compareVersions(installed, latest) >= 0) return;
     if (p === 'codex' && this.copies.state().hold?.version === latest) return;
     this.startUpdate(p, {});
+  }
+
+  // A protocol hold goes through the gate again once per runner start: the
+  // runner restarts on every landing, and that landing may be the fix that
+  // takes what the new version dropped off the runner's lists. Through now,
+  // the hold goes and the check carries on to install it like any update.
+  // Still held, it gets a thread looking into it if it never had one (a
+  // hold from before heldBack existed), unless a newer release has come
+  // out, which the update goes to instead.
+  //
+  // One at a time, and never beside an install: updateCodex waits for it,
+  // and it skips while one runs, so an "Update anyway" or "Go back" can't
+  // have its hold cleared under it. Only a gate that answered counts: a
+  // timeout leaves it to the next check.
+  private recheckHold(): Promise<void> {
+    this.rechecking ??= this.recheckHoldNow().finally(() => {
+      this.rechecking = undefined;
+    });
+    return this.rechecking;
+  }
+
+  private async recheckHoldNow(): Promise<void> {
+    const hold = this.copies.state().hold;
+    if (!hold?.missing?.length || this.stopped) return;
+    if (!this.regated.has(hold.version)) {
+      if (this.running.codex || !this.copies.lock()) return;
+      try {
+        const r = await this.copies.regate(hold.version);
+        const now = this.copies.state().hold;
+        if (!r || this.stopped || !sameHold(now, hold)) return;
+        this.regated.add(hold.version);
+        if (!r.missing.length) {
+          this.copies.clearHold(hold.version);
+          this.history.append({ at: this.iso(), provider: 'codex', action: 'hold', ok: true, version: hold.version, message: 'cleared: the runner no longer needs what it lacked' });
+          this.d.log.info('cli updates: a held Codex version passes the check now', { version: hold.version });
+          this.changed();
+          return;
+        }
+        if (r.missing.join('\n') !== hold.missing.join('\n')) {
+          this.copies.updateHold(hold.version, { missing: r.missing, added: r.added.length ? r.added : undefined });
+          this.changed();
+        }
+      } finally {
+        this.copies.unlock();
+      }
+    }
+    // An install asked for meanwhile (Update anyway, Go back) settles the
+    // hold itself; a newer release is what the update goes to instead.
+    const latest = this.st.codex?.latestVersion;
+    if (this.running.codex || (latest && compareVersions(latest, hold.version) > 0)) return;
+    this.investigate(hold.version);
+  }
+
+  // One thread per held version: archived without a fix, the hold stays
+  // with Update anyway, and no second thread starts.
+  private investigate(version: string): void {
+    const hold = this.copies.state().hold;
+    if (!this.d.hooks.heldBack || hold?.version !== version || !hold.missing?.length || hold.threadId) return;
+    try {
+      const threadId = this.d.hooks.heldBack({ version, current: this.copies.currentVersion(), missing: hold.missing, added: hold.added ?? [] });
+      if (!threadId) return;
+      this.copies.updateHold(version, { threadId });
+      this.d.log.info('cli updates: started a thread on the held Codex version', { version, threadId });
+      this.changed();
+    } catch (e) {
+      this.d.log.warn('cli updates: could not start a thread on the held Codex version', { version, error: (e as Error).message });
+    }
+  }
+
+  // A thread was archived, brought back or deleted: when it's the one on
+  // the hold, the row's "investigating" changes with it, and nothing else
+  // would tell the app until the next check.
+  // Every thread's every summary change comes through here, so it goes by
+  // what status() last saw rather than reading state.json.
+  threadChanged(threadId: string): void {
+    if (threadId !== this.sentThread?.id) return;
+    if (this.d.hooks.threadState?.(threadId) === this.sentThread.state) return;
+    this.changed();
   }
 
   // ---- updating
@@ -472,6 +582,8 @@ export class CliUpdates {
       this.finish('codex', { state: 'failed', message: "The latest Codex version isn't known yet." });
       return;
     }
+    // A recheck of a hold under way finishes first (recheckHold).
+    await this.rechecking?.catch(() => undefined);
     if (!this.copies.lock()) {
       this.finish('codex', { state: 'failed', targetVersion: target, message: 'Another runner on this home is installing Codex.' });
       return;
@@ -519,7 +631,9 @@ export class CliUpdates {
     this.history.append({ at: this.iso(), provider: 'codex', action: 'install', ok: true, version: target, output: r.output });
     if (r.kind === 'held') {
       const reason = 'the app-server protocol changed';
-      this.copies.setHold({ version: target, reason, missing: r.missing });
+      this.copies.setHold({ version: target, reason, missing: r.missing, ...(r.added.length ? { added: r.added } : {}) });
+      this.regated.add(target);
+      this.investigate(target);
       this.history.append({ at: this.iso(), provider: 'codex', action: 'hold', ok: false, version: target, message: reason, missing: r.missing, added: r.added });
       this.d.log.warn('cli updates: Codex held back', { version: target, missing: r.missing });
       if (o.bootstrap && target !== this.d.codex.testedVersion && !this.copies.currentVersion()) return this.installCodex(this.d.codex.testedVersion, { bootstrap: false });
@@ -585,6 +699,7 @@ export class CliUpdates {
 
   private changed(): void {
     const clis = this.list();
+    this.sentThread = this.readThread;
     for (const fn of this.listeners) {
       try {
         fn(clis);
@@ -607,4 +722,10 @@ export class CliUpdates {
 
 function stripUndefined<T extends Record<string, unknown>>(o: T): T {
   return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+}
+
+// The same protocol hold: an install, "Update anyway" or "Go back" since
+// replaces or clears it.
+function sameHold(a: CodexHold | undefined, b: CodexHold): boolean {
+  return a?.version === b.version && a.reason === b.reason && (a.missing ?? []).join('\n') === (b.missing ?? []).join('\n');
 }

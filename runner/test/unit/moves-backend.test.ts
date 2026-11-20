@@ -316,6 +316,28 @@ test('a move fails or is cancelled only before the switch, and a stuck one fails
   assert.equal(moveOf(s, c).state, 'claimed', 'past the switch, the new runner finishes it');
 });
 
+// 16 Nov 2026 (David Clark's fork): a restart of the main Mac took two
+// threads it had moved to another Mac for deleted there, and the owner key's
+// removeThreads deleted their rows on the Mac they'd moved to. A removal that
+// names its runner only takes that runner's rows, whatever the key.
+test("a removal naming its runner leaves a thread that moved to another runner alone", async () => {
+  const s = await setup();
+  await s.owner.upsert(thread('T7', LAPTOP), thread('T8', LAPTOP));
+  const { moveId } = await s.owner.start('T7', MINI);
+  await s.owner.info(moveId);
+  await s.mini.ready(moveId);
+  await s.owner.frozen(moveId);
+  const chunk = s.file('chunk7');
+  await s.owner.packed(moveId, [chunk]);
+  await s.mini.claim(moveId);
+  assert.equal(s.rows('threads').find((t) => t.threadId === 'T7')!.runnerId, MINI);
+
+  await call(s.ctx, sync.removeThreads as never, { key: OWNER, threadIds: ['T7', 'T8'], runnerId: LAPTOP });
+  assert.ok(s.rows('threads').some((t) => t.threadId === 'T7'), "Mac mini's thread stays");
+  assert.ok(!s.rows('threads').some((t) => t.threadId === 'T8'), "the Laptop's own goes");
+  assert.equal(await outcome(call(s.ctx, sync.removeThreads as never, { key: MINI_KEY, threadIds: ['T7'], runnerId: LAPTOP })), 'forbidden', 'a runner key names only its own runner');
+});
+
 test('the switch fails the move if the thread left its runner meanwhile', async () => {
   const s = await setup();
   await s.mini.upsert(thread('T6', MINI));

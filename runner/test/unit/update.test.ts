@@ -1059,6 +1059,32 @@ test('landChecked: a commit a landing checked on a check host needs no second ch
   assert.equal(await landChecked(repo, 'runner/', src), undefined);
 });
 
+test("landChecked: someone's copy that pulled Mike's main skips what his landings ran", async () => {
+  const { repo, commit } = makeRepo();
+  const git = (...args: string[]) => {
+    const r = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  const mikes = path.join(tmpDir(), 'mikes.git');
+  assert.equal(spawnSync('git', ['init', '-q', '--bare', '-b', 'main', mikes]).status, 0);
+  const his = commit('his change', 'runner/src/main.ts', 'console.log(3)\n');
+  // The remote says Mike's URL; insteadOf sends its fetches to the stand-in.
+  git('config', `url.${mikes}.insteadOf`, 'https://github.com/mikecann/threadbear.git');
+  git('remote', 'add', 'upstream', 'https://github.com/mikecann/threadbear.git');
+  git('push', '-q', 'upstream', 'main');
+  assert.match((await landChecked(repo, 'runner/', his)) ?? '', /upstream\/main has this commit/);
+  // A commit of this copy's own, even with a stale ref saying his main has it.
+  const own = commit('mine', 'runner/src/main.ts', 'console.log(4)\n');
+  git('update-ref', 'refs/remotes/upstream/main', own);
+  assert.equal(await landChecked(repo, 'runner/', own), undefined);
+  // A fetch that fails checks.
+  fs.rmSync(mikes, { recursive: true, force: true });
+  assert.equal(await landChecked(repo, 'runner/', his), undefined);
+  // A remote that isn't Mike's counts for nothing.
+  git('remote', 'set-url', 'upstream', 'https://github.com/someone/threadbear.git');
+  assert.equal(await landChecked(repo, 'runner/', his), undefined);
+});
+
 // landChecked rests on a landing's check running everything a build's own
 // checks do. These hold the two together.
 test("a build's own checks are no more than tb land's: the same steps, command and test run", () => {

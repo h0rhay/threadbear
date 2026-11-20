@@ -13,10 +13,11 @@
     "web:test": "node --test web/src/*.test.ts",
     "web:deploy": "static-hosting deploy --dist web/dist --build-command 'npm run web:build'",
     "web:sign-in": "swift web/scripts/sign-in.swift",
-    "lint": "eslint . --max-warnings 0"
+    "lint": "eslint . --max-warnings 0",
+    "lint:files": "eslint --max-warnings 0 --no-warn-ignored --pass-on-unpruned-suppressions"
   },
   "dependencies": {
-    "@convex-dev/state-machines": "file:vendor/convex-dev-state-machines-0.1.3-viewer.tgz",
+    "@convex-dev/state-machines": "file:vendor/convex-dev-state-machines-0.1.3-paged.tgz",
     "@convex-dev/static-hosting": "0.2.1",
     "convex": "1.49.0",
     "react": "19.3.1",

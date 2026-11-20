@@ -10,7 +10,8 @@ import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { Runner } from './runner.ts';
-import type { Account, EffortLevel, PermissionMode, PersistedEvent, Project, Schedule, ThreadSummary } from './protocol.ts';
+import { diffLines, splitLines } from './diff.ts';
+import type { Account, EffortLevel, ImageRef, PermissionMode, PersistedEvent, Project, Schedule, ThreadSummary } from './protocol.ts';
 import type { ToolApprovalAnswer } from './adapters/types.ts';
 import { cardInput, tooLongForCard } from './tools.ts';
 import { resetTime, usageLine } from './usage.ts';
@@ -20,13 +21,13 @@ import { AGENT_MESSAGE_PREFIX, EFFORT_LEVELS, ErrorCode, MOVE_MESSAGE_PREFIX, Rp
 import type { Scheduler } from './schedules.ts';
 import { MAX_CHECK_TIMEOUT_SECS } from './schedule-check.ts';
 import { checkDigest, type CheckCard } from './patch-trust.ts';
-import type { Projects } from './projects.ts';
+import { applyNoteEdits, type Projects } from './projects.ts';
 import { parseWhen, relativeFuture, relativeTime } from './when.ts';
 import { SAID_MAX } from './wake-when.ts';
 
 export { parseWhen, relativeFuture, relativeTime };
 import { RUNNER_VERSION, expandHome } from './config.ts';
-import { droppedOpenLines, OPEN_GONE, ALREADY_ENDED, ARCHIVE_ADDED, MAX_UNTIL, MAX_WAIT_FOR, SNOOZE_ADDED, snoozeFromTool, endTurnDescription, endTurnForm, endTurnMisfit, endTurnTaken, openCardsNote, END_TURN_TOOL, BULLETS_ONLY, ENDED, takenEndTurn, MAX_BYLINE, NARRATION_ONLY, NO_REPLY, needsFromTool, oneReplyAccepted, offersToTakeItBack, oneReplyAlreadyWritten, summaryFromTool, triedFirstNudged, tryFirstNudge, deadEndNudge, deadEndNudged, hasDeadEnd, plainCardNudge, plainCardNudged, wantsPlainCard, turnReply, unreadMessageRefusal, type TurnReply } from './needs.ts';
+import { droppedOpenLines, OPEN_GONE, ALREADY_ENDED, ARCHIVE_ADDED, MAX_UNTIL, MAX_WAIT_FOR, SNOOZE_ADDED, snoozeFromTool, endTurnDescription, endTurnForm, endTurnMisfit, endTurnTaken, strayAskFields, strayAskProblem, openCardsNote, END_TURN_TOOL, BULLETS_ONLY, ENDED, takenEndTurn, MAX_BYLINE, NARRATION_ONLY, NO_REPLY, needsFromTool, oneReplyAccepted, handsOverAStep, oneReplyAlreadyWritten, summaryFromTool, triedFirstNudged, tryFirstNudge, projectStepNudge, projectStepNudged, unansweredItems, deadEndNudge, deadEndNudged, hasDeadEnd, plainCardNudge, plainCardNudged, wantsPlainCard, turnReply, unreadMessageRefusal, type TurnReply } from './needs.ts';
 
 // end_turn's needs, both forms: "done" meant this turn's step until 11 Nov
 // 2026, when thread 0222c475 said nothing with three draft PRs unmerged in
@@ -35,7 +36,7 @@ import { droppedOpenLines, OPEN_GONE, ALREADY_ENDED, ARCHIVE_ADDED, MAX_UNTIL, M
 const WHOLE_JOB = "Done is the whole job, not this step: if the next step to finish it is theirs (a merge, a deploy), it's an ask.";
 import { asksForAppRestart, type AppRestarts } from './app-restarts.ts';
 import { PANEL_PLACES } from './panel-requests.ts';
-import { nudgedThisTurn, signInNudge, turnSignIns, uncovered, type ConnectorService } from './connectors.ts';
+import { notSignIns, nudgedThisTurn, signInNudge, turnSignIns, uncovered, type ConnectorService } from './connectors.ts';
 import type { PanelPlace } from './protocol.ts';
 import { providerName } from './providers.ts';
 import { readRelease, type ReleaseJson } from './release.ts';
@@ -118,12 +119,14 @@ export type ScheduleControl = Async<Scheduler, 'create' | 'list' | 'find' | 'upd
 
 // On a draining runner these are the primary's projects (projectRouter in
 // handover.ts), so they may be promises too.
-export type ProjectControl = Async<Projects, 'list' | 'get' | 'find' | 'create' | 'update' | 'appendNote' | 'changeMembership'> &
+export type ProjectControl = Async<Projects, 'list' | 'get' | 'find' | 'create' | 'update' | 'editNotes' | 'appendNote' | 'changeMembership'> &
   Partial<Async<Projects, 'chooseIcon' | 'addLinks' | 'removeLinks'>>;
 
 export const SERVER_NAME = 'threadbear';
 
-export type AgentApprovalRequest = { name: string; title: string; input: Record<string, unknown>; signal?: AbortSignal };
+// `review`: what the call changes, worked out by Threadbear itself (a project
+// brief's line diff), for the card reviewer (runner/card-review.ts) alone.
+export type AgentApprovalRequest = { name: string; title: string; input: Record<string, unknown>; review?: string; signal?: AbortSignal };
 
 // Permission modes by how much an agent may do in them without asking.
 // Plan first ranks with ask: its agent changes nothing, and only Mike's
@@ -217,6 +220,9 @@ export function approvalTitle(name: string, input: Record<string, unknown>, find
 // How long end_turn waits for its own call to reach the thread's events
 // before judging the turn (below).
 export const LAND_WAIT_MS = 1000;
+// The most of one brief field's changed lines shown to the card reviewer
+// (briefChanges).
+const BRIEF_DIFF_MAX = 20_000;
 const LAND_POLL_MS = 50;
 
 // Looking a thread id up during a handover (find, below): tries a second
@@ -271,6 +277,12 @@ export function buildThreadbearTools(
     // plainCardNudge). Off only in tests about the rest of end_turn, which
     // would otherwise each have to answer it first.
     plainCardNote?: boolean;
+    // The once-a-turn note asking for a try at a step (needs.ts,
+    // tryFirstNudge), off likewise.
+    tryFirstNote?: boolean;
+    // The once-a-turn note to a Done card in a project still going
+    // (needs.ts, projectStepNudge), off likewise.
+    projectStepNote?: boolean;
   } = {},
 ) {
   const codex = opts.provider === 'codex';
@@ -313,6 +325,64 @@ export function buildThreadbearTools(
       before = page.firstSeq;
     }
     return out;
+  };
+
+  // The thread's events back to its last few finished turns, oldest
+  // first: for the cards they left (needs.ts, unansweredItems). Pages back
+  // until it has passed `turns` turn.completed events, at most 20 pages, so
+  // a long turn running now doesn't hide the cards before it.
+  const recentEvents = async (turns = 10): Promise<PersistedEvent[]> => {
+    const out: PersistedEvent[] = [];
+    let before: number | undefined;
+    let seen = 0;
+    // Only turns that left a card count, and not ones an edit cut out: a
+    // thread.rewound comes after the range it cuts, so walking back meets it first.
+    const cuts: { from: number; to: number }[] = [];
+    for (let pages = 0; pages < 20 && seen < turns; pages++) {
+      const page = await control.events(selfId, { beforeSeq: before, limit: 500 });
+      const evs = page.events as PersistedEvent[];
+      out.unshift(...evs);
+      for (const e of [...evs].reverse()) {
+        if (e.type === 'thread.rewound') cuts.push({ from: e.fromSeq, to: e.toSeq });
+        else if (e.type === 'turn.completed' && e.needs && !cuts.some((c) => e.seq >= c.from && e.seq <= c.to)) seen++;
+      }
+      if (!evs.length || page.firstSeq <= 1) break;
+      before = page.firstSeq;
+    }
+    return out;
+  };
+
+  // The once-a-turn note to a Done card (needs.ts, projectStepNudge): only
+  // in a thread Mike started (a helper's Done is about its own brief), in a
+  // project that isn't archived, and not when the card archives it, sleeps
+  // or waits on other threads or the app restarting, as those say it isn't
+  // over or he asked. Not a sub-agent's call either: it isn't in the
+  // thread's events, so the once-a-turn mark would never be seen and it
+  // would be refused every time (refuseUnread, likewise). A project it
+  // can't read in time is left out rather than holding the turn's end.
+  // The turn (its turn.started's seq) the note last went to. A Codex
+  // sub-agent's call runs through these handlers but never reaches the
+  // thread's events either, so the mark in them alone would let it be
+  // refused every time; this caps it at once a turn whoever asks (Codex
+  // and Gemini's second review, 20 Nov).
+  let projectNotedTurn: number | undefined;
+  const projectStepNote = async (input: { archive?: unknown; snooze?: unknown; waitFor?: unknown }, needs: string, next: string[] | undefined, events: PersistedEvent[]): Promise<string | undefined> => {
+    if (opts.projectStepNote === false || needs !== 'nothing' || !projects) return undefined;
+    if (input.archive === true || snoozeFromTool({ ...input, needs: 'nothing' }) || (Array.isArray(input.waitFor) && input.waitFor.length) || projectStepNudged(events)) return undefined;
+    if (appRestarts?.isWatching(selfId)) return undefined;
+    const turn = events.findLast((e) => e.type === 'turn.started')?.seq;
+    if (turn !== undefined && turn === projectNotedTurn) return undefined;
+    if (!codex && !(await replied()).landed) return undefined;
+    const me = await inTime((async () => control.get(selfId))(), ID_LIST_TIMEOUT_MS, "couldn't read the thread").catch(() => undefined);
+    if (!me || me.startedBy || !me.projects?.length) return undefined;
+    const live: { title: string; state: string }[] = [];
+    for (const p of me.projects) {
+      const got = await inTime((async () => projects.get(p.id))(), ID_LIST_TIMEOUT_MS, "couldn't read the project").catch(() => undefined);
+      if (got && !got.project.archived) live.push({ title: got.project.title, state: got.project.state });
+    }
+    if (!live.length) return undefined;
+    projectNotedTurn = turn;
+    return projectStepNudge(live, unansweredItems(await recentEvents(), next ?? []));
   };
 
   // Whether the turn has replied to Mike (needs.ts, turnReply). The SDK
@@ -515,7 +585,7 @@ export function buildThreadbearTools(
       return { mode: 'full', title: t.title };
     }
   };
-  const confirm = async (tool: string, reasons: string[], input: Record<string, unknown>, signal?: AbortSignal): Promise<void> => {
+  const confirm = async (tool: string, reasons: string[], input: Record<string, unknown>, signal?: AbortSignal, review?: string): Promise<void> => {
     if (!reasons.length) return;
     const ask = control.requestAgentApproval?.bind(control);
     if (!ask) throw new Error(`${reasons.join('; ')}: that needs the user's OK, which this runner can't ask for here. Nothing changed; ask them to do it in the app.`);
@@ -524,11 +594,11 @@ export function buildThreadbearTools(
     // (tools.ts, cardInput; Daybreak, 7 Nov 2026).
     const card = cardInput(input, 'all');
     if (card.tooLong) throw new Error(`${reasons.join('; ')}: that needs the user's OK. ${tooLongForCard(card.tooLong)}`);
-    const a = await ask(selfId, { name: `mcp__${SERVER_NAME}__${tool}`, title: reasons.join('; '), input: card.input, ...(signal ? { signal } : {}) });
+    const a = await ask(selfId, { name: `mcp__${SERVER_NAME}__${tool}`, title: reasons.join('; '), input: card.input, ...(review ? { review } : {}), ...(signal ? { signal } : {}) });
     if (a.decision === 'allow' || a.decision === 'allowAlways') return;
     if (a.noApp) throw new Error(a.message ?? 'No card could be put up for this, so nothing changed.');
     if (a.decision === 'expired') throw new Error(`No answer from the user${a.message ? ` (${a.message})` : ''}, so nothing changed.`);
-    throw new Error(`The user said no${a.message ? `: ${a.message}` : ''}. Nothing changed; ask them how to proceed.`);
+    throw new Error(`The user said no${a.message ? `: ${a.message.replace(/[.\s]+$/, '')}` : ''}. Nothing changed; ask them how to proceed.${a.reviewer ? ` ${a.reviewer}` : ''}`);
   };
   const threadName = (id: string, title: string): string => (id === selfId ? 'this thread' : `"${title}"`);
   // A message to a thread with more access than the caller.
@@ -577,7 +647,7 @@ export function buildThreadbearTools(
   const archivedHow = (t: ThreadSummary): string => {
     if (!t.archivedBy) return '';
     const who = t.archivedBy === 'mike' ? 'the user' : t.archivedBy === 'agent' ? 'an agent' : 'Threadbear';
-    const verdict = t.archiveVerdict === 'worked' ? ': it worked' : t.archiveVerdict === 'didntWork' ? ": it didn't work" : t.archiveVerdict === 'notNeeded' ? ': not needed' : t.archiveVerdict === 'didntNeedToSee' ? ": they didn't need to see it" : t.archiveVerdict === 'gladISaw' ? ': glad to have seen it' : '';
+    const verdict = t.archiveVerdict === 'worked' ? ': it worked' : t.archiveVerdict === 'didntWork' ? ": it didn't work" : t.archiveVerdict === 'notNeeded' ? ': not needed' : t.archiveVerdict === 'didntNeedToSee' ? ": they didn't need to see it" : t.archiveVerdict === 'gladISaw' ? ': glad to have seen it' : t.archiveVerdict === 'notSure' ? ': not sure they needed to see it' : '';
     return ` by ${who}${verdict}`;
   };
 
@@ -664,7 +734,7 @@ export function buildThreadbearTools(
   const reviewTools = [
     tool(
       'show_options',
-      'Shows the user design options (mockups, wireframes, screenshots, videos or HTML pages of variants) in a review window to choose between, instead of pinning them, listing them or reading every image into the transcript. Give an option\u2019s other screens or states as its shots, never as options of their own. The window steps through every shot in order, then shows the options side by side; the user can pick any number or none, and reply. Returns a review ID promptly; finish your turn and the answer arrives later as a message. A reference option (today\u2019s version, say) can\u2019t be picked.',
+      'Shows the user design options (mockups, wireframes, screenshots, videos or HTML pages of variants) in a review window to choose between, instead of pinning them, listing them or reading every image into the transcript. Only for options whose look or motion is the point: options that are words (names, plans, approaches, a shortlist) go in your reply, not on pages made for this. Give an option\u2019s other screens or states as its shots, never as options of their own. The window steps through every shot in order, then shows the options side by side; the user can pick any number or none, and reply. Returns a review ID promptly; finish your turn and the answer arrives later as a message. A reference option (today\u2019s version, say) can\u2019t be picked.',
       {
         title: z.string().min(1).max(200).describe('What the user is reviewing.'),
         note: z.string().max(4000).optional().describe('A short lead, markdown: **bold** what matters.'),
@@ -685,7 +755,7 @@ export function buildThreadbearTools(
       handle(async (input, extra) => {
         if (!control.createReview) throw new Error('This runner does not support image reviews yet.');
         const { review } = await control.createReview(selfId, input);
-        return `Review ${review.id}: ${review.title} (${review.options.length} options). The user can compare them and send their picks and a reply. You can finish this turn; their reply will arrive as a later message. To open it from an end_turn ask, link to review:${review.id}.`;
+        return `Review ${review.id}: ${review.title} (${review.options.length} options). The user can compare them and send their picks and a reply. You can finish this turn; their reply will arrive as a later message. To open it from an end_turn ask, link to review:${review.id}.${oversizeShotsNote(review)}`;
       }),
     ),
   ];
@@ -793,7 +863,7 @@ export function buildThreadbearTools(
     ? [
         tool(
           'ask_secret',
-          `Asks the user for a secret (a password, an API key, a token, a code) in a private card in Threadbear, on their Mac or their phone, and waits for it. You never see the value, and it stays out of the chat: you get a private file holding it, readable by your commands for 24 hours. Use this whenever a task needs a secret from them, including their Mac administrator password for sudo, instead of asking for it in your reply or stopping to hand the step over. Read the file inside a command and never print it, echo it or put it in a file of your own.`,
+          `Asks the user for a secret (a password, an API key, a token, a code) in a private card in Threadbear, on their Mac or their phone, and waits for it. You never see the value, and it stays out of the chat: you get a private file holding it, readable by your commands for 24 hours. Use this whenever a task needs a secret from them, including their Mac administrator password for sudo, instead of asking for it in your reply or stopping to hand the step over. Not for one you can get yourself, like a key on a page in a signed-in browser. Read the file inside a command and never print it, echo it or put it in a file of your own.`,
           {
             label: z.string().trim().min(1).max(80).describe('The card\'s title, what you need: "Mac administrator password", "Cloudflare API token".'),
             reason: z.string().trim().min(1).max(500).describe('One or two sentences: what it is for, and where to find it if that is not obvious.'),
@@ -1093,6 +1163,39 @@ export function buildThreadbearTools(
     if (!projects) throw new Error("This runner doesn't have projects yet.");
     return projects;
   };
+  // What an update_project changes in the brief, line by line, for the card
+  // reviewer: `notes` replaces them whole, so a two-line fix sent the reviewer
+  // the whole notes and read to it as a rewrite (Mike, 20 Nov 2026). Notes
+  // are compared as they'd be saved (appendNote added, trimmed), and every
+  // other field the call changes is named, so nothing reads as unchanged
+  // that isn't (Codex and Gemini review). A field with too many changed
+  // lines to show gets their counts and is to be judged as a rewrite.
+  const briefChanges = (p: Pick<Project, 'title' | 'goals' | 'state' | 'notes'>, fields: Record<string, unknown>): string | undefined => {
+    const norm = (t: string) => t.replace(/\r\n?/g, '\n').trim();
+    const next: Partial<Record<'title' | 'goals' | 'state' | 'notes', string>> = {};
+    for (const k of ['title', 'goals', 'state'] as const) if (typeof fields[k] === 'string') next[k] = fields[k];
+    const append = typeof fields.appendNote === 'string' ? norm(fields.appendNote) : '';
+    const edits = fields.editNotes !== undefined ? applyNoteEdits(p.notes ?? '', fields.editNotes) : undefined;
+    if (typeof fields.notes === 'string' || edits !== undefined || append) {
+      const base = typeof fields.notes === 'string' ? norm(fields.notes) : norm(edits ?? p.notes ?? '');
+      next.notes = append ? (base ? `${base}\n\n${append}` : append) : base;
+    }
+    const parts = (Object.keys(next) as (keyof typeof next)[]).map((k) => {
+      const before = norm(p[k] ?? '');
+      const after = norm(next[k]!);
+      if (after === before) return `${k}: unchanged`;
+      const hunks = diffLines(before, after);
+      const lines = hunks.flatMap((h) => [`@@ -${h.oldStart},${h.oldLines} +${h.newStart},${h.newLines} @@`, ...h.lines]);
+      const head = `${k}: ${splitLines(before).length} lines before, ${splitLines(after).length} after.`;
+      const text = lines.join('\n');
+      if (text.length <= BRIEF_DIFF_MAX) return `${head} Changed lines (- before, + after):\n${text}`;
+      const count = (c: string) => lines.filter((l) => l.startsWith(c)).length;
+      return `${head} ${count('-')} lines removed and ${count('+')} added, too many to show here: judge this field from the input, as a rewrite.`;
+    });
+    const others = Object.keys(fields).filter((k) => !['project', 'title', 'goals', 'state', 'notes', 'editNotes', 'appendNote'].includes(k));
+    if (others.length) parts.push(`Also changes, not shown here (judge them from the input): ${others.join(', ')}`);
+    return parts.length ? parts.join('\n\n') : undefined;
+  };
   const project = async (q: string) => {
     const p = await mustProjects().find(q);
     if (!p) throw new Error(`No project ${q}. list_projects shows them.`);
@@ -1261,7 +1364,7 @@ export function buildThreadbearTools(
     ),
     tool(
       'update_project',
-      "Changes a project: title, goals, state, notes, links, folders, icon or Notion task board. Keep state current as work moves on (what's done, what's next, what's blocked). Notes are for what a later thread should know that the repo doesn't say: decisions and why, gotchas, what's still owed. They're not a log of what landed (git and the docs have that), so when something you note replaces an older note, rewrite the notes rather than adding to them. appendNote adds a paragraph without rewriting the notes. When the project gets a place the user will keep going back to (it goes live, gets an admin page, a dashboard, a store listing), add it with addLinks: links show at the top of every one of its threads' Highlights. The librarian finds icons by itself from the project's folders, so only set one when the user asks or the project gets a new app icon somewhere it wouldn't look.",
+      "Changes a project: title, goals, state, notes, links, folders, icon or Notion task board. Keep state current as work moves on (what's done, what's next, what's blocked). Notes are for what a later thread should know that the repo doesn't say: decisions and why, gotchas, what's still owed. They're not a log of what landed (git and the docs have that), so when something you note replaces an older note, fix that note with editNotes rather than adding another; notes replaces them all, for a real restructure. When the project gets a place the user will keep going back to (it goes live, gets an admin page, a dashboard, a store listing), add it with addLinks: links show at the top of every one of its threads' Highlights. The librarian finds icons by itself from the project's folders, so only set one when the user asks or the project gets a new app icon somewhere it wouldn't look.",
       {
         project: z.string().describe('Project id, id prefix or title.'),
         title: z.string().optional(),
@@ -1269,6 +1372,10 @@ export function buildThreadbearTools(
         goals: z.string().optional(),
         state: z.string().optional(),
         notes: z.string().optional().describe('Replaces all the notes.'),
+        editNotes: z
+          .array(z.object({ old: z.string(), new: z.string() }))
+          .optional()
+          .describe('Edits the notes in place, like Edit: each old must match once and becomes new (empty removes it). All or none.'),
         appendNote: z.string().optional().describe('Adds a paragraph to the end of the notes.'),
         links: linksArg.optional().describe('Replaces all the links. ' + LINKS_HELP),
         addLinks: linksArg.optional().describe('Adds links, or retitles ones it has (same url).'),
@@ -1287,9 +1394,12 @@ export function buildThreadbearTools(
           ),
         parent: z.string().optional().describe(PARENT_HELP + ' Empty undoes it.'),
       },
-      handle(async ({ project: q, title, mikeAsked, goals, state, notes, appendNote, links, addLinks, removeLinks, addFolders, removeFolders, icon, notion, parent }, extra) => {
+      handle(async ({ project: q, title, mikeAsked, goals, state, notes, editNotes, appendNote, links, addLinks, removeLinks, addFolders, removeFolders, icon, notion, parent }, extra) => {
         const pc = mustProjects();
         const p = await project(q);
+        if (editNotes !== undefined && notes !== undefined) throw new Error('Give notes or editNotes, not both: notes replaces them all.');
+        // Edits that don't match fail here, before anyone is asked.
+        if (editNotes !== undefined) applyNoteEdits(p.notes ?? '', editNotes, appendNote);
         // Raising access (above): the brief its threads are told (title,
         // goals, state, notes, folders) is a message to each of them. Its
         // threads are the project's own list and every thread that says it's
@@ -1304,14 +1414,16 @@ export function buildThreadbearTools(
         // So every one of those counts (Codex review), and the card shows
         // the goals a new parent brings.
         const newParent = parent?.trim() ? (await pc.get((await project(parent)).id)).project : undefined;
-        if (caller && ([title, goals, state, notes, appendNote, notion, links, parent].some((x) => x !== undefined) || addFolders?.length || addLinks?.length)) {
+        let judged = false;
+        if (caller && ([title, goals, state, notes, editNotes, appendNote, notion, links, parent].some((x) => x !== undefined) || addFolders?.length || addLinks?.length)) {
           const parts = (await pc.list({ archived: true })).filter((x) => x.parentId === p.id).map((x) => x.id);
           const told = [p.id, ...parts, ...(newParent ? [newParent.id] : []), ...(p.parentId ? [p.parentId] : [])];
           const top = await topTold(told, caller);
           if (top) {
             const parentShown = newParent ? { title: newParent.title, id: newParent.id, ...(newParent.goals ? { goals: newParent.goals } : {}) } : parent;
-            const fields = Object.fromEntries(Object.entries({ title, goals, state, notes, appendNote, addFolders: added, notion, links, addLinks, parent: parentShown }).filter(([, v]) => v !== undefined));
-            await confirm('update_project', [`Change the brief of the project "${p.title}", which "${top.title}" (${accessName(top)}) is told`], { project: p.id, ...fields }, extra?.signal);
+            const fields = Object.fromEntries(Object.entries({ title, goals, state, notes, editNotes, appendNote, addFolders: added, notion, links, addLinks, parent: parentShown }).filter(([, v]) => v !== undefined));
+            await confirm('update_project', [`Change the brief of the project "${p.title}", which "${top.title}" (${accessName(top)}) is told`], { project: { title: p.title, id: p.id }, ...fields }, extra?.signal, briefChanges(p, fields));
+            judged = true;
             if (addFolders?.length) for (const [i, f] of addFolders.entries()) await sameFolder(f, added![i]!);
             // The title and goals shown are what it gets: a parent changed
             // while the card waited is refused.
@@ -1327,8 +1439,27 @@ export function buildThreadbearTools(
           const add = added ?? [];
           folders = [...p.folders.filter((f) => !drop.has(f)), ...add.filter((f) => !p.folders.includes(f))];
         }
-        let out = await pc.update(p.id, { title, goals, state, notes, links, folders, notion, ...(parent !== undefined ? { parent: newParent?.id ?? '' } : {}), by: mikeAsked ? 'mike' : 'agent' });
-        if (appendNote?.trim()) out = await pc.appendNote(p.id, appendNote);
+        // What was judged is a change from the brief as it was then: changed
+        // meanwhile, a whole new notes or folder list would undo what changed.
+        // Checked last, just before the write (Codex and Gemini review).
+        if (judged) {
+          const now = (await pc.get(p.id)).project;
+          if ((['title', 'goals', 'state', 'notes'] as const).some((k) => now[k] !== p[k]) || now.folders.join('\n') !== p.folders.join('\n')) {
+            throw new Error(`"${p.title}"'s brief changed while this waited for an OK, so nothing changed. Read it again (read_project) and redo the change on what it says now.`);
+          }
+        }
+        const fields = { title, goals, state, links, folders, notion, ...(parent !== undefined ? { parent: newParent?.id ?? '' } : {}), by: mikeAsked ? ('mike' as const) : ('agent' as const) };
+        // New notes and a paragraph on the end are saved as one, as they were
+        // judged: saved in two steps, the notes stood for a moment without it.
+        const add = appendNote?.trim();
+        const whole = notes !== undefined && add ? (notes.trim() ? `${notes.trimEnd()}\n\n${add}` : add) : notes;
+        // Edits are read, made and saved in one step where the notes live,
+        // with the rest of the call; judged, only on the notes judged.
+        let out =
+          editNotes !== undefined
+            ? await pc.editNotes(p.id, editNotes, { ...fields, appendNote, ...(judged ? { ifNotes: p.notes } : {}) })
+            : await pc.update(p.id, { ...fields, notes: whole });
+        if (add && notes === undefined && editNotes === undefined) out = await pc.appendNote(p.id, appendNote!);
         if (addLinks?.length || removeLinks?.length) {
           if (!pc.addLinks || !pc.removeLinks) throw new Error("This runner can't change project links yet.");
           if (removeLinks?.length) out = await pc.removeLinks(p.id, removeLinks);
@@ -1534,12 +1665,16 @@ export function buildThreadbearTools(
         const repeat = repeatEndTurn(events, input);
         if (repeat) return repeat;
         checkFindings(input, needs, events);
-        const missing = uncovered(await turnSignIns(events, opts.gateway?.(), opts.gatewayHealth), needs === 'you' ? asks : []);
+        const signIns = await turnSignIns(events, opts.gateway?.(), opts.gatewayHealth);
+        const missing = uncovered(signIns, needs === 'you' ? asks : []);
         if (missing.length && !nudgedThisTurn(events)) throw new Error(signInNudge(missing));
-        if (needs === 'you' && offersToTakeItBack(asks) && !triedFirstNudged(events)) throw new Error(tryFirstNudge());
+        // Sign-ins the turn needs and Restart to Update are the user's to do.
+        if (opts.tryFirstNote !== false && needs === 'you' && handsOverAStep(notSignIns(asks, signIns).filter((a) => !asksForAppRestart([a]))) && !triedFirstNudged(events)) throw new Error(tryFirstNudge());
         if (needs === 'you') await checkThreadLinks(asks);
         if (needs === 'you' && hasDeadEnd(asks) && !deadEndNudged(events)) throw new Error(deadEndNudge(asks));
         if (opts.plainCardNote !== false && needs === 'you' && wantsPlainCard(asks) && !plainCardNudged(events)) throw new Error(plainCardNudge());
+        const projectNote = await projectStepNote(input, needs, parsed?.next, events);
+        if (projectNote) throw new Error(projectNote);
         let restart = '';
         if (needs === 'you' && appRestarts && asksForAppRestart(asks)) {
           if (!appRestarts.isWatching(selfId)) appRestarts.watch(selfId);
@@ -1665,12 +1800,15 @@ export function buildThreadbearTools(
         // than an error buried in a work group (connectors.ts).
         const events = await turnEvents();
         checkFindings(args, needs, events);
-        const missing = uncovered(await turnSignIns(events, opts.gateway?.(), opts.gatewayHealth), needs === 'you' ? asks : []);
+        const signIns = await turnSignIns(events, opts.gateway?.(), opts.gatewayHealth);
+        const missing = uncovered(signIns, needs === 'you' ? asks : []);
         if (missing.length && !nudgedThisTurn(events)) throw new Error(signInNudge(missing));
-        if (needs === 'you' && offersToTakeItBack(asks ?? []) && !triedFirstNudged(events)) throw new Error(tryFirstNudge());
+        if (opts.tryFirstNote !== false && needs === 'you' && handsOverAStep(notSignIns(asks ?? [], signIns).filter((a) => !asksForAppRestart([a]))) && !triedFirstNudged(events)) throw new Error(tryFirstNudge());
         if (needs === 'you') await checkThreadLinks(asks ?? []);
         if (needs === 'you' && hasDeadEnd(asks ?? []) && !deadEndNudged(events)) throw new Error(deadEndNudge(asks ?? []));
         if (opts.plainCardNote !== false && needs === 'you' && wantsPlainCard(asks ?? []) && !plainCardNudged(events)) throw new Error(plainCardNudge());
+        const projectNote = await projectStepNote(args, needs, parsed?.next, events);
+        if (projectNote) throw new Error(projectNote);
         // Asking Mike to Restart to Update means wanting to know when he
         // has, to check the change in the running app: the same as
         // wait_for_app_restart, unless that was already asked for.
@@ -1733,7 +1871,11 @@ export function buildThreadbearTools(
     const openGone = (r: Result): Result => (!r.isError && r.content[0]?.text.startsWith(`${ENDED} is done`) ? ok(r.content.map((c) => c.text).join('\n') + OPEN_GONE) : r);
     const sayingOpenGone = (t: typeof today, args: unknown): typeof today =>
       droppedOpenLines(args) ? ({ ...t, handler: (async (a: unknown, extra: unknown) => openGone(await (t.handler as (a: unknown, extra: unknown) => Promise<Result>)(a, extra))) as never }) : t;
-    if (codex) return Object.assign(today, { formFor: (args: unknown) => sayingOpenGone(otherForm(args) ? other : today, args) });
+    const refusingStray = (t: typeof today, args: unknown): typeof today => {
+      const stray = strayAskFields(args);
+      return stray.length ? ({ ...t, handler: (async () => fail(endTurnMisfit(strayAskProblem(stray, oneReply), oneReply))) as never }) : t;
+    };
+    if (codex) return Object.assign(today, { formFor: (args: unknown) => refusingStray(sayingOpenGone(otherForm(args) ? other : today, args), args) });
     // Unlike Codex, which runs the other form's handler, Claude's goes by
     // how its CLI was started: it ends the turn at an accepted end_turn only
     // with bullets (adapter.ts, terminalMcpTools), so only today's handler
@@ -1749,6 +1891,8 @@ export function buildThreadbearTools(
     return Object.assign(today, {
       inputSchema: z.looseObject(published) as never,
       handler: (async (args: unknown, extra: unknown) => {
+        const stray = strayAskFields(args);
+        if (stray.length) return fail(endTurnMisfit(strayAskProblem(stray, oneReply), oneReply));
         const fits = z.object((otherForm(args) ? shapes.other : shapes.today) as z.ZodRawShape).safeParse(args);
         if (!fits.success) return fail(endTurnMisfit(z.prettifyError(fits.error), oneReply));
         const r = await run(fits.data, extra);
@@ -2179,6 +2323,20 @@ function clip(text: string, max = 2000): string {
   return text.length > max ? `${text.slice(0, max)}… (${text.length - max} more characters)` : text;
 }
 
+// The app draws a picture at most this many pixels a side as it is (the
+// GPU's texture limit); a bigger one is shrunk to fit, so a full-page phone
+// shot 18,000 px tall loses detail (desktop/gpui/src/fit_picture.rs, 20 Nov).
+export const SHOT_MAX_SIDE = 16384;
+
+// A line for show_options' answer naming the shots over SHOT_MAX_SIDE.
+export function oversizeShotsNote(review: { options: { id: string; image: ImageRef; shots?: { image: ImageRef }[] }[] }): string {
+  const big = review.options.flatMap(option => (option.shots ?? [{ image: option.image }]).map((shot, i) => ({ option: option.id, i, image: shot.image })))
+    .filter(({ image }) => (image.width ?? 0) > SHOT_MAX_SIDE || (image.height ?? 0) > SHOT_MAX_SIDE);
+  if (!big.length) return '';
+  const named = big.map(({ option, i, image }) => `${option} shot ${i + 1} (${image.width} x ${image.height})`).join(', ');
+  return ` Over ${SHOT_MAX_SIDE} px a side, so shown shrunk with less detail: ${named}. For full detail, split each into shots no more than ${SHOT_MAX_SIDE} px a side and call show_options again.`;
+}
+
 // In the server's instructions, which every thread sees from its first
 // turn. Tool descriptions aren't enough: the CLI defers MCP tools, so an
 // agent sees only their names until it loads one, and an agent that made
@@ -2190,7 +2348,7 @@ function clip(text: string, max = 2000): string {
 // AGENTS.md, which those threads read, and other people's threads don't
 // get it (30 Oct).
 export const SHOWING_THE_USER =
-  'When you have design options, mockups or wireframes for the user to choose between, put them in front of them with show_options (a review window that steps through them one at a time, then has them pick one and leave notes), not as pins or a list in your reply; their answer comes back as a message. ' +
+  'When you have design options, mockups or wireframes for the user to choose between, put them in front of them with show_options (a review window that steps through them one at a time, then has them pick one and leave notes), not as pins or a list in your reply; their answer comes back as a message. It is for things seen (images, videos, page designs): options in words (names, plans, approaches) go in your reply. ' +
   "For a single file or link they should look at (a doc, a screenshot, a preview URL, a PR), use pin, with show: true to open it in Threadbear's side pane rather than running `open`. " +
   "To put one of Threadbear's own panels in front of them (this thread's Highlights, a patch panel such as the Convex dashboard, Usage), use show_panel.";
 

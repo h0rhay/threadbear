@@ -770,7 +770,7 @@ test('one reply: a reopened turn that worked before its card is asked for its re
   s.out({ kind: 'endTurnNudge', reopen: true });
   const offer = { headline: 'Release?', needs: 'you', asks: [{ question: 'Merge main into prod?', options: [{ label: 'Done' }, { label: 'Can you do it?' }] }] };
   const refused = await send('e2', offer);
-  assert.match(refused.text, /^Not ended: this card offers to have you do a step yourself/);
+  assert.match(refused.text, /^Not ended: this card hands the user a step to do/);
   toolCall(s, 'b1', 'Bash', { command: 'git push origin main:prod' });
   toolResult(s, 'b1');
   const third = await send('e3', { headline: 'Released', needs: 'nothing' });
@@ -1067,9 +1067,13 @@ test('one reply: a reply that writes its card out again keeps the card and loses
   const { thread, s } = start(h);
   const { call } = tools(h, thread.id, undefined, () => true);
   const input = { headline: 'Ready', asks: [{ question: 'Press Bring Them In on build-box.' }] };
-  toolCall(s, 'e1', END_TURN, input);
-  const r = await call('end_turn', input);
-  s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: !r.error, text: r.text, truncated: false, images: [] } });
+  // The first call hears the try-first note (a step), the second stands.
+  for (const itemId of ['e0', 'e1']) {
+    toolCall(s, itemId, END_TURN, input);
+    const r = await call('end_turn', input);
+    assert.equal(r.error, itemId === 'e0', r.text);
+    s.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: !r.error, text: r.text, truncated: false, images: [] } });
+  }
   s.text('m1', 'It is ready.\n\n**What I need from you**\n1. Press Bring Them In, then tell me how it went.');
   s.result('completed');
   const reply = h.events(thread.id).find((e: { type: string; itemId?: string }) => e.type === 'assistant.text' && e.itemId === 'm1');
@@ -1292,10 +1296,10 @@ test('end_turn asks once about an ask pointing at another thread with no link, a
   assert.deepEqual(toPhoneAsk({ action: 'x', links: [{ title: 'Open its thread', url: `thread:${app.id}` }, { title: 'File', url: '/tmp/a.png' }] }).links, [{ title: 'Open its thread', url: `thread:${app.id}` }]);
 });
 
-test('end_turn asks once for a try at a step a card offers to take back, in both forms', async () => {
+test('end_turn asks once for a try at a step a card hands over, in both forms', async () => {
   const forms = [
-    { oneReply: true, offering: { asks: [{ question: 'Turn on the setting.', options: [{ label: 'Done' }, { label: 'Can you do it?' }] }] }, plain: { asks: [{ question: 'Sign in to the store.', options: [{ label: 'Signed in' }, { label: 'Hold off' }] }] } },
-    { oneReply: false, offering: { summary: ['Built it.'], asks: [{ action: 'Turn on the setting.', why: 'It stops it quitting.', options: ['Done', 'Can you do it?'] }] }, plain: { summary: ['Built it.'], asks: [{ action: 'Sign in to the store.', why: 'It needs your password.', options: ['Signed in', 'Hold off'] }] } },
+    { oneReply: true, offering: { asks: [{ question: 'Turn on the setting.', options: [{ label: 'Done' }, { label: 'Can you do it?' }] }] }, plain: { asks: [{ question: 'Should I sign you up for the store?', options: [{ label: 'Sign me up' }, { label: 'Hold off' }] }] } },
+    { oneReply: false, offering: { summary: ['Built it.'], asks: [{ action: 'Turn on the setting.', why: 'It stops it quitting.', options: ['Done', 'Can you do it?'] }] }, plain: { summary: ['Built it.'], asks: [{ action: 'Should I sign you up for the store?', why: 'It costs $5.', options: ['Sign me up', 'Hold off'] }] } },
   ];
   for (const { oneReply, offering, plain } of forms) {
     const h = makeHarness();
@@ -1305,8 +1309,8 @@ test('end_turn asks once for a try at a step a card offers to take back, in both
     toolCall(s, 'e1', END_TURN, offering);
     const refused = await call('end_turn', offering);
     assert.equal(refused.error, true);
-    assert.match(refused.text, /^Not ended: this card offers/);
-    assert.match(refused.text, /a password or code, a payment, something physical/);
+    assert.match(refused.text, /^Not ended: this card hands the user a step/);
+    assert.match(refused.text, /a password or code only they know, a payment, something physical/);
     s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: false, text: refused.text, truncated: false, images: [] } });
     assert.equal(h.events(thread.id).filter((e) => e.type === 'tool.result' && e.itemId === 'e1').length, 1);
 
@@ -1317,7 +1321,7 @@ test('end_turn asks once for a try at a step a card offers to take back, in both
     assert.equal(taken.error, false, taken.text);
     assert.deepEqual(needsFromTool(offering)?.asks?.[0].options, ['Done', 'Can you do it?']);
 
-    // A card with no such answer is never held up.
+    // A choice is never held up.
     const other = makeHarness();
     const o = start(other);
     o.s.text('m1', 'Built it.');
@@ -1330,8 +1334,8 @@ test('end_turn asks once for a try at a step a card offers to take back, in both
 // The plain-card note (needs.ts, plainCardNudge): on by default, once a turn.
 test('end_turn asks once for a card with answers to be read as the user will, in both forms', async () => {
   const forms = [
-    { oneReply: true, card: { asks: [{ question: "Which design for Let's Build It's Apple subscriptions?", options: [{ label: 'B: thin machine' }, { label: 'C: no machine' }] }] }, step: { asks: [{ question: 'Run claude setup-token on the Hetzner box.' }] } },
-    { oneReply: false, card: { summary: ['Assessed it.'], asks: [{ action: 'Which design?', why: 'Three ways to go.', options: ['B: thin machine', 'C: no machine'] }] }, step: { summary: ['Built it.'], asks: [{ action: 'Run claude setup-token on the Hetzner box.', why: 'The proxy needs it.' }] } },
+    { oneReply: true, card: { asks: [{ question: "Which design for Let's Build It's Apple subscriptions?", options: [{ label: 'B: thin machine' }, { label: 'C: no machine' }] }] }, step: { asks: [{ question: 'Is the Hetzner box still worth keeping?' }] } },
+    { oneReply: false, card: { summary: ['Assessed it.'], asks: [{ action: 'Which design?', why: 'Three ways to go.', options: ['B: thin machine', 'C: no machine'] }] }, step: { summary: ['Built it.'], asks: [{ action: 'Is the Hetzner box still worth keeping?', why: 'It costs $5 a month.' }] } },
   ];
   const endTurnOf = (h: ReturnType<typeof makeHarness>, id: string, oneReply: boolean) => {
     const t = buildThreadbearTools(h.runner, id, Date.now, undefined, undefined, undefined, { oneReply: () => oneReply, sleep: async () => undefined }).find((x) => x.name === 'end_turn')!;
@@ -1355,13 +1359,42 @@ test('end_turn asks once for a card with answers to be read as the user will, in
     const taken = await endTurn(card);
     assert.equal(taken.error, false, taken.text);
 
-    // A step with nothing to pick is never held up.
+    // A question with nothing to pick is never held up.
     const other = makeHarness();
     const o = start(other);
     o.s.text('m1', 'Built it.');
     toolCall(o.s, 'e1', END_TURN, step);
     const fine = await endTurnOf(other, o.thread.id, oneReply)(step);
     assert.equal(fine.error, false, fine.text);
+  }
+});
+
+test('end_turn refuses an ask written outside asks, naming where it goes (thread f0dd80e2, 19 Nov)', async () => {
+  for (const oneReply of [true, false]) {
+    const h = makeHarness();
+    const { thread, s } = start(h);
+    s.text('m1', 'Pushed the fix. Should I build secret_to next?');
+    const t = buildThreadbearTools(h.runner, thread.id, Date.now, undefined, undefined, undefined, { oneReply: () => oneReply, sleep: async () => undefined, plainCardNote: false }).find((x) => x.name === 'end_turn')!;
+    const call = async (args: Record<string, unknown>) => {
+      const r = (await t.handler(args as never, {})) as { content: { text: string }[]; isError?: boolean };
+      return { text: r.content.map((c) => c.text).join('\n'), error: Boolean(r.isError) };
+    };
+    // What the thread sent: the question and its answers on end_turn itself.
+    const stray = { needs: 'you', ask: 'Build secret_to next?', options: '["File", "Keychain", "Not yet"]' };
+    toolCall(s, 'e1', END_TURN, stray);
+    const refused = await call(stray);
+    assert.equal(refused.error, true, refused.text);
+    assert.match(refused.text, /^Not ended: those arguments don't fit end_turn\./);
+    assert.match(refused.text, /`ask`, `options` aren't end_turn's own fields/);
+    assert.match(refused.text, /inside asks/);
+    s.out({ kind: 'event', event: { type: 'tool.result', itemId: 'e1', ok: false, text: refused.text, truncated: false, images: [] } });
+    // Written as asks, it's taken.
+    const asks = oneReply
+      ? { needs: 'you', asks: [{ question: 'Build secret_to next?', options: [{ label: 'Go' }, { label: 'Not yet' }] }] }
+      : { needs: 'you', summary: ['Pushed the fix.'], asks: [{ action: 'Build secret_to next?', why: 'It keeps keys out of output.', options: ['Go', 'Not yet'] }] };
+    toolCall(s, 'e2', END_TURN, asks);
+    const taken = await call(asks);
+    assert.equal(taken.error, false, taken.text);
   }
 });
 
@@ -1528,7 +1561,7 @@ test("A Codex thread's end_turn is answered in the form the thread was given, wh
   const h = makeHarness();
   const { thread } = start(h);
   const call = async (oneReply: boolean, args: Record<string, unknown>) => {
-    const list = buildThreadbearTools(h.runner, thread.id, Date.now, undefined, undefined, undefined, { plainCardNote: false, provider: 'codex', oneReply: () => oneReply, sleep: async () => {} });
+    const list = buildThreadbearTools(h.runner, thread.id, Date.now, undefined, undefined, undefined, { plainCardNote: false, tryFirstNote: false, provider: 'codex', oneReply: () => oneReply, sleep: async () => {} });
     const codex = new CodexTools(list as ToolDefinition[], { requestApproval: async () => ({ decision: 'allow' }), cwd: () => '/tmp', mode: () => 'full', rules: () => [], addRules: () => {} });
     const r = await codex.call({ threadId: 'n', turnId: 't', callId: 'c', namespace: 'threadbear', tool: 'end_turn', arguments: args }, { fromChild: false, signal: new AbortController().signal });
     return { ok: r.success, text: r.contentItems.map((c) => ('text' in c ? c.text : '')).join('') };

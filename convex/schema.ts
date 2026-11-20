@@ -12,6 +12,7 @@ import { requestStateV } from './requestStates';
 import { clearStateV } from './clearStates';
 import { boxStateV } from './boxStates';
 import { requiredUnlessStepping } from './stepping';
+import { tokenStateV } from './cloudTokenStates';
 
 // A thread's sharing, as the runner mirrors it (ThreadShare in
 // docs/protocol.md): "link" is readable by anyone with /s/<slug>; "off"
@@ -214,6 +215,15 @@ export const threadFields = {
 // phone and the Mac app agree: "inbox", "hibernating" (snoozed) or "den"
 // (archived). A starred thread that's snoozed stays in "inbox", as Starred
 // is at the top of the phone's inbox.
+// A following runner's failed update to main, in its heartbeat (API 91).
+export const updateFailedValidator = v.object({
+  kind: v.union(v.literal('build'), v.literal('backend')),
+  commit: v.string(),
+  subject: v.string(),
+  error: v.string(),
+  logFile: v.string(),
+});
+
 export const views = ['inbox', 'hibernating', 'den'] as const;
 
 // A move's states, in order (docs/protocol.md, "Moving a thread to another runner").
@@ -249,6 +259,10 @@ export const appSchema = defineSchema({
     // runner/src/follow-origin.ts): why, in a sentence or two, for the main
     // Mac's Updates panel and the canary.
     followProblem: v.optional(v.string()),
+    // Set while this following runner's update to main has failed (API 91,
+    // runner/src/fix-update.ts): the main Mac's runner starts the fix thread
+    // there, rather than this runner asking it to on a card.
+    updateFailed: v.optional(updateFailedValidator),
     // Its active schedules have been copied to scheduleWakes (API 45), once.
     wakesSeeded: v.optional(v.boolean()),
     // How a Mac app reaches this runner to open one of its threads (API 12):
@@ -298,6 +312,10 @@ export const appSchema = defineSchema({
     bootTokenHash: v.optional(v.string()),
     bootExpiresAt: v.optional(v.number()),
     boxKeyHash: v.optional(v.string()),
+    // The last exchange (boxes.ts exchange): its boot token's hash and when
+    // that token would have expired, so the same box asking again (its
+    // answer lost) gets the same answer, never another box.
+    exchanged: v.optional(v.object({ bootHash: v.string(), until: v.number() })),
     // Each boot token is for one attempt at a box, numbered from 1
     // (`boxAttempt`, the newest minted): the token's, the key's (the box
     // that traded it) and the provider box's. A loss reported for an
@@ -380,6 +398,8 @@ export const appSchema = defineSchema({
     .index('by_box_key', ['boxKeyHash'])
     .index('by_box_state', ['boxState.kind'])
     .index('by_service_state', ['serviceId', 'boxState.kind'])
+    // Boxes waiting on a login's cloud token (needsToken), released when one is set.
+    .index('by_login_state', ['login', 'boxState.kind'])
     .index('by_service_wants', ['serviceId', 'wantsWakeAt'])
     .index('by_service_hours', ['serviceId', 'waitsForHours'])
     .index('by_kept', ['keptRunningSince'])
@@ -422,6 +442,9 @@ export const appSchema = defineSchema({
     // When the token was made (it lasts a year), and when it was set here.
     madeAt: v.number(),
     setAt: v.number(),
+    // Its lifecycle (cloudTokenMachine.ts): valid, or dead once a box's
+    // turn on it was refused. Since API 94.
+    tokenState: requiredUnlessStepping('tokenState', tokenStateV),
   }).index('by_login', ['login']),
 
   // Runner keys (docs/protocol.md, "Runner keys"): each authenticates as its
@@ -1226,6 +1249,10 @@ export const appSchema = defineSchema({
     // API 20: what the phone's new thread pickers offer.
     models: v.optional(v.array(v.object({ id: v.string(), title: v.string(), effortLevels: v.optional(v.array(v.string())), defaultEffort: v.optional(v.string()) }))),
     defaultEffort: v.optional(v.string()),
+    // API 91: a Claude login's sign-in, for the Mac's Runners panel.
+    loginEndsAt: v.optional(v.string()),
+    signedOut: v.optional(v.boolean()),
+    yearToken: v.optional(v.object({ madeAt: v.optional(v.string()) })),
     usage: v.optional(
       v.object({
         windows: v.array(v.object({ kind: v.string(), title: v.string(), remainingPercent: v.number(), resetsAt: v.optional(v.string()), detail: v.optional(v.string()) })),
@@ -1258,8 +1285,13 @@ export const appSchema = defineSchema({
     // (API 4): base64 of 32 bytes, made on the phone and sent only here.
     pushKey: v.optional(v.string()),
     // "android" (API 66): apnsToken is the phone's Firebase token, and a push
-    // goes through the relay to Firebase. Absent: an Apple token.
-    platform: v.optional(v.literal('android')),
+    // goes through the relay to Firebase. "webpush" (API 93, the F-Droid
+    // build): apnsToken is its UnifiedPush endpoint, an https address this
+    // deployment posts to itself (push.ts, webPushEndpoint.ts), with the keys
+    // in webPush. Absent: an Apple token.
+    platform: v.optional(v.union(v.literal('android'), v.literal('webpush'))),
+    // For "webpush": the subscription's p256dh and auth, base64url (RFC 8291).
+    webPush: v.optional(v.object({ p256dh: v.string(), auth: v.string() })),
   })
     .index('by_apnsToken', ['apnsToken'])
     // A token's phones: at most MAX_DEVICES_PER_TOKEN (phone:registerDevice),
@@ -1309,6 +1341,16 @@ export const appSchema = defineSchema({
 
   // This backend's registration with the push relay (docs/push-relay.md),
   // made the first time a push goes that way. One row.
+  // This deployment's VAPID key pair (RFC 8292) for the F-Droid build's
+  // UnifiedPush notifications (API 93): one row, made the first time a
+  // phone asks for it (phone:webPushKey) or a web push goes out. The
+  // private part (d) never leaves the deployment; the phone gets x and y.
+  webPushVapid: defineTable({
+    x: v.string(),
+    y: v.string(),
+    d: v.string(),
+    createdAt: v.number(),
+  }),
   relayInstall: defineTable({
     installId: v.string(),
     installKey: v.string(),

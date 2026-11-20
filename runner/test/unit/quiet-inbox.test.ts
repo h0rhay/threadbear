@@ -7,6 +7,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
 import { PATIENCE_MS } from '../helpers/patience.ts';
+import { SHELL } from '../helpers/platform.ts';
 
 const END_TURN = 'mcp__threadbear__end_turn';
 
@@ -42,7 +43,7 @@ function finish(h: H, id: string, input: Record<string, unknown> = { needs: 'not
 // agent wrote itself, end_turn's `open`, which is gone.)
 function leaveUncommitted(h: H, id: string) {
   const repo = h.runner.get(id).cwd;
-  execFileSync('/bin/sh', ['-c', 'git init -q -b main && echo one > notes.md && git add -A && git -c user.name=t -c user.email=t@t commit -qm init && echo two > notes.md'], { cwd: repo });
+  execFileSync(SHELL[0], [SHELL[1], 'git init -q -b main && echo one > notes.md && git add -A && git -c user.name=t -c user.email=t@t commit -qm init && echo two > notes.md'], { cwd: repo });
   const s = h.adapter.sessions.filter((x) => x.opts.threadId === id).at(-1)!;
   s.init();
   s.out({ kind: 'event', event: { type: 'tool.call', itemId: `w${Math.random()}`, name: 'Edit', kind: 'edit', title: 'Edit notes.md', input: { file_path: path.join(repo, 'notes.md') } } });

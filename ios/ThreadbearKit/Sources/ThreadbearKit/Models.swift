@@ -697,15 +697,22 @@ public struct MessageImage: Codable, Sendable, Hashable, Identifiable {
     public var url: String
     public var width: Int?
     public var height: Int?
+    /// What it is (API 95): `text/html` for a live page, run in a sealed
+    /// view rather than decoded (LivePageView.swift).
+    public var mediaType: String?
 
-    public init(seq: Int, src: String? = nil, pinned: Bool? = nil, url: String, width: Int? = nil, height: Int? = nil) {
+    public init(seq: Int, src: String? = nil, pinned: Bool? = nil, url: String, width: Int? = nil, height: Int? = nil, mediaType: String? = nil) {
         self.seq = seq
         self.src = src
         self.pinned = pinned
         self.url = url
         self.width = width
         self.height = height
+        self.mediaType = mediaType
     }
+
+    /// A live page an agent showed in its reply.
+    public var isPage: Bool { mediaType == "text/html" }
 }
 
 /// Where a thread's pictures go among its messages.

@@ -430,4 +430,40 @@
 //    phone:messages passes them on, so the phone draws them as the Mac
 //    does: the question small, the answer as his words. A runner sends
 //    `answers` only to a backend of 89 or later.
-export const API_VERSION = 89;
+// 90: relay:queueCommand's `call` takes accounts.yearToken (the Mac's
+//    Runners panel's Year-long token… for another runner's login), and an
+//    accounts row can carry `loginEndsAt`, `signedOut` and `yearToken`
+//    (`{ madeAt? }`), never the token. A runner sends them only to a
+//    backend of 90 or later.
+// 91: sync:heartbeat takes `updateFailed` ({ kind, commit, subject, error,
+//    logFile }), a following runner's word that its update to main failed,
+//    cut to fit from a runner key and dropped from a box's. The main key
+//    reads it from sync:otherRunnersList and starts the fix thread on the
+//    main Mac itself, so the following runner no longer asks for one there
+//    on a card. A runner sends it only to a backend of 91 or later.
+// 92: sync:removeThreads takes `runnerId`, the runner whose threads went,
+//    and leaves a row that's another runner's alone, whatever the key: a
+//    restart of the main Mac removed threads it had moved to another Mac,
+//    their rows there and all. A runner sends it only to a backend of 92
+//    or later.
+// 93: phone:registerDevice takes platform "webpush" (the Android app's
+//    F-Droid build): apnsToken is its UnifiedPush endpoint and the new
+//    `webPush` ({ p256dh, auth }) its keys; push.ts posts each notification
+//    there itself, encrypted (RFC 8291) and VAPID-signed (webPush.ts). The
+//    action phone:webPushKey ({ token }) gives the phone this deployment's
+//    VAPID public key to register with. The app registers this way only
+//    with a backend of 93 or later.
+// 94: virtual runners from the Mac (docs/virtual-runners.md, slice 5): a
+//    cloud token is a state machine (valid, dead), boxes:cloudTokens says
+//    which; a box whose login has none waits (needsToken) until one is set;
+//    boxes:startThread takes cwd and accountId and writes the thread's
+//    sidebar row; the exchange gives tokenSetAt; a box says a refused token
+//    (boxes:tokenRefused) and fetches the new one (boxes:boxCloudToken);
+//    otherRunnersList's box carries service, token and login. A runner
+//    offers virtual runners only on a backend of 94 or later.
+// 95: sync:addReplyImage takes a live page, mediaType text/html (the
+//    livePages experiment, docs/live-pages-design), uploaded as plain bytes;
+//    phoneImage carries `mediaType` for a reply's media, so the phones run
+//    a page in a sealed view rather than decode it. A runner sends pages
+//    only to a backend of 95 or later.
+export const API_VERSION = 95;

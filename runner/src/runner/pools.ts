@@ -390,7 +390,8 @@ export const poolsPart = {
       return;
     }
     try {
-      this.sendTo(st, text, [], { origin: 'runner', queue: true });
+      const wakeReason = text === CARRY_ON_BACK ? 'The login had room again' : text === CARRY_ON_SIGNED_OUT ? 'Moved to another login after a sign-out' : 'Moved to another login';
+      this.sendTo(st, text, [], { origin: 'runner', queue: true, wakeReason });
     } catch (e) {
       this.log.error('could not carry on after a move', { threadId: rec.id, error: String(e) });
     }

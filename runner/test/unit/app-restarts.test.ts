@@ -258,7 +258,7 @@ test('a new build without the commit the thread waits for keeps it waiting', asy
   assert.ok(!watcher.isWatching(thread.id));
 });
 
-test('a named commit, and one git can\'t place, fall back sensibly', () => {
+test('a named commit, and a build git can\'t place, keep waiting', () => {
   const { h, thread } = setUp();
   const asked: string[] = [];
   const watcher = new AppRestarts({
@@ -271,9 +271,64 @@ test('a named commit, and one git can\'t place, fall back sensibly', () => {
   watcher.appHello(A);
   assert.equal(watcher.watch(thread.id, undefined, 'mine').waitingFor, 'c0ffee123');
   assert.deepEqual(asked, ['mine']);
-  // Git can't tell: any new build counts, as before.
+  // Git can't tell: not news, as the build may not have it (19 Nov).
   watcher.appHello(B);
-  assert.match(said(h, thread.id).message, /restarted onto bbbb222/);
+  assert.equal(said(h, thread.id).message, undefined);
+  assert.ok(watcher.isWatching(thread.id));
+});
+
+// 42071b05, 19 Nov: a thread in ~/dev/me/misc named a Threadbear commit
+// its folder doesn't have, the watch fell back to any new build, and it was
+// told the GPUI app had restarted onto main from just before its landing.
+test('a commit named from a thread outside the repo is looked for in the apps\' checkout', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const h = makeHarness();
+  const appRepo = fs.mkdtempSync(path.join(h.home, 'app-repo-'));
+  const git = (...a: string[]) => execFileSync('git', ['-C', appRepo, ...a], { encoding: 'utf8' }).trim();
+  git('init', '-q', '-b', 'main');
+  const commit = (msg: string) => {
+    fs.writeFileSync(`${appRepo}/f`, msg);
+    git('add', 'f');
+    git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', msg);
+    return git('rev-parse', 'HEAD');
+  };
+  const before = commit('main before the landing');
+  const landed = commit('the settings change');
+  const watcher = new AppRestarts({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, appRepo });
+  const { thread } = h.runner.create({ text: 'Panel of reviewers', accountId: 'claude-3' });
+  h.adapter.last.init();
+  const D = (c: string, tree: string) => ({ commit: c, short: c.slice(0, 9), tree });
+  watcher.appHello(D(before, 'tree-0'), 'desktop');
+  assert.equal(watcher.watch(thread.id, undefined, landed.slice(0, 9)).waitingFor, landed.slice(0, 9));
+  // A restart onto a build without it: still waiting.
+  watcher.appHello(D(before, 'tree-1'), 'desktop');
+  assert.equal(h.events(thread.id).findLast((e) => e.type === 'user.message' && e.origin === 'runner'), undefined);
+  assert.ok(watcher.isWatching(thread.id));
+  watcher.appHello(D(landed, 'tree-2'), 'desktop');
+  assert.match(String(h.events(thread.id).findLast((e) => e.type === 'user.message' && e.origin === 'runner')?.text), new RegExp(`restarted onto ${landed.slice(0, 9)}`));
+  // One found nowhere is refused, not turned into "any new build", and
+  // takes the place of the wait the thread had.
+  watcher.watch(thread.id);
+  assert.ok(watcher.isWatching(thread.id));
+  assert.throws(() => watcher.watch(thread.id, undefined, 'deadbeef1'), /Can't find commit deadbeef1/);
+  assert.ok(!watcher.isWatching(thread.id));
+});
+
+test('a named commit is the thread\'s own folder\'s first, main the apps\' checkout\'s', () => {
+  const { h, thread } = setUp();
+  const cwd = h.runner.get(thread.id).cwd;
+  const asked: string[] = [];
+  const watcher = new AppRestarts({
+    runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, appRepo: '/apps-checkout',
+    git: { resolve: (repo, rev) => (asked.push(`${repo === cwd ? 'cwd' : repo} ${rev}`), `${repo === cwd ? 'c' : 'a'}0ffee1234567`), contains: () => undefined },
+  });
+  // HEAD from a worktree is the worktree's, not the main checkout's.
+  assert.equal(watcher.watch(thread.id, undefined, 'HEAD').waitingFor, 'c0ffee123');
+  assert.deepEqual(asked.splice(0), ['cwd HEAD']);
+  assert.equal(watcher.watch(thread.id).waitingFor, 'a0ffee123');
+  assert.deepEqual(asked.splice(0), ['/apps-checkout refs/heads/main']);
 });
 
 // Codex's review, 18 Nov: main moved on with only runner changes before
@@ -394,11 +449,50 @@ test('a done turn waiting on the app restart hibernates until it comes, then wak
   let t = h.runner.get(thread.id);
   assert.equal(Date.parse(t.snoozedUntil!), h.clock.now() + 24 * 60 * 60_000);
   assert.equal(h.events(thread.id).findLast((e) => e.type === 'system.note')?.text, 'Hibernating until the Threadbear app restarts onto the new build, a day at most.');
+  // The app keeps it under Running, as it isn't done until Mike runs it (19 Nov 2026).
+  assert.equal(t.awaitingAppRestart, true);
   watcher.appHello(D2, 'desktop');
   t = h.runner.get(thread.id);
   assert.equal(t.snoozedUntil, undefined);
+  assert.equal(t.awaitingAppRestart, undefined);
   assert.ok(['starting', 'running'].includes(t.status), 'the restart message started a turn');
   assert.match(said(h, thread.id).message, /Check Edit shows beside Copy\./);
+});
+
+test("Mike hibernating a thread that waits on the app makes it his own snooze", () => {
+  let watcher!: AppRestarts;
+  const h = makeHarness(undefined, {}, { awaitingAppRestart: (id) => watcher.isWatching(id) });
+  watcher = new AppRestarts({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger });
+  const { thread } = h.runner.create({ text: 'Add Edit to draft boxes', accountId: 'claude-3' });
+  const s = h.adapter.last;
+  s.init();
+  watcher.appHello(D1, 'desktop');
+  watcher.watch(thread.id);
+  s.out({ kind: 'event', event: { type: 'tool.call', itemId: 'e1', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing' } } });
+  s.text('m1', 'Landed.');
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).awaitingAppRestart, true);
+  h.runner.update({ threadId: thread.id, snoozedUntil: new Date(h.clock.now() + 2 * 60 * 60_000).toISOString() });
+  assert.equal(h.runner.get(thread.id).awaitingAppRestart, undefined, 'under Hibernating, where he put it');
+});
+
+test('one archived while the app restarted no longer says it waits for the app', () => {
+  // Its watch is spent and nothing will wake it (Codex's review, 19 Nov 2026).
+  let watcher!: AppRestarts;
+  const h = makeHarness(undefined, {}, { awaitingAppRestart: (id) => watcher.isWatching(id) });
+  watcher = new AppRestarts({ runner: h.runner, home: h.home, clock: h.clock, log: nullLogger });
+  const { thread } = h.runner.create({ text: 'Add Edit to draft boxes', accountId: 'claude-3' });
+  const s = h.adapter.last;
+  s.init();
+  watcher.appHello(D1, 'desktop');
+  watcher.watch(thread.id);
+  s.out({ kind: 'event', event: { type: 'tool.call', itemId: 'e1', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing' } } });
+  s.text('m1', 'Landed.');
+  s.result('completed');
+  h.runner.update({ threadId: thread.id, archived: true });
+  watcher.appHello(D2, 'desktop');
+  h.runner.update({ threadId: thread.id, archived: false });
+  assert.equal(h.runner.get(thread.id).awaitingAppRestart, undefined);
 });
 
 test('a turn that needs Mike, or one not waiting on the app, stays in the inbox', () => {

@@ -6,10 +6,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeHarness, tmpDir } from '../helpers/fakes.ts';
+import { FakeAccounts, FakeAdapter, makeHarness, testConfig, tmpDir } from '../helpers/fakes.ts';
+import { Runner } from '../../src/runner.ts';
+import { ThreadStore } from '../../src/store.ts';
+import { FakeClock } from '../../src/clock.ts';
+import { nullLogger } from '../../src/log.ts';
 import { PATIENCE_MS } from '../helpers/patience.ts';
 import type { GenerateParams, ModelResult } from '../../src/models/index.ts';
-import { INBOX_GUESS_FILE, readGuess } from '../../src/runner/inbox-guess.ts';
+import { GUESS_CATCH_UP_MS, INBOX_GUESS_FILE, readGuess } from '../../src/runner/inbox-guess.ts';
 
 const END_TURN = 'mcp__threadbear__end_turn';
 
@@ -26,7 +30,7 @@ const settle = () => new Promise((r) => setTimeout(r, 150));
 
 type Answer = string | ModelResult<string>;
 
-function setup(o: { on?: boolean; cheap?: Answer; strong?: Answer } = {}) {
+function setup(o: { on?: boolean; cheap?: Answer; strong?: Answer; hold?: Promise<void> } = {}) {
   const home = tmpDir();
   fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { inboxGuess: o.on !== false } }));
   const asked: GenerateParams[] = [];
@@ -34,6 +38,7 @@ function setup(o: { on?: boolean; cheap?: Answer; strong?: Answer } = {}) {
     generate: async (p: GenerateParams): Promise<ModelResult<string>> => {
       if (p.feature !== 'inboxGuess') return { ok: false, reason: 'off', message: 'not the guess' };
       asked.push(p);
+      if (o.hold) await o.hold;
       const a = (p.strong ? o.strong : o.cheap) ?? '{"guess":"skip","why":"It only did what he picked."}';
       return typeof a === 'string' ? { ok: true, value: a, model: p.strong ? 'claude-opus-5-5' : 'claude-haiku-5-5' } : a;
     },
@@ -122,6 +127,17 @@ test("a helper thread is not guessed: it archives itself already", async () => {
   assert.deepEqual(h.lines(), []);
 });
 
+test('a helper that stays in his inbox, for its follow-ups, is his to see by rule', async () => {
+  const h = setup();
+  const parent = mine(h);
+  const child = h.runner.create({ text: 'Fix the panel reload', accountId: 'claude-main', startedBy: { kind: 'thread', label: 'Agent', threadId: parent } }).thread.id;
+  finish(h, child, { needs: 'nothing', next: ['Stop the Threadbear transcript jumping when a long reply arrives'] });
+  await until(() => h.lines().length === 1, 'the guess written down');
+  assert.equal(h.runner.get(child).archivedAt, undefined);
+  assert.deepEqual(h.lines()[0].guesses, [{ by: 'rule', skip: false, why: 'It suggested follow-ups.' }]);
+  assert.equal(h.asked.length, 0);
+});
+
 test("another lab's review of a change is not guessed", async () => {
   const h = setup();
   const reviewed = mine(h);
@@ -165,6 +181,20 @@ test('"Glad I saw this" is the other label, and a plain archive has none', async
   assert.equal(plain.kind, 'archive');
   assert.equal(plain.threadId, b);
   assert.equal('label' in plain, false);
+});
+
+test('"Not sure" is kept as unsure, so scoring can leave it out', async () => {
+  const h = setup();
+  const id = mine(h);
+  finish(h, id);
+  await until(() => h.lines().length === 1, 'the guess written down');
+  h.runner.update({ threadId: id, archived: true, verdict: 'notSure' });
+  assert.equal(h.runner.get(id).archiveVerdict, 'notSure');
+  assert.ok(notes(h, id).includes('Archived by you: not sure you needed to see this.'));
+  const line = h.lines()[1];
+  assert.equal(line.kind, 'archive');
+  assert.equal(line.label, 'unsure');
+  assert.deepEqual(line.guesses, h.lines()[0].guesses);
 });
 
 test('only his own archives of a finished thread are written down', async () => {
@@ -212,6 +242,125 @@ test('a guess for an earlier done card is not passed off as one for the latest',
   assert.equal(last.kind, 'archive');
   assert.equal(last.label, 'show');
   assert.equal('guesses' in last, false, 'the first card’s guess is not this card’s');
+});
+
+// The runner a new release starts, on the same data folder: it loads every
+// thread but `skip` (the ones the old runner is still finishing), and
+// adopts each of those as it's handed over.
+function next(home: string, skip: string[], answer = '{"guess":"skip","why":"A receipt."}', clock = new FakeClock()) {
+  const asked: GenerateParams[] = [];
+  const runner = new Runner({
+    config: testConfig(home),
+    store: new ThreadStore(home),
+    adapters: { claude: new FakeAdapter(), codex: new FakeAdapter('codex') },
+    accounts: new FakeAccounts(),
+    clock,
+    log: nullLogger,
+    defer: (fn) => fn(),
+    copyTranscript: () => false,
+    models: {
+      generate: async (p: GenerateParams): Promise<ModelResult<string>> => {
+        if (p.feature !== 'inboxGuess') return { ok: false, reason: 'off', message: 'not the guess' };
+        asked.push(p);
+        return { ok: true, value: answer, model: p.strong ? 'claude-opus-5-5' : 'claude-haiku-5-5' };
+      },
+    },
+  });
+  runner.start({ skip: new Set(skip) });
+  return { runner, asked };
+}
+
+// A runner whose models never answer in time: the guess is still being
+// made when the thread leaves it.
+function slow() {
+  let answer: (() => void) | undefined;
+  const hold = new Promise<void>((r) => (answer = r));
+  return { ...setup({ hold }), answer: () => answer!() };
+}
+
+test('a thread that finished on a runner handing over gets its guess from the new one', async () => {
+  // Seven of his first sixteen answers had no guess beside them (19 Nov):
+  // each thread had finished on the old runner during a release, and was
+  // handed over half a second later, before the models had answered.
+  const h = slow();
+  const id = mine(h);
+  finish(h, id, { needs: 'nothing' }, 'Landed on main, and the setting is gone.');
+  await until(() => h.asked.length === 2, 'the old runner asking');
+  await h.runner.letGo(h.runner.threads.get(id)!);
+  const b = next(h.home, [id]);
+  assert.equal(b.asked.length, 0);
+  b.runner.adopt(id);
+  await until(() => h.lines().length === 1, 'the guess written down');
+  const [line] = h.lines();
+  assert.equal(line.kind, 'guess');
+  assert.equal(line.threadId, id);
+  assert.deepEqual((line.guesses as Array<{ skip: boolean }>).map((g) => g.skip), [true, true]);
+  // From the log: what he asked and the whole reply.
+  assert.match(b.asked[0].prompt, /Turn it on for everyone/);
+  assert.match(b.asked[0].prompt, /Landed on main, and the setting is gone\./);
+  // The old runner's answer, arriving after it let go, writes nothing.
+  h.answer();
+  await settle();
+  assert.equal(h.lines().length, 1);
+  // And his pick is kept beside it.
+  b.runner.update({ threadId: id, archived: true, verdict: 'didntNeedToSee' });
+  assert.deepEqual(h.lines()[1].guesses, line.guesses);
+});
+
+test('its follow-ups come across too: by rule, with no model asked', async () => {
+  const h = setup({ on: false });
+  const id = mine(h);
+  finish(h, id, { needs: 'nothing', next: ['Stop the Threadbear transcript jumping when a long reply arrives'] });
+  await settle();
+  await h.runner.letGo(h.runner.threads.get(id)!);
+  fs.writeFileSync(path.join(h.home, 'runner.json'), JSON.stringify({ experiments: { inboxGuess: true } }));
+  const b = next(h.home, [id]);
+  b.runner.adopt(id);
+  await until(() => h.lines().length === 1, 'the guess written down');
+  assert.deepEqual(h.lines()[0].guesses, [{ by: 'rule', skip: false, why: 'It suggested follow-ups.' }]);
+  assert.equal(b.asked.length, 0);
+});
+
+test("one that came across with its guess, or asking him something, isn't guessed again", async () => {
+  const h = setup();
+  const guessed = mine(h);
+  finish(h, guessed);
+  await until(() => h.lines().length === 1, 'the guess written down');
+  const asking = mine(h);
+  finish(h, asking, { needs: 'you', asks: [{ question: 'Deploy it?' }] });
+  await settle();
+  await h.runner.letGo(h.runner.threads.get(guessed)!);
+  await h.runner.letGo(h.runner.threads.get(asking)!);
+  const b = next(h.home, [guessed, asking]);
+  b.runner.adopt(guessed);
+  b.runner.adopt(asking);
+  await settle();
+  assert.equal(b.asked.length, 0);
+  assert.equal(h.lines().length, 1);
+});
+
+test('a runner starting makes the guess a just-finished thread lost, and leaves older ones alone', async () => {
+  // Idle threads go to the new runner at once, with whatever was being
+  // worked out about them. Not every finished thread in the inbox, though:
+  // that would be a model call for each, at every start.
+  const h = slow();
+  const fresh = mine(h);
+  finish(h, fresh);
+  const old = mine(h, 'How is the daily brief made?');
+  finish(h, old);
+  await until(() => h.asked.length === 4, 'the old runner asking');
+  const at = Date.parse(h.runner.threads.get(fresh)!.rec.finished!.at);
+  await h.runner.letGo(h.runner.threads.get(fresh)!);
+  await h.runner.letGo(h.runner.threads.get(old)!);
+  const file = path.join(h.home, 'threads', old, 'thread.json');
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8')) as { finished: { at: string } };
+  rec.finished.at = new Date(at - GUESS_CATCH_UP_MS - 60_000).toISOString();
+  fs.writeFileSync(file, JSON.stringify(rec));
+  const b = next(h.home, [], undefined, new FakeClock(at + 5_000));
+  await until(() => h.lines().length === 1, 'the guess written down');
+  await settle();
+  assert.deepEqual(h.lines().map((l) => l.threadId), [fresh]);
+  assert.equal(b.asked.length, 2);
 });
 
 test('reading a model’s answer: only a clear skip or show counts', () => {

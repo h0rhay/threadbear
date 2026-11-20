@@ -78,6 +78,21 @@ Then('the list row {string} has its globe and the mark {string} beside its title
   });
 });
 
+const listRow = (d: Dump, title: string) => pane(d)?.list?.flatMap((s) => s.rows).find((r) => r.title === title);
+
+When('I press the switch on the list row {string}', async function (this: ThreadbearWorld, title: string) {
+  await this.until(`"${title}" with a switch`, (d) => Boolean(listRow(d, title)?.switch));
+  await this.app.do({ cmd: 'switch', row: title });
+});
+
+Then('the switch on the list row {string} is on, waiting for the runner', async function (this: ThreadbearWorld, title: string) {
+  await this.until(`"${title}"'s switch on and waiting`, (d) => listRow(d, title)?.switch?.on === true && listRow(d, title)?.switch?.pending === true);
+});
+
+Then('the switch on the list row {string} is {word}', async function (this: ThreadbearWorld, title: string, state: string) {
+  await this.until(`"${title}"'s switch ${state}`, (d) => listRow(d, title)?.switch?.on === (state === 'on') && listRow(d, title)?.switch?.pending === false);
+});
+
 Then('the image panel shows a picture', async function (this: ThreadbearWorld) {
   await this.until('a picture in the image panel', (d) => /^picture \d+x\d+/.test(pane(d)?.image ?? ''));
 });

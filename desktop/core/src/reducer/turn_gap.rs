@@ -13,6 +13,11 @@ pub struct TurnGap {
     /// What finished and woke it; empty for a wake with no finished work or
     /// from a runner too old to say.
     pub woke_by: Vec<BackgroundTask>,
+    /// What the runner said woke it, when its own message started the turn
+    /// ("The Threadbear GPUI app restarted onto 1f103ac18"): a thread that
+    /// hibernated for the app to restart sat 14 hours under its last reply
+    /// with nothing to say so (Mike, 19 Nov). Empty: "Threadbear woke it".
+    pub runner_wake: Option<String>,
 }
 
 impl TurnGap {
@@ -23,7 +28,11 @@ impl TurnGap {
     /// "6 min later · Mine the repo finished".
     pub fn label(&self) -> String {
         let time = Self::later(self.milliseconds());
-        match Self::cause(&self.woke_by) {
+        let runner = self.runner_wake.as_deref().map(|why| match text::trim_ws_nl(why) {
+            "" => "Threadbear woke it".to_owned(),
+            why => why.to_owned(),
+        });
+        match runner.or_else(|| Self::cause(&self.woke_by)) {
             Some(cause) => format!("{time} · {cause}"),
             None => time,
         }

@@ -10,6 +10,7 @@ import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { realPath } from './platform.ts';
 import type { WorktreePatch } from './patches.ts';
 import { inBackground } from './background.ts';
 import { mainCheckoutOf as linkedMainCheckout } from './patch-trust.ts';
@@ -142,12 +143,10 @@ export async function mainCheckoutOf(cwd: string): Promise<string | undefined> {
   return (await listCheckouts(cwd))?.find((c) => c.branch === MAIN)?.path;
 }
 
+// The real form of a path, to compare two by (platform.ts: on Windows git's
+// long names and a cwd's 8.3 short ones are one folder).
 export function realpath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
-  }
+  return realPath(path.resolve(p));
 }
 
 function isDir(p: string): boolean {
@@ -1149,11 +1148,11 @@ async function stackWaiting(
   return { tip, group };
 }
 
-// The `--only` a failed check ends with (check.sh): what to run again to see
+// The `./check.sh --only` a failed check ends with: what to run again to see
 // the same failure, as THREADBEAR_CHECK_ONLY takes it. Undefined for a check
 // that says no such thing (another repo's, or one that died before its end).
 export function onlyFailed(text: string): string | undefined {
-  const said = [...text.matchAll(/^To run only what failed again: --only "([A-Za-z0-9 ._/=;()-]{1,4000})"$/gm)].at(-1)?.[1];
+  const said = [...text.matchAll(/^To run only what failed again: (?:\.\/check\.sh )?--only "([A-Za-z0-9 ._/=;()-]{1,4000})"$/gm)].at(-1)?.[1];
   return said && !said.startsWith('-') ? said : undefined;
 }
 

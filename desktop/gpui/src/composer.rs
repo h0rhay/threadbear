@@ -129,6 +129,10 @@ pub struct Composer {
     pub(crate) spell: crate::composer_spelling::SpellState,
     /// Board clicks wait for the box's own window and any saved draft restore.
     pending_mentions: Vec<threadbear_core::board::PendingMention>,
+    /// The token card's paste field, for that login (token_card.rs): its
+    /// words go out with Set and are never kept.
+    pub(crate) token_field: Option<(String, Entity<gpui_kit::component::input::InputState>)>,
+    pub(crate) token_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -221,7 +225,17 @@ impl Composer {
                 this.spelling_after_edit(window, cx);
                 // Kept across a quit (drafts.rs).
                 if let Some(app) = this.app.upgrade() {
-                    app.update(cx, |app, cx| app.drafts_changed(cx));
+                    // Not for the box emptying after a send: that would start
+                    // one for a thread nobody is writing.
+                    let new_thread = this.thread_id.is_none() && !this.input.read(cx).value().trim().is_empty();
+                    app.update(cx, |app, cx| {
+                        app.drafts_changed(cx);
+                        // A new thread's CLI, started again if the box's
+                        // settings changed since the page opened (warm start).
+                        if new_thread {
+                            app.warm_new_thread(cx);
+                        }
+                    });
                 }
                 cx.notify();
             }
@@ -260,6 +274,8 @@ impl Composer {
             pending_saved: None,
             held_extras: Vec::new(),
             pending_mentions: vec![],
+            token_field: None,
+            token_sub: None,
             palette: PaletteState::default(),
             palette_asked: None,
             palette_scroll: ScrollHandle::new(),
@@ -470,8 +486,40 @@ impl Composer {
     /// picture, one still being copied in included (app_update.rs).
     /// A picture still being copied in: not in the draft yet (`draft`), so a
     /// handover waits for it rather than lose it.
+    /// A picture still being copied in, in the box or a card's Something
+    /// else box: it isn't in the drafts file until it's in.
     pub(crate) fn copying_picture(&self, cx: &App) -> bool {
-        self.box_chips(cx).iter().any(|(_, chip)| matches!(chip, threadbear_core::inline_chips::BoxChip::Picture(None)))
+        let copying = |chips: Vec<(std::ops::Range<usize>, threadbear_core::inline_chips::BoxChip)>| chips.iter().any(|(_, chip)| matches!(chip, threadbear_core::inline_chips::BoxChip::Picture(None)));
+        copying(self.box_chips(cx)) || self.card.answer_inputs().iter().any(|input| copying(self.box_chips_in(input, cx)))
+    }
+
+    /// What in this box a restart now would lose or change, though its words
+    /// go across in the drafts file: as the end of "It switches in once
+    /// ...", `{t}` the thread's title. Codex's review, 19 Nov.
+    pub(crate) fn restart_hold(&self, cx: &App) -> Option<&'static str> {
+        if self.copying_picture(cx) {
+            return Some("the picture being copied in on “{t}” is in");
+        }
+        // The draft under the edit is kept only in memory, until it's back.
+        if self.editing.is_some() || self.pending_saved.is_some() || self.pending_box.is_some() {
+            return Some("the message you're editing in “{t}” is sent or put back");
+        }
+        // Words half composed (an input method's) would come back as typed.
+        if self.input.read(cx).has_composition() || self.card.answer_inputs().iter().any(|i| i.read(cx).has_composition()) {
+            return Some("the word you're composing in “{t}” is done");
+        }
+        if self.thread_id.as_deref().is_some_and(crate::thread::sending_now) {
+            return Some("the message on its way in “{t}” has gone");
+        }
+        None
+    }
+
+    /// Anything here the drafts file would keep: the box's words or
+    /// pictures, or the card's answers.
+    pub(crate) fn has_draft(&self, cx: &App) -> bool {
+        // Only the card still open: an answered one's state stays behind.
+        let open = self.card.seq.is_some() && self.open_card(cx).is_some_and(|c| !c.is_done() && Some(c.seq) == self.card.seq);
+        self.holds_anything(cx) || (open && (!self.card.picks.is_empty() || self.card.notes.values().any(|n| !n.text.trim().is_empty() || !n.images.is_empty())))
     }
 
     pub(crate) fn holds_anything(&self, cx: &App) -> bool {
@@ -1408,13 +1456,14 @@ impl Composer {
         let side = px(style::size::THUMBNAIL);
         let radius = px(8.);
         let edge = style::hairline(cx);
-        let mut row = h_flex().gap(px(8.));
+        // Keep later attachments reachable when the composer is narrow.
+        let mut row = h_flex().flex_wrap().gap(px(STRIP_GAP)).w_full();
         for (index, (_, id)) in chips.iter().enumerate() {
             let chip = self.pictures.get(id);
             let image = chip.and_then(|c| c.image.as_ref());
             let tile = div().relative().size(side).rounded(radius).border_1().border_color(edge).overflow_hidden().bg(style::chip_fill(cx));
             let tile = match image {
-                Some(image) => tile.child(img(PathBuf::from(&image.path)).size(side).rounded(radius).object_fit(ObjectFit::Cover)),
+                Some(image) => tile.child(img(crate::rows::markdown::file_picture(&image.path)).size(side).rounded(radius).object_fit(ObjectFit::Cover)),
                 None if chip.is_none() => tile.flex().items_center().justify_center().child(crate::icons::symbol("exclamationmark.triangle").size(px(14.)).text_color(style::quiet_text(cx))),
                 None => tile.flex().items_center().justify_center().child(Spinner::new().color(style::quiet_text(cx)).with_size(px(14.))),
             };
@@ -1467,7 +1516,7 @@ impl Composer {
             let open = threadbear_core::juice::strip_open(since);
             return Some(div().h(px(style::size::THUMBNAIL * open)).child(row).into_any_element());
         }
-        Some(row.into_any_element())
+        Some(div().id("composer-strip").w_full().max_h(px(strip_max_height())).overflow_y_scroll().child(row).into_any_element())
     }
 
     fn render_send_button(&self, running: bool, creating: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -1688,7 +1737,7 @@ impl Composer {
         Some(
             deferred(
                 anchored().position(bounds.origin).anchor(Anchor::BottomLeft).snap_to_window().offset(point(px(0.), px(-8.))).child(
-                    div().p(px(4.)).rounded(px(10.)).bg(cx.theme().popover).border_1().border_color(style::hairline(cx)).shadow_lg().child(img(path).max_w(px(320.)).max_h(px(240.)).rounded(px(6.))),
+                    div().p(px(4.)).rounded(px(10.)).bg(cx.theme().popover).border_1().border_color(style::hairline(cx)).shadow_lg().child(img(crate::rows::markdown::file_picture(&path.to_string_lossy())).max_w(px(320.)).max_h(px(240.)).rounded(px(6.))),
                 ),
             )
             .with_priority(1)
@@ -1753,6 +1802,9 @@ impl Render for Composer {
         // The box: the limit box and the open card, each over a line, then
         // the message.
         let limit = self.render_limit_box(cx);
+        // A thread on a virtual runner whose login needs a cloud token
+        // (token_card.rs), in the same place.
+        let token_card = self.render_token_card(window, cx);
         // An edit is a message of its own: the open card waits for after it.
         let card = if self.editing.is_some() { None } else { self.render_card(window, cx) };
         // Dimmed while the thread moves, with nothing on it taking a click.
@@ -1817,11 +1869,23 @@ impl Render for Composer {
                     // edge (1 pt in the accent, otherwise a 0.5 hairline)
                     // moves nothing. First, so the rest draws over it.
                     .child(div().absolute().inset_0().rounded(px(style::COMPOSER_RADIUS)).border(px(if needs_you { 1. } else { 0.5 })).border_color(if needs_you { style::accent(cx) } else { style::hairline(cx) }))
-                    // Clicking the card's padding puts the cursor in the text.
+                    // Clicking anywhere in the box off the words (its padding,
+                    // the gap over the controls, beside them) puts the cursor
+                    // in the text. Claimed, or the page or pane behind it,
+                    // which tracks a focus of its own, takes the focus back
+                    // on the same press: GPUI focuses every focusable under a
+                    // press that hasn't had prevent_default. Only the words'
+                    // own rows took a click (ADEMark, 19 Nov). A control in
+                    // the box still gets its click, on the let go.
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        if window.default_prevented() {
+                            return;
+                        }
                         this.focus(window, cx);
                         crate::web_panels::keyboard_to_app(window);
+                        window.prevent_default();
                     }))
+                    .children(token_card)
                     .children(limit)
                     .children(card)
                     .child(body)
@@ -1908,10 +1972,18 @@ pub(crate) fn picture_chip(path: Option<PathBuf>, number: usize, dimmed: bool, s
                 .border_color(edge)
                 // A click opens the picture (`open_picture`).
                 .when(path.is_some(), |s| s.cursor_pointer())
-                .when_some(path, |s, path| s.child(img(path).size(px(14.)).rounded(px(3.)).object_fit(ObjectFit::Cover).when(dimmed, |s| s.opacity(0.5))))
+                .when_some(path, |s, path| s.child(img(crate::rows::markdown::file_picture(&path.to_string_lossy())).size(px(14.)).rounded(px(3.)).object_fit(ObjectFit::Cover).when(dimmed, |s| s.opacity(0.5))))
                 .child(div().text_size(px(13.)).text_color(label_color).child(format!("Picture {number}"))),
         )
         .into_any_element()
+}
+
+const STRIP_GAP: f32 = 8.;
+const STRIP_ROWS: f32 = 3.;
+
+/// Cap the pictures at three rows so the message stays in view.
+pub(crate) fn strip_max_height() -> f32 {
+    STRIP_ROWS * style::size::THUMBNAIL + (STRIP_ROWS - 1.) * STRIP_GAP
 }
 
 /// The ×'s name for VoiceOver (the Swift one's accessibilityLabel), and for

@@ -148,6 +148,12 @@ export function memoryBackend(root = CONVEX) {
   // Inside a function (call), every row written is checked against its table.
   const inCall = { depth: 0 };
   const tableOf = (id: string) => Object.keys(tables).find((t) => tables[t]!.some((r) => r._id === id));
+  // (table, id): the id must be that table's, as Convex checks; (id) alone as it is.
+  const byTable = (a: string, b?: string): string => {
+    if (b === undefined) return a;
+    if (!b.startsWith(`${a}:`)) throw new Error(`convex-memory: ${b} isn't an id of ${a}`);
+    return b;
+  };
   const checkRow = (table: string | undefined, row: Record<string, unknown>) => {
     if (!inCall.depth || !table) return;
     const { _id, _creationTime, ...doc } = row;
@@ -248,12 +254,17 @@ export function memoryBackend(root = CONVEX) {
       return _id;
     },
     // A get counts toward the bytes, not the rows (reads() is queries' rows).
-    async get(id: string) {
+    // Each takes (id) or, as Convex 1.31 and later do, (table, id), whose id
+    // must be of that table.
+    async get(a: string, b?: string) {
+      const id = byTable(a, b);
       const r = find(id);
       if (r) counter.bytes += Buffer.byteLength(JSON.stringify(r));
       return r;
     },
-    async patch(id: string, p: Record<string, unknown>) {
+    async patch(a: string, b: string | Record<string, unknown>, c?: Record<string, unknown>) {
+      const id = typeof b === 'string' ? byTable(a, b) : a;
+      const p = (typeof b === 'string' ? c : b)!;
       const row = find(id);
       if (!row) throw new Error(`convex-memory: no row ${id}`);
       const next: Record<string, unknown> = { ...row };
@@ -267,14 +278,17 @@ export function memoryBackend(root = CONVEX) {
         else row[k] = x;
       }
     },
-    async replace(id: string, doc: Record<string, unknown>) {
+    async replace(a: string, b: string | Record<string, unknown>, c?: Record<string, unknown>) {
+      const id = typeof b === 'string' ? byTable(a, b) : a;
+      const doc = (typeof b === 'string' ? c : b)!;
       const row = find(id);
       if (!row) throw new Error(`convex-memory: no row ${id}`);
       checkRow(tableOf(id), doc);
       for (const k of Object.keys(row)) if (k !== '_id' && k !== '_creationTime') delete row[k];
       Object.assign(row, doc);
     },
-    async delete(id: string) {
+    async delete(a: string, b?: string) {
+      const id = byTable(a, b);
       for (const t of Object.keys(tables)) tables[t] = tables[t]!.filter((r) => r._id !== id);
     },
     // (id) for a stored file, or (table, id) as the state machines library asks for its timers' jobs.
@@ -282,8 +296,27 @@ export function memoryBackend(root = CONVEX) {
       get: async (a: string, b?: string) => (b === undefined ? (files.has(a) ? { _id: a } : null) : a === '_scheduled_functions' ? (jobs.get(b) ?? null) : files.has(b) ? { _id: b } : null),
       query: (table: string) => {
         if (table !== '_scheduled_functions') throw new Error(`convex-memory: no system table ${table}`);
-        const list = () => [...jobs.values()];
-        return { order: () => ({ async *[Symbol.asyncIterator]() { yield* list().reverse(); } }), async *[Symbol.asyncIterator]() { yield* list(); } };
+        // Each job counts as a read, as Convex's 4,096 a function count them.
+        const list = (desc: boolean) => (desc ? [...jobs.values()].reverse() : [...jobs.values()]);
+        const over = (desc: boolean) => ({
+          async *[Symbol.asyncIterator]() {
+            for (const j of list(desc)) {
+              read(j as never);
+              yield j;
+            }
+          },
+          // A page in that order, its cursor the last job's id.
+          async paginate({ numItems, cursor }: { numItems: number; cursor: string | null }) {
+            const rest = list(desc);
+            const at = cursor ? rest.findIndex((j) => j._id === cursor) : -1;
+            if (cursor && at < 0) throw new Error(`convex-memory: no job ${cursor} for a page's cursor`);
+            const from = at + 1;
+            const page = rest.slice(from, from + numItems);
+            page.forEach((j) => read(j as never));
+            return { page, isDone: from + page.length >= rest.length, continueCursor: page.at(-1)?._id ?? cursor ?? '' };
+          },
+        });
+        return { order: (d: 'asc' | 'desc') => over(d === 'desc'), ...over(false) };
       },
       // A stored file's id is any name a test gave it (file()), or no table's row; a job's, a scheduled one's.
       normalizeId: (table: string, id: string) => (table === '_storage' ? (files.has(id) || !id.includes(':') ? id : null) : table === '_scheduled_functions' ? (jobs.has(id) ? id : null) : null),

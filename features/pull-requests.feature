@@ -31,3 +31,37 @@ Feature: Pull requests open beside the thread
     And I press the PR's button "Closes the PR on GitHub"
     Then the PR's button "close" is busy
     And the PR's status reads "Closed"
+
+  @pane.prs @inline-prs @swift-pending
+  Scenario: A PR link in a reply shows whether it's open, and keeps up
+    When a reply linking the PR "https://github.com/acme/app/pull/72" streams in
+    Then the mark before the PR "https://github.com/acme/app/pull/72" says "Open"
+    When I follow the PR link "https://github.com/acme/app/pull/72" in the thread
+    And I press the PR's button "Closes the PR on GitHub"
+    Then the mark before the PR "https://github.com/acme/app/pull/72" says "Closed"
+
+  @pane.prs @inline-prs @swift-pending
+  Scenario: Resting the pointer on a PR link starts reading it before the click
+    When a reply linking the PR "https://github.com/acme/app/pull/72" streams in, its turn still going
+    Then the PR "https://github.com/acme/app/pull/72" isn't read yet
+    When I rest the pointer on the reply's link "#72"
+    Then the PR "https://github.com/acme/app/pull/72" is being read
+
+  @pane.prs @inline-prs @swift-pending
+  Scenario: The PRs a turn's reply links to are read as it ends
+    When a reply linking the PR "https://github.com/acme/app/pull/72" streams in
+    Then the PR "https://github.com/acme/app/pull/72" is being read
+
+  @pane.prs @inline-prs @swift-pending
+  Scenario: The PRs a thread's last messages link to are read as it shows
+    When a reply linking the PR "https://github.com/acme/app/pull/72" streams in, its turn still going
+    And I open the thread "Draft the release notes for 0.4"
+    And I open the thread "Make uploads resume after a crash"
+    Then the PR "https://github.com/acme/app/pull/72" is being read
+
+  @pane.prs @inline-prs @slow-pr-files @swift-pending
+  Scenario: A PR shows before its changes are read
+    When I follow the PR link "https://github.com/acme/app/pull/72" in the thread
+    Then the PR's status reads "Open"
+    And the PR's changes are still being read
+    And the PR lists the file "runner/src/swift-changes.ts"

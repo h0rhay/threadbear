@@ -4,12 +4,15 @@ Written 17 Nov 2026, from the 9 Nov audit (`runner-windows.md`), Keith's
 fork as it stood on 10 Nov (`platima/main`, 113 commits; his GitHub repo is
 gone now, so the local copy is all there is), and a look at the Dell XPS.
 
-Today a Windows PC runs the GPUI app natively and the runner in WSL
-(Ubuntu 24.04, mirrored networking, a systemd unit copying the token across).
-The goal is the runner running on Windows itself, installed and kept up to
-date the way it is on the Mac, with WSL no longer needed.
+When this was written, a Windows PC ran the GPUI app natively and the runner
+in WSL (Ubuntu 24.04, mirrored networking, a systemd unit copying the token
+across). The goal was the runner running on Windows itself, installed and
+kept up to date the way it is on the Mac, with WSL no longer needed. *Done:
+since 19 Nov nothing uses WSL. The Dell's Ubuntu and its start-up task are
+deleted, and the app no longer looks for the token WSL copied (it brings an
+older app's settings across from that folder once).*
 
-## Where things stand
+## Where things stood (17 Nov)
 
 - **Main's runner has nothing for Windows yet.** Four files mention `win32`.
   Everything in the audit is still to do.
@@ -90,8 +93,37 @@ fresh PC), which is what you want gone.
    the helper, before the token is written) and hooks off `/dev/null`
    (plus hooks named in a repo's config, on every platform) are in, after
    five rounds of Codex's review. Keith's trust fixes are what's left.*
+   *19 Nov: Keith's trust fixes are in, with four rounds of Codex's
+   review. Each round still found about six ways round following a script
+   on Windows, so there, for now, a project's patch and a folder's Claude
+   Code settings run nothing by themselves: buttons run when clicked, and
+   hooks, worktree setup and teardown, live functions' commands and
+   Claude's hooks don't run (`clicksOnly` in `runner/src/platform.ts`).*
+   *19 Nov: idle time and keep-awake are in, from the same helper
+   (`GetLastInputInfo`, `SetThreadExecutionState`, `GetSystemPowerStatus`).
+   Settings still shows the keep-awake switch on a Mac only, as its words
+   say Mac; it's on by default, and `"keepAwake": false` in runner.json
+   turns it off.*
+   *19 Nov: following on Windows also hashes every file Windows could run
+   by a bare name in the folders commands run from, so a program a pull
+   drops there asks again, and refuses round 4's ways round
+   NoDefaultCurrentDirectoryInExePath. Codex's sixth review still found
+   gaps (a JS subprocess's cwd and package commands, a variable named by
+   an expansion, which this repo's own scripts use, a DLL beside a repo
+   program), so clicks-only stays on for now.*
 6. **Polish.** Codex on Windows, pictures, stuck-job detection, a Windows
    check host, client path display (`C:\Users\...` shown as `~`).
+   *19 Nov: pictures are converted with Windows' own imaging
+   (`runner/src/win-image.ps1`, WIC through a hidden PowerShell; no SVG),
+   the app shows a Windows home as `~` whatever its case or slashes
+   (`abbreviate_home` in `desktop/core/src/new_thread.rs`, and every place
+   that shortened paths on its own now uses it), and the test helpers run
+   Git Bash rather than `/bin/sh`.*
+   *19 Nov: Codex runs on the Dell as it is: the runner's own copy
+   (`tools\codex`, 0.170.0) signed in as codex-main, in the Misc pool. A
+   thread in Full ran a command (Codex uses PowerShell there) and
+   Threadbear's tools; one in Ask put up an approval card for its
+   PowerShell command, and ran it once allowed.*
 
 Slices 1 to 4 replace WSL on the Dell. 5 is where it's as safe as the Mac.
 
@@ -100,8 +132,9 @@ Slices 1 to 4 replace WSL on the Dell. 5 is where it's as safe as the Mac.
 Screen tools (`mac-screen`), the `swiftc` secret check, BrowserBear and
 ComputerCub, `taskpolicy`, frozen-CLI detection (it watches for macOS
 privacy prompts), and the repo's own dev scripts (`check.sh`,
-`dev-runner.sh`), which run under Git Bash at best. Patch trust stays
-closed on Windows (patches run only when clicked) until slice 5 ports it.
+`dev-runner.sh`), which run under Git Bash at best. On Windows, patches
+and a folder's Claude Code settings run only what's clicked until following
+a script there has no known gaps (slice 5's note).
 
 ## Things only Mike can do
 

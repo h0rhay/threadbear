@@ -163,7 +163,9 @@ export type CliStatus = {
   // update on demand (ACP agents).
   canUpdateNow?: boolean;
   checkedAt?: string;
-  hold?: { version: string; reason: string; missing?: string[] };
+  // threadId: the thread started to look into a protocol hold;
+  // investigating: it's still open.
+  hold?: { version: string; reason: string; missing?: string[]; threadId?: string; investigating?: boolean };
   update?: {
     state: CliUpdateState;
     targetVersion?: string;
@@ -212,8 +214,8 @@ export type ThreadStatus = 'idle' | 'starting' | 'running' | 'waiting' | 'error'
 export type ArchivedBy = 'mike' | 'agent' | 'threadbear';
 // The last two are the inboxGuess experiment's (runner/inbox-guess.ts):
 // whether he needed to see the thread at all, from the Archive menu.
-export type ArchiveVerdict = 'worked' | 'didntWork' | 'notNeeded' | 'didntNeedToSee' | 'gladISaw';
-export const ARCHIVE_VERDICTS: readonly ArchiveVerdict[] = ['worked', 'didntWork', 'notNeeded', 'didntNeedToSee', 'gladISaw'];
+export type ArchiveVerdict = 'worked' | 'didntWork' | 'notNeeded' | 'didntNeedToSee' | 'gladISaw' | 'notSure';
+export const ARCHIVE_VERDICTS: readonly ArchiveVerdict[] = ['worked', 'didntWork', 'notNeeded', 'didntNeedToSee', 'gladISaw', 'notSure'];
 
 // What fills a thread's context, in Claude's own words (threads.contextUsage,
 // docs/protocol.md "Context breakdown"). Rows are the CLI's /context rows:
@@ -265,8 +267,9 @@ export type ThreadSummary = {
   snoozedUntilRelease?: true; // with snoozedUntilRestart: until it starts on a new release
   // Hibernated in Mike's words ("Hibernate in words"): what he said, the
   // topic it waits for, and pending while the time is worked out.
-  wakeWhen?: { said: string; topic?: string; pending?: true };
+  wakeWhen?: { said: string; topic?: string; pending?: true; agent?: true };
   waitingOn?: { threadId: string; title: string; until?: string; done?: true }[]; // hibernating until these finish (or do `until`)
+  awaitingAppRestart?: true; // hibernating until the Mac app restarts onto what this thread landed
   woke?: { at: string; since?: string }; // woke from hibernating by itself, not looked at yet
   onOldRunner?: boolean; // finishing a turn on a runner that handed over (Handovers)
   archivedAt?: string;
@@ -643,6 +646,9 @@ export type PanelItem = {
   section?: string;
   // Short, faint, at the end of the title's line: a date or a count.
   trailing?: string;
+  // A switch at the end of the title's line; a press sends panels.toggle
+  // (docs/protocol.md, Patches, "Row toggles").
+  toggle?: { id: string; on: boolean; icon?: string; title?: string };
 };
 
 export type BackgroundKind = 'agent' | 'shell' | 'monitor' | 'other';
@@ -726,12 +732,19 @@ export type TurnErrorKind = 'usageLimit' | 'contextWindow' | 'auth' | 'network';
 // agent's answer (end_turn's findings), absent until it gives one.
 export type ReviewSeverity = 'high' | 'medium' | 'low';
 export type ReviewOutcome = 'fixed' | 'disputed' | 'left';
-export type ReviewFinding = { id: number; round: number; severity: ReviewSeverity; claim: string; where?: string; case?: string; outcome?: ReviewOutcome; note?: string };
+// by: which of a panel found it (its reviewer line), on a round several
+// reviewed.
+export type ReviewFinding = { id: number; round: number; severity: ReviewSeverity; claim: string; where?: string; case?: string; outcome?: ReviewOutcome; note?: string; by?: string };
+// One of a review panel (runner/lab-review.ts): several reviewers at once
+// on a big or risky change.
+export type PanelReviewer = { reviewer: string; threadId: string; independent: boolean };
 export type LabReviewLedger = {
-  reviewer: string; // "Codex (codex-1)"
-  independent: boolean; // another lab, not a fresh session of the same one
+  reviewer: string; // "Codex (codex-1)"; a panel's names, joined with ", "
+  independent: boolean; // another lab, not a fresh session of the same one (a panel: any of it)
   rounds: number;
-  threadId: string; // the latest round's review thread
+  threadId: string; // the latest round's review thread (a panel's first)
+  // The latest round's panel, when several reviewed it at once.
+  panel?: PanelReviewer[];
   // The latest round found nothing that holds up.
   passed: boolean;
   // A round whose reviewer gave no verdict in end_turn: its reply is all
@@ -823,7 +836,7 @@ export type EventBody =
   | { type: 'button.updated'; button: ReplyButton }
   // origin is set only on messages the runner sent by itself (the resume
   // after a restart).
-  | { type: 'user.message'; text: string; images: ImageRef[]; origin?: MessageOrigin; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number }
+  | { type: 'user.message'; text: string; images: ImageRef[]; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number }
   // summary: the turn's summary, written by the runner from end_turn
   // givesWay: the turn's summary, with bullet replies off: any message of
   // the turn is the reply over it, however short

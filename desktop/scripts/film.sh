@@ -4,7 +4,7 @@
 # on Tinker Desk's desktop, recorded at 2x. Run it from the M5; everything
 # that shows a window happens on Tinker Desk, never here.
 #
-#   desktop/scripts/film.sh start [--turns FILE] [--fixtures DIR]... [--size 1240x820]
+#   desktop/scripts/film.sh start [--turns FILE] [--fixtures DIR]... [--live-page FILE] [--size 1240x820]
 #                                 [--appearance dark|light] [--no-build]
 #   desktop/scripts/film.sh do '<json>'...        (dev-app.sh's commands)
 #   desktop/scripts/film.sh dump | shot <file.png> | log [--mock]
@@ -62,18 +62,37 @@ SSH=(ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o BatchMode=yes)
 # (ssh has no TMPDIR, Desk Runner the per-user one; not the SSD, whose root
 # any account can write to, which dev-app.sh refuses), the build film.sh
 # made, and the turns.
-env_there="cd $base/checkout && export TMPDIR=\$(getconf DARWIN_USER_TEMP_DIR) THREADBEAR_FILM_HOST=1 DEV_APP_IDLE_QUIT_SECONDS=1200 TB_GPUI_BIN=$base/bin/threadbear-gpui; [ ! -f $base/turns.json ] || export MOCK_SCRIPTED_TURNS=$base/turns.json"
+env_there="cd $base/checkout && export TMPDIR=\$(getconf DARWIN_USER_TEMP_DIR) THREADBEAR_FILM_HOST=1 DEV_APP_IDLE_QUIT_SECONDS=1200 TB_GPUI_BIN=$base/bin/threadbear-gpui; [ ! -f $base/turns.json ] || export MOCK_SCRIPTED_TURNS=$base/turns.json; [ ! -f $base/live-page.html ] || export TB_MOCK_LIVE_PAGES=$base/live-page.html"
 q() { printf '%q ' "$@"; }
 there() { "${SSH[@]}" "$host" "$env_there; $1"; }
 desk() { "${SSH[@]}" "$host" "~/.local/bin/desk $(q "$env_there; $1")"; }
 devapp() { there "desktop/scripts/dev-app.sh $(q "$@") --id film"; }
 die() { echo "film: $*" >&2; exit 1; }
+# Who has the host's screen: with fast user switching another account's
+# session can be on the console while ours sits behind it, and then the
+# stage's virtual display comes up 0x0 (19 Nov: an ADEMark run's ademark
+# session had it, and start failed only after the whole build). Empty when
+# it's ours, otherwise why not.
+console_not_ours() {
+  local who
+  # The window server's list of sessions, not /dev/console's owner: that
+  # stays on the last user to log in after a fast switch away (19 Nov it
+  # said mikeysee while ademark's session had the screen).
+  who="$("${SSH[@]}" "$host" 'p=$(mktemp) && ioreg -n Root -d1 -a >"$p" && i=0 on= && while u=$(plutil -extract IOConsoleUsers.$i.kCGSSessionUserNameKey raw -o - "$p" 2>/dev/null); do [ "$(plutil -extract IOConsoleUsers.$i.kCGSSessionOnConsoleKey raw -o - "$p" 2>/dev/null)" != true ] || on=$u; i=$((i + 1)); done; rm -f "$p"; echo "${on:-loginwindow} $(id -un)"')" || { echo "couldn't ask $host who has its screen"; return; }
+  set -- $who
+  [ "${1:-}" != "${2:-}" ] || return 0
+  case "${1:-}" in
+    ademark) echo "$host's screen is on the ademark user's session (an ADEMark run?); film again when it's back on ${2:-}" ;;
+    root|loginwindow|"") echo "$host is at the login window, so no session has its screen; film again once ${2:-} is logged in there and on screen" ;;
+    *) echo "$host's screen is on the ${1} user's session, not ${2:-}'s; film again when it's back on ${2:-}" ;;
+  esac
+}
 
 cmd="${1:-help}"
 [ $# -eq 0 ] || shift
 case "$cmd" in
   start)
-    turns="" size=1240x820 appearance=dark build=1 fixtures=() fix_src=()
+    turns="" size=1240x820 appearance=dark build=1 fixtures=() fix_src=() live_page=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --turns) turns="$2"; shift 2 ;;
@@ -81,10 +100,15 @@ case "$cmd" in
         --size) size="$2"; shift 2 ;;
         --appearance) appearance="$2"; shift 2 ;;
         --no-build) build=0; shift ;;
+        # A live page for the mock's demo_live_page thread (the livePages experiment).
+        --live-page) live_page="$2"; shift 2 ;;
         *) die "unknown start option $1" ;;
       esac
     done
     [ -z "$turns" ] || [ -f "$turns" ] || die "no turns file $turns"
+    # Before anything slow: the stage needs our session on the screen.
+    why="$(console_not_ours)"
+    [ -z "$why" ] || die "$why"
     w="${size%x*}" h="${size#*x}"
     # The display has room round the window, so it's never pushed off an edge.
     stage_size="$(( w + 360 > 1600 ? w + 360 : 1600 ))x$(( h + 180 > 1000 ? h + 180 : 1000 ))"
@@ -92,9 +116,21 @@ case "$cmd" in
       die "another checkout is filming on $host (one at a time, as there's one stage)"
     fi
     "${SSH[@]}" "$host" "mkdir -p $base/bin $base/rec $base/fixtures"
+    # Desk Runner has to be able to open $base, with a time limit: ssh reads
+    # it while Desk Runner's every open there can sit forever. On 19 Nov an
+    # unanswered "would like to access files on a removable volume" prompt
+    # for another app (bun, 18 Nov 19:23) had macOS hold every later
+    # removable-volume request on Tinker Desk, Desk Runner's included, behind
+    # it, with the screen asleep so nobody saw it, and start waited 20 minutes
+    # on a hold.pl that never ran.
+    # Checked first, so it fails in seconds rather than after the build, and
+    # without desk()'s cd into $base, which nothing could time out.
+    if ! "${SSH[@]}" "$host" "~/.local/bin/desk $(q "perl -e 'alarm 15; exec @ARGV' /bin/sh -c ': > $base/.desk-probe && rm -f $base/.desk-probe'")" >/dev/null 2>&1; then
+      die "Desk Runner on $host can't open $base (gave up after 15 seconds). Most likely macOS has an unanswered \"would like to access files on a removable volume\" prompt on its screen, for Desk Runner or any other app, and every later request for that disk waits behind it. See it with ssh $host '~/.local/bin/desk \"screencapture -x /tmp/s.png\"' and copy /tmp/s.png back, then answer it on $host. Or film from a folder on its own disk, with FILM_DIR=<home there>/threadbear-film on every film.sh command"
+    fi
     # A previous take's app and stage go first, and with them its hold on the
     # lock, which the build below waits for.
-    [ "$("${SSH[@]}" "$host" "[ -d $base/checkout ] && echo yes")" != yes ] || there "desktop/scripts/dev-app.sh stop --id film >/dev/null 2>&1; touch $base/stage.stop; for i in \$(seq 1 20); do pgrep -f '[t]hreadbear-film/$key/stage ' >/dev/null || break; sleep 0.5; done; pkill -f '[h]old.pl $base ' || true; rm -f $base/stage.stop $base/stage.json $base/locked $base/go"
+    [ "$("${SSH[@]}" "$host" "[ -d $base/checkout ] && echo yes")" != yes ] || there "desktop/scripts/dev-app.sh stop --id film >/dev/null 2>&1; touch $base/stage.stop; for i in \$(seq 1 20); do pgrep -f '[t]hreadbear-film/$key/stage ' >/dev/null || break; sleep 0.5; done; pkill -f '^perl desktop/scripts/film/hold.pl $base ' || true; rm -f $base/stage.stop $base/stage.json $base/locked $base/go"
     if [ "$build" = 1 ]; then
       echo "Building on $host..." >&2
       log="$(mktemp -t film-build)"
@@ -107,6 +143,8 @@ case "$cmd" in
     # What dev-app.sh needs there, and the recorder.
     (cd "$root" && rsync -rlpcR --delete -e "${SSH[*]}" --exclude node_modules \
       desktop/scripts runner/scripts/find-node.sh runner/src app/Tools/mock-runner site/scripts/record-window.swift "$host:$base/checkout/")
+    "${SSH[@]}" "$host" "rm -f $base/live-page.html"
+    [ -z "$live_page" ] || rsync -c -e "${SSH[*]}" "$live_page" "$host:$base/live-page.html"
     for f in "${fix_src[@]+"${fix_src[@]}"}"; do rsync -rlpc --delete -e "${SSH[*]}" "${f%/}/" "$host:$base/fixtures/$(basename "$f")/"; done
     if [ -n "$turns" ]; then scp -q "$turns" "$host:$base/turns.json"; else "${SSH[@]}" "$host" "rm -f $base/turns.json"; fi
     there "[ -d app/Tools/mock-runner/node_modules ] || (. runner/scripts/find-node.sh && n=\"\$(threadbear_find_node)\" && PATH=\"\${n%/*}:\$PATH\" npm ci --silent --prefix app/Tools/mock-runner)
@@ -114,10 +152,25 @@ case "$cmd" in
     # The host's build-and-measurement lock first (film/hold.pl), so the app's
     # window and the stage never land in another thread's --desk run.
     desk "(perl desktop/scripts/film/hold.pl $base $base/stage $stage_size >$base/stage.log 2>&1 </dev/null &)"
-    said=""
+    # Only the perl itself: the shell Desk Runner started it from has
+    # "hold.pl <base>" in its command line too, and stays if perl never runs.
+    holding="pgrep -f '^perl desktop/scripts/film/hold.pl $base ' >/dev/null"
+    # Whether anyone holds the lock right now (a moment's try for it, let go
+    # at once): if nobody does, hold.pl should have had it already.
+    lock_free="perl -MFcntl=:flock -e 'open(my \$l, q(>>), \"\$ENV{HOME}/.cache/threadbear-perf.lock\") or exit 1; exit(flock(\$l, LOCK_EX|LOCK_NB) ? 0 : 1)'"
+    said="" free=0
     until there "[ -f $base/locked ]"; do
-      there "pgrep -f '[h]old.pl $base ' >/dev/null" || { there "cat $base/stage.log" >&2; die "the lock holder stopped (above says why)"; }
-      note="$("${SSH[@]}" "$host" "sed -n 3p ~/.cache/threadbear-perf.lock.holder 2>/dev/null")"
+      there "$holding" || { there "cat $base/stage.log" >&2; die "the lock holder stopped (above says why)"; }
+      # Free for 30 seconds while hold.pl hasn't said it has it: it's stuck
+      # on something else (opening $base, say), not waiting its turn.
+      if there "$lock_free"; then free=$((free + 1)); else free=0; fi
+      if [ "$free" -ge 6 ]; then
+        there "pkill -f '^perl desktop/scripts/film/hold.pl $base ' || true; cat $base/stage.log 2>/dev/null || true" >&2
+        die "hold.pl on $host hasn't taken the build-and-measurement lock in 30 seconds though nobody holds it, so it's stuck, not waiting (stopped it). Check Desk Runner can open $base: desk \"ls $base\" there should answer at once"
+      fi
+      # No holder file when nobody holds the lock: sed's failure would end
+      # the script silently under set -e.
+      note="$("${SSH[@]}" "$host" "sed -n 3p ~/.cache/threadbear-perf.lock.holder 2>/dev/null || true")"
       [ "$note" = "$said" ] || { echo "Waiting for $host's build-and-measurement lock, held by: ${note:-someone}" >&2; said="$note"; }
       sleep 5
     done
@@ -128,7 +181,17 @@ case "$cmd" in
     pid="$(there "cat \"\$(find \"\$TMPDIR\" -path '*/film/app.json' 2>/dev/null | head -1)\"" | sed -E 's/.*"app":([0-9]+).*/\1/')"
     [[ "$pid" =~ ^[0-9]+$ ]] || { there "touch $base/stage.stop"; die "couldn't find the app's pid"; }
     there "echo $pid > $base/go; for i in \$(seq 1 150); do [ -f $base/stage.json ] && break; grep -q '^error' $base/stage.log && break; sleep 0.2; done; cat $base/stage.log"
-    there "[ -f $base/stage.json ]" || { there "desktop/scripts/dev-app.sh stop --id film >/dev/null 2>&1; touch $base/stage.stop"; die "the stage didn't come up (above says why)"; }
+    if ! there "[ -f $base/stage.json ]"; then
+      there "desktop/scripts/dev-app.sh stop --id film >/dev/null 2>&1; touch $base/stage.stop"
+      # Its own words, in the message itself: on 19 Nov all that showed was
+      # "film", and the reason sat in stage.log on the host.
+      said_log="$(there "grep -v '^[[:space:]]*\$' $base/stage.log 2>/dev/null | tail -5" || true)"
+      why="$(console_not_ours)"
+      die "the stage didn't come up.${said_log:+ The stage said:
+$said_log}${why:+
+$why.}
+The whole log: $host:$base/stage.log"
+    fi
     devapp do '{"cmd":"focus"}' >/dev/null
     echo "Filming on $host: the app's up at $size $appearance on a 2x stage. Drive it with film.sh do, record with film.sh record."
     ;;

@@ -479,6 +479,81 @@ thread_local! {
 /// only for `scripts_for`'s bytes. `real` is the file the open gate found;
 /// `opened` makes opening it again a fresh page, read again.
 pub(crate) fn local_page(real: &str, scripts_for: Option<&str>, opened: u64, main: bool, window: &mut Window, cx: &mut App) -> AnyElement {
+    sealed_page(&format!("preview:{opened}:{}:{real}", scripts_for.unwrap_or("")), real, scripts_for, false, false, main, window, cx)
+}
+
+/// A live page's card in the transcript (live_pages.rs): the same sealed
+/// page with its scripts on for `digest`'s bytes, a fresh one for each Run
+/// (`run`). Shown only while the whole card is inside the transcript: its
+/// native view can't be cut to the scrolled list, so partly out it hides,
+/// and Chromium pauses a hidden page. `in_pane`: the same page opened big in
+/// the side pane (Full size), placed whole as the pane's other pages are.
+pub(crate) fn live_page(real: &str, digest: &str, run: u64, in_pane: bool, main: bool, window: &mut Window, cx: &mut App) -> AnyElement {
+    sealed_page(&live_key(real, digest, run), real, Some(digest), !in_pane, true, main, window, cx)
+}
+
+thread_local! {
+    /// The height the transcript last showed a running live page's card in.
+    static LIVE_ROOM: Cell<f32> = const { Cell::new(0.) };
+}
+
+/// How tall the transcript is where a live page last ran, if one has.
+pub(crate) fn live_room() -> Option<f32> {
+    Some(LIVE_ROOM.with(Cell::get)).filter(|h| *h > 0.)
+}
+
+fn live_key(real: &str, digest: &str, run: u64) -> String {
+    format!("live:{run}:{digest}:{real}")
+}
+
+/// Whether the live page made for this Run has its view hidden now (the
+/// sweep hides it each frame its card isn't wholly in sight), or None
+/// before it's made.
+pub(crate) fn live_page_hidden(real: &str, digest: &str, run: u64, cx: &App) -> Option<bool> {
+    let key = live_key(real, digest, run);
+    panels(cx)?.read(cx).page(&key).map(|page| page.hidden())
+}
+
+/// Closes every live page's view but the one running now, if any: a
+/// stopped page doesn't wait in the pool, running hidden.
+pub(crate) fn close_live_pages(keep: Option<(&str, &str, u64)>, cx: &mut App) {
+    let Some(panels) = panels(cx) else { return };
+    let keep = keep.map(|(real, digest, run)| live_key(real, digest, run));
+    panels.update(cx, |p, _| {
+        let gone: Vec<String> = p.pages.iter().map(|k| k.key.clone()).filter(|k| k.starts_with("live:") && Some(k) != keep.as_ref()).collect();
+        for key in gone {
+            p.forget(&key);
+        }
+    });
+}
+
+/// Placed this frame: whole, or (`clip`) only if all of it is inside what
+/// the window shows of its scrolled parent.
+fn placed(drawn: Rc<Cell<(u64, Bounds<Pixels>)>>, clip: bool) -> AnyElement {
+    canvas(
+        move |bounds, window, _| {
+            let mask = window.content_mask().bounds;
+            if clip {
+                // How tall the transcript shows, for the card to fit next frame
+                // (`live_room`): the answer card under the reply can leave less
+                // room than the card's own height, and then it would never show.
+                let room = f32::from(mask.size.height);
+                if (LIVE_ROOM.with(Cell::get) - room).abs() > 1. {
+                    LIVE_ROOM.with(|r| r.set(room));
+                    window.refresh();
+                }
+            }
+            if !clip || mask.intersect(&bounds) == bounds {
+                drawn.set((frame_now(), bounds));
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .size_full()
+    .into_any_element()
+}
+
+fn sealed_page(key: &str, real: &str, scripts_for: Option<&str>, clip: bool, live: bool, main: bool, window: &mut Window, cx: &mut App) -> AnyElement {
     let Some(panels) = panels(cx) else { return note("This page can't show here.", cx) };
     let parent = match running("hl-page", "this page", main, None, window, cx) {
         Ok(parent) => parent,
@@ -488,17 +563,23 @@ pub(crate) fn local_page(real: &str, scripts_for: Option<&str>, opened: u64, mai
         }
     };
     LOCAL_PAGE.with(|l| *l.borrow_mut() = "running".into());
-    let key = format!("preview:{opened}:{}:{real}", scripts_for.unwrap_or(""));
+    let key = key.to_owned();
     if let Some(drawn) = panels.update(cx, |p, _| p.touch(&key)) {
-        return canvas(move |bounds, _, _| drawn.set((frame_now(), bounds)), |_, _, _, _| {}).size_full().into_any_element();
+        return placed(drawn, clip);
     }
     if let Some(why) = panels.read(cx).failed.get(&key).cloned() {
         return note(&format!("Couldn't show this page: {why}"), cx);
     }
     if panels.update(cx, |p, _| p.making.insert(key.clone())) {
-        match threadbear_core::local_preview::Site::new(std::path::Path::new(real), scripts_for.map(str::to_owned)) {
+        // A live page gets its own bytes and nothing beside it.
+        let site = match (live, scripts_for) {
+            (true, Some(digest)) => threadbear_core::local_preview::Site::page_only(std::path::Path::new(real), digest.to_owned()),
+            _ => threadbear_core::local_preview::Site::new(std::path::Path::new(real), scripts_for.map(str::to_owned)),
+        };
+        match site {
             Some(site) => {
-                let preview = threadbear_web::PreviewSite::new(Arc::new(site), scripts_for.is_some());
+                let site = Arc::new(site);
+                let preview = if live { threadbear_web::PreviewSite::live(site) } else { threadbear_web::PreviewSite::new(site, scripts_for.is_some()) };
                 let (panels, url) = (panels.clone(), preview.page_url());
                 // After this frame, as a panel's page is made.
                 cx.defer(move |cx| panels.update(cx, |p, cx| p.make(key, url, PanelKind::Preview(preview), parent, cx)));

@@ -225,6 +225,7 @@ export const reviewsPart = {
       delete next.untilRelease;
       delete next.wakeWhen;
       delete next.waitingOn;
+      delete next.hibernatedForApp;
       delete next.archivedAt;
     }
     this.store.save(next);
@@ -234,6 +235,7 @@ export const reviewsPart = {
       delete st.rec.untilRelease;
       delete st.rec.wakeWhen;
       delete st.rec.waitingOn;
+      delete st.rec.hibernatedForApp;
       delete st.rec.archivedAt;
     }
     // An answer queued is new work: its last finish no longer counts for

@@ -12,6 +12,28 @@ type Probe = { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; home?: strin
 
 export const IS_WINDOWS = process.platform === 'win32';
 
+// Windows, for now: a project's patch trusted by its hash, and a folder's
+// Claude Code settings, run nothing by themselves (hooks, worktree setup
+// and teardown, a live function's commands, Claude's hooks). Only a
+// patch's buttons run, when they're clicked. Following a script there
+// still has gaps a repo written to get round it could use: each of four
+// reviews found about six more ways to run a program the hash didn't
+// cover (Mike, 19 Nov 2026). THREADBEAR_CLICKS_ONLY=1 turns it on
+// anywhere, and =0 off, both for tests: the unit tests turn it off
+// (test/helpers/clean-env.ts), as most check what the follow lets run once
+// this goes, and clicks-only.test.ts turns it on. The runner's own
+// variables are set by its Scheduled Task, which no thread can change.
+// Read once, as this loads, before any patch's code runs in the runner's
+// process: one that set process.env later would otherwise turn the rule
+// off (Codex's review, 19 Nov).
+const CLICKS_ONLY_SET = process.env.THREADBEAR_CLICKS_ONLY;
+export function clicksOnly(env?: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): boolean {
+  const set = env ? env.THREADBEAR_CLICKS_ONLY : CLICKS_ONLY_SET;
+  return set === '1' || (platform === 'win32' && set !== '0');
+}
+
+export const CLICKS_ONLY_NOTE = "On Windows, a project's hooks, setup and live commands don't run by themselves for now. Its buttons still run when you click them.";
+
 // %LOCALAPPDATA%, or where Windows puts it when the variable is missing. A
 // home other than this user's (a test's temp folder) gets its own, so a
 // test can never reach the real data dir through the variable.
@@ -105,6 +127,22 @@ export function noHooksPath(p: Probe = {}): string {
 // changes nothing on macOS and Linux, where path.sep is already /.
 export function slashes(p: string): string {
   return path.sep === '/' ? p : p.split(path.sep).join('/');
+}
+
+// Whether the runner may open a path that an agent's text or tool call
+// named (a Markdown picture, a pinned file). Off Windows any path may be. On
+// Windows not one that starts with two separators: `//host/share/x.png`,
+// `\\host\share\x.png`, `\\?\UNC\host\share\x.png` and
+// `file:////host/share/x.png` all make Windows open a connection to a host
+// the text picked, and send the user's NTLM sign-in to it (`\\?\C:\x.png` and
+// `\\.\pipe\x` are device names, which aren't a picture's either). Nor one
+// that names a device in a folder (`C:\x\CON.png` opens the console, and a
+// read of it waits for ever). A drive letter's path, and one rooted on the
+// current drive (`\x\a.png`), are the user's own.
+export function isLocalPath(p: string, windows: boolean = IS_WINDOWS): boolean {
+  if (!windows) return true;
+  if (/^[\\/]{2}/.test(p)) return false;
+  return !p.split(/[\\/]/).some((part) => /^(con|prn|aux|nul|com[0-9]|lpt[0-9]|conin\$|conout\$)(\.|:|$)/i.test(part));
 }
 
 // npm beside a Node: its `npm` link elsewhere, and on Windows its script,

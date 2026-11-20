@@ -61,7 +61,18 @@ const clearState: Step = async (ctx, cursor) => {
   return { cursor: page.continueCursor, done: page.isDone };
 };
 
-const BACKFILLS: Record<string, Step> = { commandState, moveState, requestState, clearState };
+// cloudTokens.tokenState (cloudTokenMachine.ts): a token set before API 94
+// is valid, as no box had said otherwise.
+const tokenState: Step = async (ctx, cursor) => {
+  const page = await ctx.db.query('cloudTokens').paginate({ numItems: PAGE, cursor, maximumBytesRead: PAGE_BYTES });
+  for (const t of page.page) {
+    // eslint-disable-next-line machines/no-direct-state-writes, @convex-dev/explicit-table-ids -- a backfill writes the field before its machine is live (stepping.ts), as the others here do
+    if (t.tokenState === undefined) await ctx.db.patch(t._id, { tokenState: { kind: 'valid' } });
+  }
+  return { cursor: page.continueCursor, done: page.isDone };
+};
+
+const BACKFILLS: Record<string, Step> = { commandState, moveState, requestState, clearState, tokenState };
 const mark = (name: string) => `backfill-${name}-done`;
 
 /** One run of a backfill from where the last left off. Run it until it says done. */

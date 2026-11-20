@@ -46,6 +46,8 @@ impl LinkMark {
             RowStatus::NeedsYou => LinkMark::NeedsYou,
             RowStatus::Failed => LinkMark::Failed,
             _ if t.needs_you => LinkMark::NeedsYou,
+            // Waiting on its own work: under Running, so not done yet.
+            _ if t.waiting_on_work() => LinkMark::Working,
             RowStatus::Time if t.said_done() => LinkMark::Done,
             _ => LinkMark::Idle,
         }
@@ -124,7 +126,7 @@ pub fn resolve_in<'a>(id: &str, ids: impl IntoIterator<Item = &'a String>) -> Op
     found.cloned()
 }
 
-fn collect(node: &markdown::mdast::Node, found: &mut impl FnMut(&markdown::mdast::Link)) {
+pub(crate) fn collect(node: &markdown::mdast::Node, found: &mut impl FnMut(&markdown::mdast::Link)) {
     if let markdown::mdast::Node::Link(link) = node {
         found(link);
     }

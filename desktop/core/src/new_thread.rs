@@ -574,6 +574,10 @@ pub struct NewThreadPicks {
     /// The runner it starts on; None for this Mac.
     pub runner: Option<String>,
     pub runner_picked: bool,
+    /// A virtual runner it starts on instead (`threads.create`'s
+    /// `serviceId`), with `runner` None: the folder and login are this
+    /// Mac's, as the runner here reads the repo and the login's email.
+    pub service: Option<String>,
 }
 
 /// What the next new thread remembers across sends (AppModel's UserDefaults:
@@ -594,6 +598,9 @@ pub struct Remembered {
     pub last_permission: Option<String>,
     /// The runner new threads start on ("Runs on"'s star), nil for this Mac.
     pub default_runner: Option<String>,
+    /// Or the virtual runner they start on, when that has the star
+    /// (`default_runner` is None then).
+    pub default_service: Option<String>,
 }
 
 impl Remembered {
@@ -869,12 +876,21 @@ pub fn short_folder(path: &str) -> String {
     folder_name(path)
 }
 
-/// `String.abbreviatingHome`.
+/// `String.abbreviatingHome`: the home folder shown as `~`. A Windows home
+/// (`C:\Users\alex`, from a runner on Windows) matches whatever its case,
+/// with `\` or `/` after it, as Windows reads both (runner-windows-plan.md,
+/// slice 6); the rest of the path is kept as written.
 pub fn abbreviate_home(path: &str, home: &str) -> String {
-    if !home.is_empty() && path == home {
-        "~".to_owned()
-    } else if !home.is_empty() && path.starts_with(&format!("{home}/")) {
-        format!("~{}", &path[home.len()..])
+    let windows = crate::reducer::text::is_windows_path(home);
+    let home = home.trim_end_matches(|c| c == '/' || (windows && c == '\\'));
+    if home.is_empty() || path.len() < home.len() || !path.is_char_boundary(home.len()) {
+        return path.to_owned();
+    }
+    let (head, rest) = path.split_at(home.len());
+    let same = if windows { head.replace('\\', "/").eq_ignore_ascii_case(&home.replace('\\', "/")) } else { head == home };
+    let follows = rest.is_empty() || rest.starts_with('/') || (windows && rest.starts_with('\\'));
+    if same && follows {
+        format!("~{rest}")
     } else {
         path.to_owned()
     }
@@ -1235,5 +1251,16 @@ mod tests {
         assert_eq!(short_folder("/"), "/");
         assert_eq!(abbreviate_home("/Users/alex/dev", "/Users/alex"), "~/dev");
         assert_eq!(abbreviate_home("/opt", "/Users/alex"), "/opt");
+        assert_eq!(abbreviate_home("/Users/alexandra/dev", "/Users/alex"), "/Users/alexandra/dev");
+        assert_eq!(abbreviate_home("/users/alex/dev", "/Users/alex"), "/users/alex/dev");
+        assert_eq!(abbreviate_home("/Users/alex", "/Users/alex/"), "~");
+        // A runner on Windows: any case, either slash, and nothing else.
+        assert_eq!(abbreviate_home("C:\\Users\\mikec\\dev\\me", "C:\\Users\\mikec"), "~\\dev\\me");
+        assert_eq!(abbreviate_home("c:\\users\\MIKEC\\dev", "C:\\Users\\mikec"), "~\\dev");
+        assert_eq!(abbreviate_home("C:/Users/mikec/dev", "C:\\Users\\mikec"), "~/dev");
+        assert_eq!(abbreviate_home("C:\\Users\\mikec", "C:\\Users\\mikec\\"), "~");
+        assert_eq!(abbreviate_home("C:\\Users\\mikecann\\x", "C:\\Users\\mikec"), "C:\\Users\\mikecann\\x");
+        assert_eq!(abbreviate_home("D:\\Users\\mikec\\x", "C:\\Users\\mikec"), "D:\\Users\\mikec\\x");
+        assert_eq!(abbreviate_home("C:\\Users\\mikec\\x", "/Users/alex"), "C:\\Users\\mikec\\x");
     }
 }
