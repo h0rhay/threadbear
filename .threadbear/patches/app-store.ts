@@ -17,9 +17,14 @@ let pending: Promise<Version[]> | undefined;
 
 function versions(sh: Ctx["sh"]): Promise<Version[]> {
   if (cached && Date.now() - cached.at < KEEP_MS) return Promise.resolve(cached.value);
-  pending ??= sh(`node ~/dev/me/poddle/scripts/asc-status.mjs ${APP_ID}`)
+  // Nothing to ask anywhere but Mike's Mac: running the script there only fails, in red, in Patches.
+  pending ??= sh("test -f ~/dev/me/poddle/scripts/asc-status.mjs")
+    .then(
+      () => sh(`node ~/dev/me/poddle/scripts/asc-status.mjs ${APP_ID}`),
+      () => undefined,
+    )
     .then((out) => {
-      const value = JSON.parse(out).versions as Version[];
+      const value: Version[] = out ? JSON.parse(out).versions : [];
       cached = { at: Date.now(), value };
       return value;
     })
