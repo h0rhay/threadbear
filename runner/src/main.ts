@@ -517,7 +517,7 @@ async function main(): Promise<void> {
     models,
     // A box's clone is its own checkout too: its repo's worktree setup runs as a new thread's would.
     // The slow looks at folders on worker threads, not the main one (trust-off-thread.ts).
-    patchTrust: new PatchTrust({ file: path.join(cfg.home, 'patch-trust.json'), always: [ownCheckout(), ...(box && !box.broken ? [box.checkout] : [])], offThread: trustWorker }),
+    patchTrust: new PatchTrust({ file: path.join(cfg.home, 'patch-trust.json'), always: [ownCheckout(), ...(box && !box.broken ? [box.checkout] : [])], offThread: trustWorker, loadClaudeSettings: !cfg.claudeFolderTrust }),
     offThread: trustWorker,
     // Keeps any text end_turn's own sign-up or wait_for_app_restart gave.
     appRestartAsked: (threadId) => {

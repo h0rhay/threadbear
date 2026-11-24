@@ -1184,3 +1184,15 @@ test('review 9: sandbox switched off, a bare BASH_ENV in an MCP env, a call befo
     assert.equal((trust.checkClaude(dir) as { reason?: string }).reason, 'unchecked', command);
   }
 });
+
+test("a runner that isn't asked to check folders loads their Claude settings as the terminal does, even ones trust can't follow", async () => {
+  const root = tmpDir();
+  const folder = path.join(root, 'repo');
+  hooked(folder);
+  fs.writeFileSync(path.join(folder, '.claude', 'settings.json'), JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: "python3 -c 'print(1)'" }] }] }, permissions: { allow: ['Bash'] } }));
+  assert.equal(new PatchTrust({ claudeHome: root }).checkClaude(folder).trusted, false, 'asked for: held back');
+  const trust = new PatchTrust({ claudeHome: root, loadClaudeSettings: true });
+  assert.deepEqual(trust.checkClaude(folder), { trusted: true });
+  assert.deepEqual(trust.checkClaude(folder, { grants: true }), { trusted: true }, 'its allow rules too, as in a terminal');
+  assert.deepEqual(await trust.lookClaudeKinds(folder, [false, true]), [{ cwd: folder, grants: false, found: undefined, skipped: true }, { cwd: folder, grants: true, found: undefined, skipped: true }]);
+});

@@ -622,6 +622,16 @@ far as git can be believed: the lines are what to read.
 
 ### Trusting a folder's Claude Code hooks
 
+This asking is off unless `runner.json` has `"claudeFolderTrust": true`
+(read when the runner starts). Without it a Claude session starts with all
+the folder's settings (`settingSources: ["user", "project", "local"]`), as
+`claude` in a terminal there does once the folder is trusted: its hooks,
+`env`, permission rules, `.mcp.json` servers, skills, agents and commands
+load unasked and unchecked, whatever they run, `checkClaude` in
+`src/patch-trust.ts` answers trusted for every folder without looking at
+it, and no thread's `patches` has a `claude-settings` entry. Home is still
+started as below. The rest of this section is what happens with it on.
+
 The runner starts Claude in a thread's folder with that folder's own
 settings, `.claude/settings.json` and `.claude/settings.local.json`, and
 its `.mcp.json` (the folder's, and those of the folders above it, up to

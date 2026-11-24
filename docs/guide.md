@@ -2249,7 +2249,15 @@ your folders when this arrived are trusted for you. Patches you trusted
 before 6 Nov 2026 are asked about once more: the way their trust is
 worked out changed, so the old yes can't carry over.
 
-A repo's own Claude Code settings are asked about the same way. When its
+A repo's own Claude Code settings load as they do when you run `claude`
+in that folder in a terminal: its hooks, MCP servers, skills, agents,
+slash commands and permission rules are all there from a thread's first
+message, with nothing to trust. So a thread in a repo you've only just
+cloned runs that repo's hooks straight away, as the terminal would once
+you'd said you trust the folder. If you'd rather be asked first, set
+`"claudeFolderTrust": true` in `runner.json` (ask a thread in your
+Threadbear folder) and restart the runner. The rest of this paragraph is
+what happens then. They are asked about the same way as patches. When its
 `.claude/settings.json` or `.claude/settings.local.json` has hooks, a
 status line or another command Claude runs by itself, or environment
 settings (`env`, which can change where Claude sends your messages and

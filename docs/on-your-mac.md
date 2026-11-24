@@ -731,7 +731,11 @@ File references are where to look.
   held back the same way (`runner/src/claude-trust.ts`): the runner reads
   those files and the scripts they reach to hash them, runs `git ls-files`
   in the folder to find skills in folders under it, and keeps what you
-  trusted in the same `patch-trust.json`. Beside it,
+  trusted in the same `patch-trust.json`. That holding back is only with
+  `"claudeFolderTrust": true` in `runner.json`: without it, Claude in a
+  thread loads and runs all of those as `claude` in a terminal in that
+  folder does, unasked, and the runner doesn't read or hash them to start
+  a thread. Beside it,
   `patch-trust-unvouched.json` lists worktrees a thread moved from another
   Mac changed the patches or Claude settings of, which Threadbear's own
   checkout's standing trust doesn't reach. And `patch-trust-versions.json` keeps,

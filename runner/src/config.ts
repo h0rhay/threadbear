@@ -101,6 +101,11 @@ export type Config = {
   // Threadbear's own copy (<home>/tools/codex/current), or until there is
   // one the codex next to the runner's Node; never ~/.local/bin/codex.
   codexPath?: string;
+  // Ask before a folder's own Claude Code settings (hooks, MCP servers,
+  // skills, agents, commands) load, as patches are asked about
+  // (claude-trust.ts). Off unless runner.json says true: a thread starts
+  // Claude with all the folder's settings, as `claude` in a terminal does.
+  claudeFolderTrust?: boolean;
   // Used as is by the ACP agents (adapters/acp/agents.ts), else wherever
   // each is installed.
   cursorPath?: string;
@@ -213,6 +218,7 @@ export type RunnerJson = {
   idleMinutes?: number;
   maxLiveCLIs?: number;
   codexPath?: string;
+  claudeFolderTrust?: boolean;
   cursorPath?: string;
   opencodePath?: string;
   grokPath?: string;
@@ -509,6 +515,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { readOnl
     // On for everyone since 10 Nov 2026, after a few days as an experiment
     // on Mike's Mac; Settings turns it off for anyone who'd rather.
     keepAwake: json.keepAwake !== false,
+    claudeFolderTrust: json.claudeFolderTrust === true,
     ...(json.releases?.publish === true ? { releases: { publish: true, ...(typeof json.releases.signingKey === 'string' ? { signingKey: expand(json.releases.signingKey) } : {}), ...(typeof json.releases.signingProvider === 'string' ? { signingProvider: expand(json.releases.signingProvider) } : {}) } } : {}),
     models: modelSettingsFrom(json),
     ...(codexPath ? { codexPath: expand(codexPath) } : {}),

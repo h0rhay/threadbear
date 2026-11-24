@@ -266,7 +266,12 @@ export class PatchTrust implements PatchTrustStore {
   private offThread: TrustOffThread | undefined;
   // offThread: where lookClaude looks (the runner's trust worker); without
   // one, on the calling thread.
-  constructor(opts: { file?: string; always?: string[]; claudeHome?: string; offThread?: TrustOffThread } = {}) {
+  // loadClaudeSettings: a folder's Claude Code settings load as `claude` in
+  // a terminal loads them, unasked and unchecked (the runner's default;
+  // runner.json's claudeFolderTrust turns the asking on).
+  private loadClaudeSettings: boolean;
+  constructor(opts: { file?: string; always?: string[]; claudeHome?: string; offThread?: TrustOffThread; loadClaudeSettings?: boolean } = {}) {
+    this.loadClaudeSettings = opts.loadClaudeSettings === true;
     this.file = opts.file;
     this.claudeHome = opts.claudeHome;
     this.offThread = opts.offThread;
@@ -476,12 +481,13 @@ export class PatchTrust implements PatchTrustStore {
   async lookClaudeKinds(cwd: string, grants: boolean[], lane: Lane = 'background'): Promise<ClaudeLook[]> {
     this.load();
     // Trusted whatever it holds: nothing to look at.
-    if (this.alwaysFor(folderKeyOfDir(cwd), cwd)) return grants.map((g) => ({ cwd, grants: g, found: undefined, skipped: true }));
+    if (this.loadClaudeSettings || this.alwaysFor(folderKeyOfDir(cwd), cwd)) return grants.map((g) => ({ cwd, grants: g, found: undefined, skipped: true }));
     const found = this.offThread ? await this.offThread.claudeCommands(cwd, this.claudeHome ?? os.homedir(), grants, lane) : claudeCommandsKinds(cwd, this.claudeHome, grants);
     return grants.map((g, i) => ({ cwd, grants: g, found: found[i] }));
   }
 
   checkClaude(cwd: string, opts: ClaudeOptions = {}, look?: ClaudeLook): ClaudeVerdict {
+    if (this.loadClaudeSettings) return { trusted: true };
     this.load();
     const key = folderKeyOfDir(cwd);
     if (this.alwaysFor(key, cwd)) return { trusted: true };
