@@ -190,7 +190,12 @@ final class RichRenderer: NSObject, WKNavigationDelegate, WKUIDelegate {
             .compactMap { $0?.appendingPathComponent(name) }
             .first { FileManager.default.fileExists(atPath: $0.path) }
             .flatMap(Bundle.init(url:))
-        guard let url = bundle?.url(forResource: "pele", withExtension: "js", subdirectory: "Rich") else { return nil }
+        // Some SwiftPM versions copy Resources/Rich as the link itself, which
+        // points nowhere from inside the bundle: then read the checkout's own
+        // shared/rich (only there when built on this Mac from a checkout).
+        let checkout = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../../../shared/rich/pele.js").standardizedFileURL
+        let url = bundle?.url(forResource: "pele", withExtension: "js", subdirectory: "Rich") ?? checkout
         return try? String(contentsOf: url, encoding: .utf8)
     }()
 
